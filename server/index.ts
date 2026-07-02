@@ -12,7 +12,7 @@ import {
   ResponsesToMessagesConverter
 } from "@zenmux/rosetta-ai";
 import { JsonStore, parseHeaderTemplate } from "./store.js";
-import type { RequestLog, RequestLogStatus, Site, SiteAddress } from "../shared/types.js";
+import type { ProviderModelSyncResult, RequestLog, RequestLogStatus, Site, SiteAddress } from "../shared/types.js";
 
 const PORT = Number(process.env.SAMAPI_PORT || 8787);
 const HOST = process.env.SAMAPI_HOST || "0.0.0.0";
@@ -1319,6 +1319,61 @@ async function discoverProviderModels(siteId: string, apiKey: string, apiKeyName
   throw new Error(`模型列表获取失败：${errors.slice(0, 4).join("；") || "没有可用地址"}`);
 }
 
+async function syncAllProviderModels(request: http.IncomingMessage): Promise<ProviderModelSyncResult> {
+  const db = store.getDb();
+  const targets = db.providerApiKeyGroups.flatMap((group) => {
+    const site = db.sites.find((item) => item.id === group.siteId);
+    return group.apiKeys
+      .filter((apiKey) => apiKey.enabled)
+      .map((apiKey) => ({
+        groupId: group.id,
+        apiKeyId: apiKey.id,
+        siteId: group.siteId,
+        siteName: site?.name || group.groupName,
+        apiKeyLabel: apiKey.label,
+        secret: apiKey.secret
+      }));
+  });
+  const results: ProviderModelSyncResult["results"] = [];
+
+  for (const target of targets) {
+    try {
+      const discovered = await discoverProviderModels(target.siteId, target.secret, target.apiKeyLabel, request);
+      const checkedAt = new Date().toISOString();
+      store.updateProviderApiKeyModels(target.groupId, target.apiKeyId, discovered.models, checkedAt);
+      results.push({
+        groupId: target.groupId,
+        apiKeyId: target.apiKeyId,
+        siteId: target.siteId,
+        siteName: discovered.siteName || target.siteName,
+        apiKeyLabel: target.apiKeyLabel,
+        status: "success",
+        modelCount: discovered.models.length,
+        models: discovered.models
+      });
+    } catch (error) {
+      results.push({
+        groupId: target.groupId,
+        apiKeyId: target.apiKeyId,
+        siteId: target.siteId,
+        siteName: target.siteName,
+        apiKeyLabel: target.apiKeyLabel,
+        status: "failed",
+        modelCount: 0,
+        errorMessage: error instanceof Error ? error.message : "模型同步失败"
+      });
+    }
+  }
+
+  const success = results.filter((result) => result.status === "success").length;
+  return {
+    total: targets.length,
+    success,
+    failed: results.length - success,
+    results
+  };
+}
+
 function resolveLogContext(routeNameOrId: string): Partial<RequestLog> {
   try {
     const resolved = store.resolveRoute(routeNameOrId);
@@ -1406,6 +1461,7 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
           await discoverProviderModels(String(body.siteId || ""), String(body.apiKey || ""), String(body.apiKeyName || ""), request)
         );
       }
+      if (method === "POST" && parts[2] === "sync-models") return sendJson(response, 200, await syncAllProviderModels(request));
       if (method === "GET") return sendJson(response, 200, store.snapshot().providerApiKeyGroups);
       if (method === "POST") return sendJson(response, 201, store.upsertProviderApiKeyGroup(await readJson(request)));
       if (method === "DELETE") {
@@ -1579,12 +1635,15 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
 
           if (upstream.ok && !looksLikeHtml(contentType, "")) {
             if (downstreamStream && upstream.body) {
+              response.socket?.setNoDelay(true);
               response.writeHead(upstream.status, {
                 "Content-Type": streamResponseContentType(proxyInfo.kind, contentType),
                 "Cache-Control": "no-cache, no-transform",
                 Connection: "keep-alive",
+                "X-Accel-Buffering": "no",
                 "Access-Control-Allow-Origin": "*"
               });
+              response.flushHeaders();
               try {
                 const streamPreviewText =
                   responseConverter?.convertStream

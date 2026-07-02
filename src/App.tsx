@@ -1,9 +1,9 @@
 import {
   Activity,
   Braces,
+  Check,
   ChevronDown,
   ChevronRight,
-  Check,
   Copy,
   Database,
   KeyRound,
@@ -19,7 +19,7 @@ import {
   Wand2,
   X
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { Children, FormEvent, isValidElement, useEffect, useId, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import type {
   ApiKeyCreated,
@@ -212,8 +212,140 @@ function TextInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
   return <input {...props} className={`field ${props.className || ""}`} />;
 }
 
+function selectOptionLabel(value: React.ReactNode): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (Array.isArray(value)) return value.map(selectOptionLabel).join("");
+  return "";
+}
+
 function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
-  return <select {...props} className={`field ${props.className || ""}`} />;
+  const { className, children, disabled, value, defaultValue, onChange, name } = props;
+  const selectId = useId();
+  const rootRef = useRef<HTMLSpanElement>(null);
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const currentValue = String(value ?? defaultValue ?? "");
+  const options = useMemo(
+    () =>
+      Children.toArray(children).flatMap((child) => {
+        if (!isValidElement<{ value?: string | number; disabled?: boolean; children?: React.ReactNode }>(child)) return [];
+        if (child.type !== "option") return [];
+        const optionValue = String(child.props.value ?? selectOptionLabel(child.props.children));
+        return [
+          {
+            value: optionValue,
+            label: selectOptionLabel(child.props.children) || optionValue,
+            disabled: Boolean(child.props.disabled)
+          }
+        ];
+      }),
+    [children]
+  );
+  const selectedIndex = options.findIndex((option) => option.value === currentValue);
+  const selectedOption = selectedIndex >= 0 ? options[selectedIndex] : undefined;
+  const firstEnabledIndex = options.findIndex((option) => !option.disabled);
+
+  useEffect(() => {
+    if (!open) return;
+    setActiveIndex(selectedIndex >= 0 && !options[selectedIndex]?.disabled ? selectedIndex : Math.max(firstEnabledIndex, 0));
+  }, [firstEnabledIndex, open, options, selectedIndex]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [open]);
+
+  const commitValue = (nextValue: string) => {
+    onChange?.({
+      target: { value: nextValue, name },
+      currentTarget: { value: nextValue, name }
+    } as unknown as React.ChangeEvent<HTMLSelectElement>);
+    setOpen(false);
+  };
+
+  const moveActive = (direction: 1 | -1) => {
+    if (options.length === 0) return;
+    setActiveIndex((current) => {
+      let next = current;
+      for (let step = 0; step < options.length; step += 1) {
+        next = (next + direction + options.length) % options.length;
+        if (!options[next].disabled) return next;
+      }
+      return current;
+    });
+  };
+
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (disabled) return;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!open) setOpen(true);
+      moveActive(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      if (!open) {
+        setOpen(true);
+        return;
+      }
+      const option = options[activeIndex];
+      if (option && !option.disabled) commitValue(option.value);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setOpen(false);
+    }
+  };
+
+  return (
+    <span ref={rootRef} className={`select-shell ${open ? "select-shell-open" : ""} ${disabled ? "select-shell-disabled" : ""}`}>
+      <button
+        type="button"
+        className={`field select-trigger ${className || ""}`}
+        disabled={disabled}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={`${selectId}-listbox`}
+        onClick={() => setOpen((current) => !current)}
+        onKeyDown={handleKeyDown}
+      >
+        <span className={`select-trigger-value ${selectedOption ? "" : "select-trigger-placeholder"}`}>
+          {selectedOption?.label || "请选择"}
+        </span>
+        <ChevronDown className="select-chevron h-4 w-4" aria-hidden="true" />
+      </button>
+      {open ? (
+        <div id={`${selectId}-listbox`} className="select-menu" role="listbox">
+          {options.map((option, index) => {
+            const selected = option.value === currentValue;
+            const active = index === activeIndex;
+            return (
+              <button
+                key={`${option.value}-${index}`}
+                type="button"
+                role="option"
+                aria-selected={selected}
+                disabled={option.disabled}
+                className={`select-option ${selected ? "select-option-selected" : ""} ${active ? "select-option-active" : ""}`}
+                onMouseEnter={() => setActiveIndex(index)}
+                onClick={() => commitValue(option.value)}
+              >
+                <span>{option.label}</span>
+                {selected ? <Check className="h-4 w-4" /> : null}
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </span>
+  );
 }
 
 function ActionButton({
@@ -260,6 +392,8 @@ export default function App() {
   const [appScrollbarVisible, setAppScrollbarVisible] = useState(false);
   const [logsAutoRefresh, setLogsAutoRefresh] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [modelSyncing, setModelSyncing] = useState(false);
+  const [modelDiscoveringIndex, setModelDiscoveringIndex] = useState<number | null>(null);
   const toastTimerRef = useRef<number | undefined>(undefined);
   const toastStartedAtRef = useRef(0);
   const toastRemainingMsRef = useRef(0);
@@ -444,7 +578,7 @@ export default function App() {
 
   const discoverProviderModels = async (index: number) => {
     const apiKey = providerKeyDraft.apiKeys[index];
-    setBusy(true);
+    setModelDiscoveringIndex(index);
     try {
       const result = await api.discoverProviderModels(providerKeyDraft.siteId, apiKey?.secret || "", apiKey?.label || "");
       setProviderKeyDraft((current) => ({
@@ -460,7 +594,33 @@ export default function App() {
       setToast(error instanceof Error ? error.message : "模型获取失败");
     } finally {
       await load().catch(() => undefined);
-      setBusy(false);
+      setModelDiscoveringIndex(null);
+    }
+  };
+
+  const syncProviderModels = async () => {
+    setModelSyncing(true);
+    try {
+      const result = await api.syncProviderModels();
+      await load();
+      if (result.total === 0) {
+        setToast("没有可同步的已启用 API Key");
+        return;
+      }
+      const failedItems = result.results.filter((item) => item.status === "failed");
+      const failedSummary = failedItems
+        .slice(0, 3)
+        .map((item) => `${item.siteName}/${item.apiKeyLabel}: ${item.errorMessage || "同步失败"}`)
+        .join("；");
+      setToast(
+        result.failed > 0
+          ? `模型同步完成：成功 ${result.success}/${result.total}，失败 ${result.failed}${failedSummary ? `；${failedSummary}` : ""}`
+          : `模型同步完成：成功 ${result.success}/${result.total}`
+      );
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "模型同步失败");
+    } finally {
+      setModelSyncing(false);
     }
   };
 
@@ -631,10 +791,13 @@ export default function App() {
                 draft={providerKeyDraft}
                 editorOpen={providerKeyEditorOpen}
                 busy={busy}
+                modelSyncing={modelSyncing}
+                modelDiscoveringIndex={modelDiscoveringIndex}
                 onDraft={setProviderKeyDraft}
                 onSubmit={saveProviderKeyGroup}
                 onClose={() => setProviderKeyEditorOpen(false)}
                 onDiscoverModels={discoverProviderModels}
+                onSyncModels={syncProviderModels}
                 onEdit={openEditProviderKeyGroup}
                 onDelete={(id) => mutate(async () => api.deleteProviderKeyGroup(id), "API Key 分组已删除")}
               />
@@ -722,6 +885,14 @@ function RoutesView(props: {
       }
     }));
   };
+  const updateRouteSite = (route: SwitchRoute, siteId: string) => {
+    const site = props.snapshot.sites.find((item) => item.id === siteId);
+    const models = siteModels(site);
+    updateRouteDraft(route, {
+      siteId,
+      model: models[0] || ""
+    });
+  };
   const saveQuickRoute = async (route: SwitchRoute) => {
     const next = routeDraft(route);
     await props.onQuickSave(next);
@@ -745,16 +916,35 @@ function RoutesView(props: {
           <div className="site-list">
             {routes.map((route) => {
               const site = props.snapshot.sites.find((item) => item.id === route.siteId);
-              const models = siteModels(site);
-              const modelOptions = Array.from(new Set([route.model, ...models].filter(Boolean))).sort();
               const quick = routeDraft(route);
+              const quickSite = props.snapshot.sites.find((item) => item.id === quick.siteId) || site;
+              const models = siteModels(quickSite);
+              const modelOptions = Array.from(new Set([quick.model, ...models].filter(Boolean))).sort();
               const isOpen = Boolean(expanded[route.id]);
-              const hasChanges = quick.model !== route.model || quick.enabled !== route.enabled;
+              const hasChanges = quick.siteId !== route.siteId || quick.model !== route.model || quick.enabled !== route.enabled;
+              const toggleRoute = () => setExpanded((current) => ({ ...current, [route.id]: !isOpen }));
               return (
-                <article key={route.id} className="record route-record">
+                <article
+                  key={route.id}
+                  className={`record route-record ${isOpen ? "route-record-open" : ""}`}
+                  role="button"
+                  tabIndex={0}
+                  aria-expanded={isOpen}
+                  onClick={toggleRoute}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter" && event.key !== " ") return;
+                    event.preventDefault();
+                    toggleRoute();
+                  }}
+                >
                   <div className="route-record-main">
                     <div className="min-w-0">
-                      <div className="record-title">{route.name}</div>
+                      <div className="route-title-line">
+                        <span className="route-expand-indicator">
+                          {isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+                        </span>
+                        <span className="record-title">{route.name}</span>
+                      </div>
                       <div className="record-meta">
                         {site?.name} / 目标模型 {route.model} / {endpointLabels[route.endpoint]}
                       </div>
@@ -763,30 +953,42 @@ function RoutesView(props: {
                         <code className="block truncate rounded-md bg-ink px-3 py-2 text-xs text-citron">model: {route.name}</code>
                       </div>
                     </div>
-                    <div className="record-actions">
-                      <ActionButton
-                        tone="ghost"
-                        title={isOpen ? "收起" : "展开快捷切换"}
-                        onClick={() => setExpanded((current) => ({ ...current, [route.id]: !isOpen }))}
-                      >
-                        {isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-                      </ActionButton>
-                      <ActionButton tone="ghost" title="复制 Base URL" onClick={() => props.onCopy(`${proxyOrigin}/proxy`)}>
-                        <Copy className="h-4 w-4" />
-                      </ActionButton>
-                      <ActionButton tone="ghost" onClick={() => props.onEdit(route)} title="编辑">
-                        <Wand2 className="h-4 w-4" />
-                      </ActionButton>
-                      <ActionButton tone="danger" onClick={() => props.onDelete(route.id)} title="删除">
-                        <Trash2 className="h-4 w-4" />
-                      </ActionButton>
-                    </div>
+                  </div>
+                  <div
+                    className="record-actions route-record-actions"
+                    onClick={(event) => event.stopPropagation()}
+                    onKeyDown={(event) => event.stopPropagation()}
+                  >
+                    <ActionButton tone="ghost" title="复制 Base URL" onClick={() => props.onCopy(`${proxyOrigin}/proxy`)}>
+                      <Copy className="h-4 w-4" />
+                    </ActionButton>
+                    <ActionButton tone="ghost" onClick={() => props.onEdit(route)} title="编辑">
+                      <Wand2 className="h-4 w-4" />
+                    </ActionButton>
+                    <ActionButton tone="danger" onClick={() => props.onDelete(route.id)} title="删除">
+                      <Trash2 className="h-4 w-4" />
+                    </ActionButton>
                   </div>
                   {isOpen ? (
-                    <div className="route-quick-panel">
+                    <div
+                      className="route-quick-panel"
+                      onClick={(event) => event.stopPropagation()}
+                      onKeyDown={(event) => event.stopPropagation()}
+                    >
                       <div className="route-quick-grid">
-                        <label>
-                          快捷切换模型
+                        <label className="route-quick-control">
+                          <span className="route-quick-label">供应商</span>
+                          <SelectInput value={quick.siteId || ""} onChange={(event) => updateRouteSite(route, event.target.value)}>
+                            <option value="">选择供应商</option>
+                            {props.snapshot.sites.map((siteOption) => (
+                              <option key={siteOption.id} value={siteOption.id}>
+                                {siteOption.name}
+                              </option>
+                            ))}
+                          </SelectInput>
+                        </label>
+                        <label className="route-quick-control">
+                          <span className="route-quick-label">快捷切换模型</span>
                           <SelectInput value={quick.model || ""} onChange={(event) => updateRouteDraft(route, { model: event.target.value })}>
                             <option value="">选择模型</option>
                             {modelOptions.map((model) => (
@@ -796,21 +998,28 @@ function RoutesView(props: {
                             ))}
                           </SelectInput>
                         </label>
-                        <div className="route-quick-status">
-                          <span>当前供应商</span>
-                          <strong>{site?.name || "供应商不可用"}</strong>
+                        <div className="route-quick-control">
+                          <span className="route-quick-label">可用模型</span>
+                          <div className="route-quick-body route-quick-stat">
+                            <strong>{models.length} 个</strong>
+                          </div>
                         </div>
-                        <div className="route-quick-status">
-                          <span>Endpoint</span>
-                          <strong>{endpointLabels[route.endpoint]}</strong>
+                        <div className="route-quick-control">
+                          <span className="route-quick-label">Endpoint</span>
+                          <div className="route-quick-body route-quick-stat route-quick-endpoint">
+                            <strong>{endpointLabels[route.endpoint]}</strong>
+                          </div>
                         </div>
-                        <label className="toggle-row route-quick-toggle">
-                          <input
-                            type="checkbox"
-                            checked={quick.enabled ?? true}
-                            onChange={(event) => updateRouteDraft(route, { enabled: event.target.checked })}
-                          />
-                          启用
+                        <label className="route-quick-control">
+                          <span className="route-quick-label">状态</span>
+                          <span className="route-quick-body route-quick-toggle">
+                            <input
+                              type="checkbox"
+                              checked={quick.enabled ?? true}
+                              onChange={(event) => updateRouteDraft(route, { enabled: event.target.checked })}
+                            />
+                            启用
+                          </span>
                         </label>
                       </div>
                       <div className="route-quick-actions">
@@ -1081,10 +1290,13 @@ function ProviderKeysView(props: {
   draft: ProviderKeyGroupDraft;
   editorOpen: boolean;
   busy: boolean;
+  modelSyncing: boolean;
+  modelDiscoveringIndex: number | null;
   onDraft: (value: ProviderKeyGroupDraft) => void;
   onSubmit: (event: FormEvent) => void;
   onClose: () => void;
   onDiscoverModels: (index: number) => void;
+  onSyncModels: () => void;
   onEdit: (group: ProviderApiKeyGroupView) => void;
   onDelete: (id: string) => void;
 }) {
@@ -1124,6 +1336,10 @@ function ProviderKeysView(props: {
               <h2>API Key 分组</h2>
               <div className="mt-1 text-xs font-bold text-ink/55">{groups.length} 个分组</div>
             </div>
+            <ActionButton type="button" tone="ghost" disabled={props.modelSyncing || groups.length === 0} onClick={props.onSyncModels}>
+              <RefreshCw className={`h-4 w-4 ${props.modelSyncing ? "animate-spin" : ""}`} />
+              同步模型
+            </ActionButton>
           </div>
           <div className="site-list">
             {groups.map((group) => (
@@ -1204,8 +1420,13 @@ function ProviderKeysView(props: {
                       <input type="checkbox" checked={apiKey.enabled} onChange={(event) => updateApiKey(index, { enabled: event.target.checked })} />
                       启用
                     </label>
-                    <ActionButton type="button" tone="ghost" disabled={props.busy} onClick={() => props.onDiscoverModels(index)}>
-                      <RefreshCw className={`h-4 w-4 ${props.busy ? "animate-spin" : ""}`} />
+                    <ActionButton
+                      type="button"
+                      tone="ghost"
+                      disabled={props.modelDiscoveringIndex !== null}
+                      onClick={() => props.onDiscoverModels(index)}
+                    >
+                      <RefreshCw className={`h-4 w-4 ${props.modelDiscoveringIndex === index ? "animate-spin" : ""}`} />
                       获取模型
                     </ActionButton>
                   </div>
@@ -1314,26 +1535,34 @@ function KeysView(props: {
             </div>
           </div>
           <div className="site-list">
-            {props.snapshot.apiKeys.map((key) => (
-              <article key={key.id} className="record">
-                <div>
-                  <div className="record-title">{key.name}</div>
-                  <div className="record-meta">{key.prefix}...</div>
-                </div>
-                <div className="record-actions">
-                  <label className="toggle-row">
-                    <input type="checkbox" checked={key.enabled} onChange={(event) => props.onToggle(key.id, event.target.checked)} />
-                    启用
-                  </label>
-                  <ActionButton tone="ghost" onClick={() => props.onCopy(`${key.prefix}...`)} title="复制前缀">
-                    <Copy className="h-4 w-4" />
-                  </ActionButton>
-                  <ActionButton tone="danger" onClick={() => props.onDelete(key.id)} title="删除">
-                    <Trash2 className="h-4 w-4" />
-                  </ActionButton>
-                </div>
-              </article>
-            ))}
+            {props.snapshot.apiKeys.map((key) => {
+              const fullKey = key.plainTextKey || "";
+              return (
+                <article key={key.id} className="record">
+                  <div className="min-w-0">
+                    <div className="record-title">{key.name}</div>
+                    <div className="record-meta break-all">{fullKey || `${key.prefix}...`}</div>
+                  </div>
+                  <div className="record-actions">
+                    <label className="toggle-row">
+                      <input type="checkbox" checked={key.enabled} onChange={(event) => props.onToggle(key.id, event.target.checked)} />
+                      启用
+                    </label>
+                    <ActionButton
+                      tone="ghost"
+                      disabled={!fullKey}
+                      onClick={() => props.onCopy(fullKey)}
+                      title={fullKey ? "复制完整密钥" : "历史密钥未保存完整值"}
+                    >
+                      <Copy className="h-4 w-4" />
+                    </ActionButton>
+                    <ActionButton tone="danger" onClick={() => props.onDelete(key.id)} title="删除">
+                      <Trash2 className="h-4 w-4" />
+                    </ActionButton>
+                  </div>
+                </article>
+              );
+            })}
           </div>
         </section>
       )}
@@ -1365,10 +1594,6 @@ function KeysView(props: {
             </div>
             {props.createdKey ? (
               <div className="mt-4 rounded-lg border border-citron bg-citron/25 p-3">
-                <div className="mb-2 flex items-center gap-2 text-sm font-bold">
-                  <Check className="h-4 w-4" />
-                  仅显示一次
-                </div>
                 <code className="block break-all rounded-md bg-ink p-3 text-xs text-citron">{props.createdKey.plainTextKey}</code>
                 <ActionButton tone="ghost" className="mt-3" onClick={() => props.onCopy(props.createdKey!.plainTextKey)}>
                   <Copy className="h-4 w-4" />

@@ -6,6 +6,7 @@ import type {
   HeaderTemplate,
   ProviderApiKeyGroupInput,
   ProviderApiKeyGroupView,
+  ProviderModelSyncResult,
   Site,
   SwitchRoute
 } from "../shared/types";
@@ -68,6 +69,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ siteId, apiKey, apiKeyName })
     }),
+  syncProviderModels: () => request<ProviderModelSyncResult>("/api/provider-key-groups/sync-models", { method: "POST" }),
   saveHeader: (template: Partial<HeaderTemplate>) =>
     request<HeaderTemplate>(template.id ? `/api/headers/${template.id}` : "/api/headers", {
       method: template.id ? "PATCH" : "POST",

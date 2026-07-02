@@ -194,8 +194,7 @@ export class JsonStore {
       updatedAt: timestamp,
       plainTextKey
     };
-    const { plainTextKey: _plainTextKey, ...record } = created;
-    this.db.apiKeys.unshift(record);
+    this.db.apiKeys.unshift(created);
     this.persist();
     return created;
   }
@@ -263,6 +262,19 @@ export class JsonStore {
     this.db.providerApiKeyGroups = this.db.providerApiKeyGroups.filter((group) => group.id !== id);
     if (current) this.syncSiteModelsFromProviderKeys(current.siteId);
     this.persist();
+  }
+
+  updateProviderApiKeyModels(groupId: string, apiKeyId: string, models: string[], checkedAt = now()) {
+    const group = this.db.providerApiKeyGroups.find((item) => item.id === groupId);
+    if (!group) throw new Error("API Key 分组不存在");
+    const apiKey = group.apiKeys.find((item) => item.id === apiKeyId);
+    if (!apiKey) throw new Error("API Key 不存在");
+    apiKey.models = Array.from(new Set(models.map((model) => String(model).trim()).filter(Boolean))).sort();
+    apiKey.lastCheckedAt = checkedAt;
+    group.updatedAt = now();
+    this.syncSiteModelsFromProviderKeys(group.siteId);
+    this.persist();
+    return this.toProviderApiKeyGroupView(group);
   }
 
   resolveProviderApiKey(siteId: string, model: string) {
@@ -489,7 +501,7 @@ export class JsonStore {
       new Set(
         this.db.providerApiKeyGroups
           .filter((group) => group.siteId === siteId)
-          .flatMap((group) => group.apiKeys.flatMap((key) => key.models))
+          .flatMap((group) => group.apiKeys.filter((key) => key.enabled).flatMap((key) => key.models))
           .filter(Boolean)
       )
     ).sort();

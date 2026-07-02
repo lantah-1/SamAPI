@@ -26,6 +26,7 @@ export interface ApiKeyRecord {
   name: string;
   prefix: string;
   keyHash: string;
+  plainTextKey?: string;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -75,6 +76,25 @@ export interface ProviderApiKeyGroupInput {
   siteId?: string;
   groupName?: string;
   apiKeys?: ProviderApiKeyEntryInput[];
+}
+
+export interface ProviderModelSyncItemResult {
+  groupId: string;
+  apiKeyId: string;
+  siteId: string;
+  siteName: string;
+  apiKeyLabel: string;
+  status: RequestLogStatus;
+  modelCount: number;
+  models?: string[];
+  errorMessage?: string;
+}
+
+export interface ProviderModelSyncResult {
+  total: number;
+  success: number;
+  failed: number;
+  results: ProviderModelSyncItemResult[];
 }
 
 export interface HeaderTemplate {
