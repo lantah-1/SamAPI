@@ -25,9 +25,14 @@ import type {
   ApiKeyCreated,
   AppSnapshot,
   EndpointKind,
+  GroupRoute,
+  GroupRouteMember,
+  GroupRouteStrategy,
   HeaderTemplate,
   ProviderApiKeyGroupView,
   RequestLog,
+  RouteRecord,
+  RouteType,
   Site,
   SiteAddress,
   SiteType,
@@ -35,6 +40,24 @@ import type {
 } from "../shared/types";
 
 type Section = "routes" | "sites" | "providerKeys" | "keys" | "headers" | "logs" | "settings" | "docs";
+
+interface RouteDraft {
+  id?: string;
+  name?: string;
+  type?: RouteType;
+  siteId?: string;
+  addressId?: string;
+  model?: string;
+  modelGroupId?: string;
+  matchRule?: string;
+  members?: GroupRouteMember[];
+  strategy?: GroupRouteStrategy;
+  endpoint?: EndpointKind;
+  headerTemplateId?: string;
+  enabled?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
 
 interface ProviderApiKeyDraft {
   id?: string;
@@ -61,6 +84,15 @@ interface HeaderTemplateDraft extends Partial<HeaderTemplate> {
   headerRows: HeaderKeyValue[];
 }
 
+interface ProviderModelOption {
+  siteId: string;
+  siteName: string;
+  apiKeyId: string;
+  apiKeyLabel: string;
+  model: string;
+  enabled: boolean;
+}
+
 const blankAddress: SiteAddress = {
   id: "",
   label: "主地址",
@@ -85,6 +117,17 @@ const siteTypeLabels: Record<SiteType, string> = {
   unknown: "未知"
 };
 
+const routeTypeLabels: Record<RouteType, string> = {
+  switch: "切换型",
+  group: "分组型"
+};
+
+const groupStrategyLabels: Record<GroupRouteStrategy, string> = {
+  "stable-first": "稳定优先",
+  sequential: "顺序执行",
+  random: "随机调用"
+};
+
 const navItems = [
   { id: "routes", label: "路由管理", icon: Route },
   { id: "sites", label: "站点管理", icon: Server },
@@ -98,7 +141,143 @@ const navItems = [
 const settingsNavItem = { id: "settings", label: "设置", icon: Settings } satisfies { id: Section; label: string; icon: typeof Route };
 const allNavItems = [...navItems, settingsNavItem];
 
-function emptyRoute(snapshot?: AppSnapshot): Partial<SwitchRoute> {
+function groupMemberKey(member: GroupRouteMember) {
+  return `${member.siteId}::${member.apiKeyId}::${member.model}`;
+}
+
+function providerModelOptions(snapshot?: AppSnapshot): ProviderModelOption[] {
+  if (!snapshot) return [];
+  const options = new globalThis.Map<string, ProviderModelOption>();
+  for (const group of snapshot.providerApiKeyGroups) {
+    const site = snapshot.sites.find((item) => item.id === group.siteId);
+    for (const apiKey of group.apiKeys) {
+      for (const model of apiKey.models) {
+        if (!model) continue;
+        const option = {
+          siteId: group.siteId,
+          siteName: site?.name || group.groupName,
+          apiKeyId: apiKey.id,
+          apiKeyLabel: apiKey.label,
+          model,
+          enabled: Boolean(apiKey.enabled && site)
+        };
+        options.set(groupMemberKey(option), option);
+      }
+    }
+  }
+  return Array.from(options.values()).sort((left, right) => {
+    const siteOrder = left.siteName.localeCompare(right.siteName);
+    if (siteOrder !== 0) return siteOrder;
+    const keyOrder = left.apiKeyLabel.localeCompare(right.apiKeyLabel);
+    if (keyOrder !== 0) return keyOrder;
+    return left.model.localeCompare(right.model);
+  });
+}
+
+function optionToMember(option: ProviderModelOption): GroupRouteMember {
+  return {
+    siteId: option.siteId,
+    apiKeyId: option.apiKeyId,
+    model: option.model
+  };
+}
+
+function uniqueMembers(members: GroupRouteMember[]) {
+  const memberMap = new globalThis.Map<string, GroupRouteMember>();
+  for (const member of members) memberMap.set(groupMemberKey(member), member);
+  return Array.from(memberMap.values());
+}
+
+function matchRuleTokens(rule: string) {
+  return rule
+    .split(/[\n,，;；]+/)
+    .map((token) => token.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function modelMatchesRule(model: string, rule: string) {
+  const normalizedModel = model.trim().toLowerCase();
+  if (!normalizedModel) return false;
+  return matchRuleTokens(rule).some((token) => normalizedModel.startsWith(token));
+}
+
+function modelMatchTokens(value: string) {
+  return value
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function smartModelMatches(model: string, query: string) {
+  if (modelMatchesRule(model, query)) return true;
+  const modelTokens = modelMatchTokens(model);
+  const queryTokens = modelMatchTokens(query);
+  if (modelTokens.length === 0 || queryTokens.length === 0) return false;
+  const modelCounts = new globalThis.Map<string, number>();
+  for (const token of modelTokens) modelCounts.set(token, (modelCounts.get(token) || 0) + 1);
+  return queryTokens.every((token) => {
+    const current = modelCounts.get(token) || 0;
+    if (current <= 0) return false;
+    modelCounts.set(token, current - 1);
+    return true;
+  });
+}
+
+function groupRouteStats(snapshot: AppSnapshot, route: GroupRoute) {
+  const selected = new Set((route.members || []).map(groupMemberKey));
+  const selectedOptions = providerModelOptions(snapshot).filter((option) => selected.has(groupMemberKey(option)));
+  return {
+    providerCount: new Set(selectedOptions.map((option) => option.siteId)).size,
+    keyCount: new Set(selectedOptions.map((option) => option.apiKeyId)).size,
+    modelCount: selectedOptions.length,
+    models: selectedOptions.map((option) => option.model)
+  };
+}
+
+function groupRouteMemberGroups(snapshot: AppSnapshot, route: GroupRoute) {
+  const selected = new Set((route.members || []).map(groupMemberKey));
+  const providerMap = new globalThis.Map<
+    string,
+    {
+      siteId: string;
+      siteName: string;
+      apiKeys: globalThis.Map<string, { apiKeyId: string; apiKeyLabel: string; models: string[] }>;
+    }
+  >();
+  for (const option of providerModelOptions(snapshot)) {
+    if (!selected.has(groupMemberKey(option))) continue;
+    const provider =
+      providerMap.get(option.siteId) ||
+      {
+        siteId: option.siteId,
+        siteName: option.siteName,
+        apiKeys: new globalThis.Map<string, { apiKeyId: string; apiKeyLabel: string; models: string[] }>()
+      };
+    const apiKey = provider.apiKeys.get(option.apiKeyId) || { apiKeyId: option.apiKeyId, apiKeyLabel: option.apiKeyLabel, models: [] };
+    apiKey.models.push(option.model);
+    provider.apiKeys.set(option.apiKeyId, apiKey);
+    providerMap.set(option.siteId, provider);
+  }
+  return Array.from(providerMap.values()).map((provider) => ({
+    ...provider,
+    apiKeys: Array.from(provider.apiKeys.values())
+  }));
+}
+
+function emptyRoute(snapshot?: AppSnapshot, type: RouteType = "switch"): RouteDraft {
+  if (type === "group") {
+    return {
+      name: "default-group",
+      type: "group",
+      matchRule: "",
+      members: [],
+      strategy: "stable-first",
+      endpoint: "messages",
+      headerTemplateId: snapshot?.headerTemplates[0]?.id,
+      enabled: true
+    };
+  }
   const site = snapshot?.sites[0];
   const models = site ? siteModels(site) : [];
   return {
@@ -377,7 +556,7 @@ function NavButton(props: { item: (typeof allNavItems)[number]; active: boolean;
 export default function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
   const [section, setSection] = useState<Section>("routes");
-  const [routeDraft, setRouteDraft] = useState<Partial<SwitchRoute>>({});
+  const [routeDraft, setRouteDraft] = useState<RouteDraft>({});
   const [routeEditorOpen, setRouteEditorOpen] = useState(false);
   const [siteDraft, setSiteDraft] = useState<Partial<Site>>(emptySite());
   const [siteEditorOpen, setSiteEditorOpen] = useState(false);
@@ -501,7 +680,7 @@ export default function App() {
   const saveRoute = (event: FormEvent) => {
     event.preventDefault();
     mutate(async () => {
-      await api.saveRoute(routeDraft);
+      await api.saveRoute(routeDraft as Partial<RouteRecord>);
       setRouteEditorOpen(false);
     }, "路由已保存");
   };
@@ -539,7 +718,7 @@ export default function App() {
     setRouteEditorOpen(true);
   };
 
-  const openEditRoute = (route: SwitchRoute) => {
+  const openEditRoute = (route: RouteRecord) => {
     setRouteDraft(route);
     setRouteEditorOpen(true);
   };
@@ -663,6 +842,7 @@ export default function App() {
     const models = siteModels(site);
     setRouteDraft((current) => ({
       ...current,
+      type: "switch",
       siteId,
       addressId: undefined,
       model: models[0] || ""
@@ -858,21 +1038,24 @@ export default function App() {
 
 function RoutesView(props: {
   snapshot: AppSnapshot;
-  draft: Partial<SwitchRoute>;
+  draft: RouteDraft;
   editorOpen: boolean;
   selectedSite?: Site;
   selectedSiteModels: string[];
-  onDraft: (value: Partial<SwitchRoute>) => void;
+  onDraft: (value: RouteDraft) => void;
   onSite: (siteId: string) => void;
   onSubmit: (event: FormEvent) => void;
   onClose: () => void;
   onDelete: (id: string) => void;
-  onEdit: (route: SwitchRoute) => void;
+  onEdit: (route: RouteRecord) => void;
   onQuickSave: (route: Partial<SwitchRoute>) => Promise<void>;
   onCopy: (value: string) => void;
 }) {
-  const routes = props.snapshot.routes.filter((route): route is SwitchRoute => route.type === "switch");
-  const proxyOrigin = apiOrigin();
+  const switchRoutes = props.snapshot.routes.filter((route): route is SwitchRoute => route.type === "switch");
+  const groupRoutes = props.snapshot.routes.filter((route): route is GroupRoute => route.type === "group");
+  const routeCount = switchRoutes.length + groupRoutes.length;
+  const modelOptions = providerModelOptions(props.snapshot);
+  const enabledModelOptions = modelOptions.filter((option) => option.enabled);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [quickDrafts, setQuickDrafts] = useState<Record<string, Partial<SwitchRoute>>>({});
   const routeDraft = (route: SwitchRoute) => ({ ...route, ...(quickDrafts[route.id] || {}) });
@@ -901,20 +1084,73 @@ function RoutesView(props: {
       return rest;
     });
   };
+  const draftType = props.draft.type || "switch";
+  const changeDraftType = (type: RouteType) => {
+    if (type === draftType) return;
+    const next = emptyRoute(props.snapshot, type);
+    props.onDraft({
+      ...next,
+      id: props.draft.id,
+      name: props.draft.name || next.name,
+      endpoint: props.draft.endpoint || next.endpoint,
+      headerTemplateId: props.draft.headerTemplateId || next.headerTemplateId,
+      enabled: props.draft.enabled ?? true
+    });
+  };
+  const draftMembers = props.draft.members || [];
+  const selectedGroupKeys = new Set(draftMembers.map(groupMemberKey));
+  const selectedAvailableCount = modelOptions.filter((option) => selectedGroupKeys.has(groupMemberKey(option))).length;
+  const groupedModelOptions = props.snapshot.providerApiKeyGroups
+    .map((group) => {
+      const site = props.snapshot.sites.find((item) => item.id === group.siteId);
+      const apiKeys = group.apiKeys
+        .map((apiKey) => ({
+          apiKey,
+          options: modelOptions.filter((option) => option.siteId === group.siteId && option.apiKeyId === apiKey.id)
+        }))
+        .filter((item) => item.options.length > 0);
+      return {
+        siteId: group.siteId,
+        siteName: site?.name || group.groupName,
+        apiKeys
+      };
+    })
+    .filter((group) => group.apiKeys.length > 0);
+  const updateGroupMembers = (members: GroupRouteMember[]) => {
+    props.onDraft({ ...props.draft, type: "group", members: uniqueMembers(members) });
+  };
+  const toggleGroupMember = (option: ProviderModelOption, checked: boolean) => {
+    const optionKey = groupMemberKey(option);
+    updateGroupMembers(checked ? [...draftMembers, optionToMember(option)] : draftMembers.filter((member) => groupMemberKey(member) !== optionKey));
+  };
+  const applyRuleSelection = () => {
+    const rule = (props.draft.matchRule || props.draft.name || "").trim();
+    const matched = enabledModelOptions.filter((option) => modelMatchesRule(option.model, rule)).map(optionToMember);
+    props.onDraft({ ...props.draft, type: "group", matchRule: rule, members: uniqueMembers([...draftMembers, ...matched]) });
+  };
+  const applySmartSelection = () => {
+    const query = (props.draft.matchRule || props.draft.name || "").trim();
+    const matched = enabledModelOptions.filter((option) => smartModelMatches(option.model, query)).map(optionToMember);
+    props.onDraft({ ...props.draft, type: "group", matchRule: props.draft.matchRule || query, members: uniqueMembers([...draftMembers, ...matched]) });
+  };
+  const clearGroupSelection = () => updateGroupMembers([]);
+  const canSaveRoute = draftType !== "group" || selectedAvailableCount > 0 || Boolean(props.draft.matchRule?.trim());
   return (
     <>
-      {routes.length === 0 ? (
+      {routeCount === 0 ? (
         <div className="center-empty">暂无路由</div>
       ) : (
+        <div className="grid gap-4">
+        {switchRoutes.length > 0 ? (
         <section className="panel p-4">
           <div className="form-head">
             <div>
               <h2>切换型路由</h2>
-              <div className="mt-1 text-xs font-bold text-ink/55">{routes.length} 条路由</div>
+              <div className="mt-1 text-xs font-bold text-ink/55">{switchRoutes.length} 条路由</div>
             </div>
           </div>
           <div className="site-list">
-            {routes.map((route) => {
+            {switchRoutes.map((route) => {
               const site = props.snapshot.sites.find((item) => item.id === route.siteId);
               const quick = routeDraft(route);
               const quickSite = props.snapshot.sites.find((item) => item.id === quick.siteId) || site;
@@ -948,10 +1184,6 @@ function RoutesView(props: {
                       <div className="record-meta">
                         {site?.name} / 目标模型 {route.model} / {endpointLabels[route.endpoint]}
                       </div>
-                      <div className="mt-3 grid gap-2">
-                        <code className="block truncate rounded-md bg-ink px-3 py-2 text-xs text-citron">base_url: {proxyOrigin}/proxy</code>
-                        <code className="block truncate rounded-md bg-ink px-3 py-2 text-xs text-citron">model: {route.name}</code>
-                      </div>
                     </div>
                   </div>
                   <div
@@ -959,7 +1191,7 @@ function RoutesView(props: {
                     onClick={(event) => event.stopPropagation()}
                     onKeyDown={(event) => event.stopPropagation()}
                   >
-                    <ActionButton tone="ghost" title="复制 Base URL" onClick={() => props.onCopy(`${proxyOrigin}/proxy`)}>
+                    <ActionButton tone="ghost" title="复制模型名" onClick={() => props.onCopy(route.name)}>
                       <Copy className="h-4 w-4" />
                     </ActionButton>
                     <ActionButton tone="ghost" onClick={() => props.onEdit(route)} title="编辑">
@@ -1047,85 +1279,328 @@ function RoutesView(props: {
             })}
           </div>
         </section>
+        ) : null}
+        {groupRoutes.length > 0 ? (
+          <section className="panel p-4">
+            <div className="form-head">
+              <div>
+                <h2>分组型路由</h2>
+                <div className="mt-1 text-xs font-bold text-ink/55">{groupRoutes.length} 条路由</div>
+              </div>
+            </div>
+            <div className="site-list">
+              {groupRoutes.map((route) => {
+                const stats = groupRouteStats(props.snapshot, route);
+                const memberGroups = groupRouteMemberGroups(props.snapshot, route);
+                const headerTemplate = route.headerTemplateId
+                  ? props.snapshot.headerTemplates.find((template) => template.id === route.headerTemplateId)
+                  : undefined;
+                const isOpen = Boolean(expanded[route.id]);
+                const toggleRoute = () => setExpanded((current) => ({ ...current, [route.id]: !isOpen }));
+                return (
+                  <article
+                    key={route.id}
+                    className={`record route-record group-route-record ${isOpen ? "route-record-open" : ""}`}
+                    role="button"
+                    tabIndex={0}
+                    aria-expanded={isOpen}
+                    onClick={toggleRoute}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" && event.key !== " ") return;
+                      event.preventDefault();
+                      toggleRoute();
+                    }}
+                  >
+                    <div className="route-record-main">
+                      <div className="min-w-0">
+                        <div className="route-title-line">
+                          <span className="route-expand-indicator">
+                            {isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+                          </span>
+                          <span className="record-title">{route.name}</span>
+                        </div>
+                        <div className="record-meta">
+                          关键词 {route.matchRule || "-"} / {groupStrategyLabels[route.strategy]} / {endpointLabels[route.endpoint]}
+                        </div>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <span className="pill">{stats.providerCount} 个供应商</span>
+                          <span className="pill">{stats.keyCount} 个 Key</span>
+                          <span className="pill">{stats.modelCount} 个模型</span>
+                          <span className="pill">{route.enabled ? "已启用" : "已停用"}</span>
+                        </div>
+                        {stats.models.length > 0 ? (
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {stats.models.slice(0, 6).map((model) => (
+                              <span key={model} className="pill pill-muted">
+                                {model}
+                              </span>
+                            ))}
+                            {stats.models.length > 6 ? <span className="pill pill-muted">+{stats.models.length - 6}</span> : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                    <div
+                      className="record-actions route-record-actions"
+                      onClick={(event) => event.stopPropagation()}
+                      onKeyDown={(event) => event.stopPropagation()}
+                    >
+                      <ActionButton tone="ghost" title="复制模型名" onClick={() => props.onCopy(route.name)}>
+                        <Copy className="h-4 w-4" />
+                      </ActionButton>
+                      <ActionButton tone="ghost" onClick={() => props.onEdit(route)} title="编辑">
+                        <Wand2 className="h-4 w-4" />
+                      </ActionButton>
+                      <ActionButton tone="danger" onClick={() => props.onDelete(route.id)} title="删除">
+                        <Trash2 className="h-4 w-4" />
+                      </ActionButton>
+                    </div>
+                    {isOpen ? (
+                      <div
+                        className="route-detail-panel group-route-detail"
+                        onClick={(event) => event.stopPropagation()}
+                        onKeyDown={(event) => event.stopPropagation()}
+                      >
+                        <div className="group-route-summary">
+                          <div>
+                            <span>匹配关键词</span>
+                            <strong>{route.matchRule || "-"}</strong>
+                          </div>
+                          <div>
+                            <span>调用策略</span>
+                            <strong>{groupStrategyLabels[route.strategy]}</strong>
+                          </div>
+                          <div>
+                            <span>Header 模版</span>
+                            <strong>{headerTemplate?.name || "不使用"}</strong>
+                          </div>
+                          <div>
+                            <span>Endpoint</span>
+                            <strong>{endpointLabels[route.endpoint]}</strong>
+                          </div>
+                        </div>
+                        <div className="group-route-members">
+                          <div className="group-route-members-head">
+                            <strong>组内模型详情</strong>
+                            <span>
+                              {stats.providerCount} 个供应商 / {stats.keyCount} 个 Key / {stats.modelCount} 个模型
+                            </span>
+                          </div>
+                          {memberGroups.length === 0 ? (
+                            <div className="group-route-empty">暂无可用组内模型</div>
+                          ) : (
+                            <div className="group-route-member-list">
+                              {memberGroups.map((provider) => (
+                                <div key={provider.siteId} className="group-route-member-provider">
+                                  <div className="group-route-provider-name">{provider.siteName}</div>
+                                  {provider.apiKeys.map((apiKey) => (
+                                    <div key={apiKey.apiKeyId} className="group-route-member-key">
+                                      <div className="group-route-key-name">{apiKey.apiKeyLabel}</div>
+                                      <div className="group-route-models">
+                                        {apiKey.models.map((model) => (
+                                          <span key={model} className="pill pill-muted">
+                                            {model}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ) : null}
+                  </article>
+                );
+              })}
+            </div>
+          </section>
+        ) : null}
+        </div>
       )}
 
       {props.editorOpen ? (
         <div className="modal-backdrop" role="presentation">
-          <form onSubmit={props.onSubmit} className="modal-panel" role="dialog" aria-modal="true" aria-label="路由编辑">
-            <div className="form-head">
+          <form onSubmit={props.onSubmit} className="modal-panel route-modal-panel" role="dialog" aria-modal="true" aria-label="路由编辑">
+            <div className="form-head route-modal-head">
               <h2>{props.draft.id ? "编辑路由" : "新增路由"}</h2>
               <ActionButton type="button" tone="ghost" onClick={props.onClose} title="关闭">
                 <X className="h-4 w-4" />
               </ActionButton>
             </div>
-            <div className="form-grid">
-              <label>
-                路由名称
-                <TextInput value={props.draft.name || ""} onChange={(event) => props.onDraft({ ...props.draft, name: event.target.value })} />
-              </label>
-              <label>
-                供应商
-                <SelectInput value={props.draft.siteId || ""} onChange={(event) => props.onSite(event.target.value)}>
-                  <option value="">选择供应商</option>
-                  {props.snapshot.sites.map((site) => (
-                    <option key={site.id} value={site.id}>
-                      {site.name}
-                    </option>
-                  ))}
-                </SelectInput>
-              </label>
-              <label>
-                模型
-                <SelectInput value={props.draft.model || ""} onChange={(event) => props.onDraft({ ...props.draft, model: event.target.value })}>
-                  <option value="">选择模型</option>
-                  {props.selectedSiteModels.map((model) => (
-                    <option key={model} value={model}>
-                      {model}
-                    </option>
-                  ))}
-                </SelectInput>
-              </label>
-              <label>
-                Header 模版
-                <SelectInput
-                  value={props.draft.headerTemplateId || ""}
-                  onChange={(event) => props.onDraft({ ...props.draft, headerTemplateId: event.target.value || undefined })}
-                >
-                  <option value="">不使用模版</option>
-                  {props.snapshot.headerTemplates.map((template) => (
-                    <option key={template.id} value={template.id}>
-                      {template.name}
-                    </option>
-                  ))}
-                </SelectInput>
-              </label>
-              <label>
-                Endpoint
-                <SelectInput
-                  value={props.draft.endpoint || "messages"}
-                  onChange={(event) => props.onDraft({ ...props.draft, endpoint: event.target.value as EndpointKind })}
-                >
-                  {props.snapshot.endpoints.map((endpoint) => (
-                    <option key={endpoint} value={endpoint}>
-                      {endpointLabels[endpoint]}
-                    </option>
-                  ))}
-                </SelectInput>
+            <div className="route-modal-body">
+              <div className="form-grid">
+                <label>
+                  路由名称
+                  <TextInput value={props.draft.name || ""} onChange={(event) => props.onDraft({ ...props.draft, name: event.target.value })} />
+                </label>
+                <label>
+                  路由类型
+                  <SelectInput value={draftType} onChange={(event) => changeDraftType(event.target.value as RouteType)}>
+                    <option value="switch">{routeTypeLabels.switch}</option>
+                    <option value="group">{routeTypeLabels.group}</option>
+                  </SelectInput>
+                </label>
+                {draftType === "switch" ? (
+                  <>
+                    <label>
+                      供应商
+                      <SelectInput value={props.draft.siteId || ""} onChange={(event) => props.onSite(event.target.value)}>
+                        <option value="">选择供应商</option>
+                        {props.snapshot.sites.map((site) => (
+                          <option key={site.id} value={site.id}>
+                            {site.name}
+                          </option>
+                        ))}
+                      </SelectInput>
+                    </label>
+                    <label>
+                      模型
+                      <SelectInput value={props.draft.model || ""} onChange={(event) => props.onDraft({ ...props.draft, model: event.target.value })}>
+                        <option value="">选择模型</option>
+                        {props.selectedSiteModels.map((model) => (
+                          <option key={model} value={model}>
+                            {model}
+                          </option>
+                        ))}
+                      </SelectInput>
+                    </label>
+                  </>
+                ) : (
+                  <>
+                    <label className="form-span-2">
+                      匹配关键词
+                      <div className="group-rule-row">
+                        <TextInput
+                          value={props.draft.matchRule || ""}
+                          placeholder="请输入关键词"
+                          onChange={(event) => props.onDraft({ ...props.draft, type: "group", matchRule: event.target.value })}
+                        />
+                        <ActionButton type="button" tone="ghost" disabled={!props.draft.matchRule?.trim()} onClick={applyRuleSelection}>
+                          前缀勾选
+                        </ActionButton>
+                        <ActionButton
+                          type="button"
+                          tone="ghost"
+                          disabled={!(props.draft.matchRule || props.draft.name)?.trim()}
+                          onClick={applySmartSelection}
+                        >
+                          <Wand2 className="h-4 w-4" />
+                          智能勾选
+                        </ActionButton>
+                      </div>
+                    </label>
+                    <label>
+                      调用策略
+                      <SelectInput
+                        value={props.draft.strategy || "stable-first"}
+                        onChange={(event) => props.onDraft({ ...props.draft, type: "group", strategy: event.target.value as GroupRouteStrategy })}
+                      >
+                        <option value="stable-first">{groupStrategyLabels["stable-first"]}</option>
+                        <option value="sequential">{groupStrategyLabels.sequential}</option>
+                        <option value="random">{groupStrategyLabels.random}</option>
+                      </SelectInput>
+                    </label>
+                    <div className="group-model-picker form-span-2">
+                      <div className="group-model-head">
+                        <div>
+                          <strong>组内模型</strong>
+                          <span>
+                            已选 {selectedAvailableCount} / 可用 {enabledModelOptions.length}
+                          </span>
+                        </div>
+                        <ActionButton type="button" tone="ghost" disabled={selectedAvailableCount === 0} onClick={clearGroupSelection}>
+                          清空
+                        </ActionButton>
+                      </div>
+                      {modelOptions.length === 0 ? (
+                        <div className="group-model-empty">暂无可选模型</div>
+                      ) : (
+                        <div className="group-model-list">
+                          {groupedModelOptions.map((provider) => (
+                            <div key={provider.siteId} className="group-model-provider">
+                              <div className="group-model-provider-title">{provider.siteName}</div>
+                              {provider.apiKeys.map(({ apiKey, options }) => (
+                                <div key={apiKey.id} className="group-model-key">
+                                  <div className="group-model-key-title">
+                                    <span>{apiKey.label}</span>
+                                    {!apiKey.enabled ? <span>已停用</span> : null}
+                                  </div>
+                                  <div className="group-model-options">
+                                    {options.map((option) => {
+                                      const optionKey = groupMemberKey(option);
+                                      const checked = selectedGroupKeys.has(optionKey);
+                                      return (
+                                        <label
+                                          key={optionKey}
+                                          className={`group-model-option ${checked ? "group-model-option-checked" : ""} ${
+                                            option.enabled ? "" : "group-model-option-disabled"
+                                          }`}
+                                        >
+                                          <input
+                                            type="checkbox"
+                                            checked={checked}
+                                            disabled={!option.enabled}
+                                            onChange={(event) => toggleGroupMember(option, event.target.checked)}
+                                          />
+                                          <span>{option.model}</span>
+                                        </label>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
+                <label>
+                  Header 模版
+                  <SelectInput
+                    value={props.draft.headerTemplateId || ""}
+                    onChange={(event) => props.onDraft({ ...props.draft, headerTemplateId: event.target.value || undefined })}
+                  >
+                    <option value="">不使用模版</option>
+                    {props.snapshot.headerTemplates.map((template) => (
+                      <option key={template.id} value={template.id}>
+                        {template.name}
+                      </option>
+                    ))}
+                  </SelectInput>
+                </label>
+                <label>
+                  Endpoint
+                  <SelectInput
+                    value={props.draft.endpoint || "messages"}
+                    onChange={(event) => props.onDraft({ ...props.draft, endpoint: event.target.value as EndpointKind })}
+                  >
+                    {props.snapshot.endpoints.map((endpoint) => (
+                      <option key={endpoint} value={endpoint}>
+                        {endpointLabels[endpoint]}
+                      </option>
+                    ))}
+                  </SelectInput>
+                </label>
+              </div>
+              <label className="toggle-row mt-3">
+                <input
+                  type="checkbox"
+                  checked={props.draft.enabled ?? true}
+                  onChange={(event) => props.onDraft({ ...props.draft, enabled: event.target.checked })}
+                />
+                启用
               </label>
             </div>
-            <label className="toggle-row mt-3">
-              <input
-                type="checkbox"
-                checked={props.draft.enabled ?? true}
-                onChange={(event) => props.onDraft({ ...props.draft, enabled: event.target.checked })}
-              />
-              启用
-            </label>
-            <div className="mt-4 flex justify-end gap-2">
+            <div className="route-modal-actions">
               <ActionButton type="button" tone="ghost" onClick={props.onClose}>
                 取消
               </ActionButton>
-              <ActionButton type="submit">
+              <ActionButton type="submit" disabled={!canSaveRoute}>
                 <Save className="h-4 w-4" />
                 保存路由
               </ActionButton>
@@ -1784,10 +2259,10 @@ function LogsView(props: {
 
   if (logs.length === 0) {
     return (
-      <>
+      <div className="logs-empty-page">
         <section className="panel p-4">{header}</section>
         <div className="center-empty">暂无日志</div>
-      </>
+      </div>
     );
   }
 
@@ -1993,35 +2468,102 @@ function DetailBlock(props: { title: string; value: unknown }) {
   );
 }
 
+function UsageCopyRow(props: { label: string; value: string; note: string; onCopy: (value: string) => void }) {
+  return (
+    <div className="usage-copy-row">
+      <div>
+        <span>{props.label}</span>
+        <code>{props.value}</code>
+        <p>{props.note}</p>
+      </div>
+      <ActionButton tone="ghost" onClick={() => props.onCopy(props.value)} title={`复制 ${props.label}`}>
+        <Copy className="h-4 w-4" />
+      </ActionButton>
+    </div>
+  );
+}
+
 function DocsView(props: { snapshot: AppSnapshot; onCopy: (value: string) => void }) {
-  const route = props.snapshot.routes.find((item) => item.type === "switch");
+  const enabledRoutes = props.snapshot.routes.filter((item) => item.enabled);
+  const route = enabledRoutes[0] || props.snapshot.routes[0];
+  const proxyBaseUrl = `${apiOrigin()}/proxy`;
+  const proxyV1BaseUrl = `${apiOrigin()}/proxy/v1`;
+  const modelName = route?.name || "default-messages";
+  const ccSwitchConfig = `base_url = ${proxyBaseUrl}
+api_key = sk-samapi-...
+model = ${modelName}`;
   const command = `curl ${apiOrigin()}/proxy \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer sk-samapi-..." \\
-  -d '{"model":"${route?.name || "default-messages"}","messages":[{"role":"user","content":"hello"}]}'`;
+  -d '{"model":"${modelName}","messages":[{"role":"user","content":"hello"}]}'`;
+  const modelsCommand = `curl ${apiOrigin()}/proxy/v1/models \\
+  -H "Authorization: Bearer sk-samapi-..."`;
   return (
-    <section className="panel p-4">
-      <div className="form-head">
-        <h2>本地调用</h2>
-        <ActionButton tone="ghost" onClick={() => props.onCopy(command)}>
+    <section className="panel usage-panel p-4">
+      <div className="usage-hero">
+        <div>
+          <p>下游接入</p>
+          <h2>把路由名当作模型名使用</h2>
+        </div>
+        <ActionButton tone="ghost" onClick={() => props.onCopy(ccSwitchConfig)}>
           <Copy className="h-4 w-4" />
+          复制配置
         </ActionButton>
       </div>
-      <pre className="overflow-auto rounded-lg bg-ink p-4 text-sm text-citron">{command}</pre>
-      <div className="mt-4 grid gap-2 rounded-lg border border-ink/10 bg-white p-3 text-sm font-bold text-ink/65">
-        <div className="grid gap-1 md:grid-cols-[88px_1fr]">
-          <span>base_url</span>
-          <code className="break-all text-ink">{apiOrigin()}/proxy</code>
+
+      <div className="usage-config-block">
+        <div className="usage-block-head">
+          <span>CC-Switch / Claude 配置</span>
+          <ActionButton tone="ghost" onClick={() => props.onCopy(ccSwitchConfig)} title="复制配置">
+            <Copy className="h-4 w-4" />
+          </ActionButton>
         </div>
-        <div className="grid gap-1 md:grid-cols-[88px_1fr]">
-          <span>model</span>
-          <code className="break-all text-ink">{route?.name || "default-messages"}</code>
+        <pre>{ccSwitchConfig}</pre>
+      </div>
+
+      <div className="usage-copy-list">
+        <UsageCopyRow label="base_url" value={proxyBaseUrl} note="推荐给 CC-Switch、Claude CLI 这类会自动拼接 /v1/messages 的客户端。" onCopy={props.onCopy} />
+        <UsageCopyRow label="api_key" value="sk-samapi-..." note="从客户端密钥页面复制完整密钥，作为 Bearer Token 使用。" onCopy={props.onCopy} />
+        <UsageCopyRow label="model" value={modelName} note="填写路由管理里的路由名称；分组路由也复制分组名称作为模型名。" onCopy={props.onCopy} />
+        <UsageCopyRow label="models" value={`${proxyV1BaseUrl}/models`} note="用于下游获取可用模型列表，返回启用中的路由名称。" onCopy={props.onCopy} />
+        <UsageCopyRow label="OpenAI base_url" value={proxyV1BaseUrl} note="如果客户端要求 base_url 已经包含 /v1，可以使用这个地址。" onCopy={props.onCopy} />
+      </div>
+
+      <div className="usage-example-grid">
+        <div className="usage-code-block">
+          <div className="usage-block-head">
+            <span>模型列表</span>
+            <ActionButton tone="ghost" onClick={() => props.onCopy(modelsCommand)} title="复制模型列表请求">
+              <Copy className="h-4 w-4" />
+            </ActionButton>
+          </div>
+          <pre>{modelsCommand}</pre>
         </div>
-        <div className="grid gap-1 md:grid-cols-[88px_1fr]">
-          <span>api_key</span>
-          <code className="break-all text-ink">sk-samapi-...</code>
+        <div className="usage-code-block">
+          <div className="usage-block-head">
+            <span>消息请求</span>
+            <ActionButton tone="ghost" onClick={() => props.onCopy(command)} title="复制消息请求">
+              <Copy className="h-4 w-4" />
+            </ActionButton>
+          </div>
+          <pre>{command}</pre>
         </div>
       </div>
+
+      <div className="usage-route-strip">
+        <span>当前可用模型</span>
+        <div>
+          {(enabledRoutes.length > 0 ? enabledRoutes : props.snapshot.routes).slice(0, 12).map((item) => (
+            <button key={item.id} type="button" onClick={() => props.onCopy(item.name)}>
+              {item.name}
+            </button>
+          ))}
+          {(enabledRoutes.length > 0 ? enabledRoutes : props.snapshot.routes).length > 12 ? (
+            <strong>+{(enabledRoutes.length > 0 ? enabledRoutes : props.snapshot.routes).length - 12}</strong>
+          ) : null}
+        </div>
+      </div>
+
       <div className="mt-4 grid gap-3 md:grid-cols-3">
         <div className="metric">
           <span>{props.snapshot.sites.length}</span>

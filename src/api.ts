@@ -7,8 +7,8 @@ import type {
   ProviderApiKeyGroupInput,
   ProviderApiKeyGroupView,
   ProviderModelSyncResult,
+  RouteRecord,
   Site,
-  SwitchRoute
 } from "../shared/types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -76,8 +76,8 @@ export const api = {
       body: JSON.stringify(template)
     }),
   deleteHeader: (id: string) => request<{ ok: true }>(`/api/headers/${id}`, { method: "DELETE" }),
-  saveRoute: (route: Partial<SwitchRoute>) =>
-    request<SwitchRoute>(route.id ? `/api/routes/${route.id}` : "/api/routes", {
+  saveRoute: (route: Partial<RouteRecord>) =>
+    request<RouteRecord>(route.id ? `/api/routes/${route.id}` : "/api/routes", {
       method: route.id ? "PATCH" : "POST",
       body: JSON.stringify(route)
     }),

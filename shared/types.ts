@@ -4,6 +4,8 @@ export type RouteType = "switch" | "group";
 
 export type SiteType = "newapi" | "unknown";
 
+export type GroupRouteStrategy = "stable-first" | "sequential" | "random";
+
 export interface SiteAddress {
   id: string;
   label: string;
@@ -119,13 +121,22 @@ export interface SwitchRoute {
   updatedAt: string;
 }
 
+export interface GroupRouteMember {
+  siteId: string;
+  apiKeyId: string;
+  model: string;
+}
+
 export interface GroupRoute {
   id: string;
   name: string;
   type: "group";
-  strategy: "stable-first" | "round-robin" | "random";
-  modelGroupId: string;
+  strategy: GroupRouteStrategy;
+  modelGroupId?: string;
+  matchRule: string;
+  members: GroupRouteMember[];
   endpoint: EndpointKind;
+  headerTemplateId?: string;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;

@@ -6,6 +6,9 @@ import type {
   ApiKeyRecord,
   AppDatabase,
   AppSettings,
+  GroupRoute,
+  GroupRouteMember,
+  GroupRouteStrategy,
   HeaderTemplate,
   ProviderApiKeyEntry,
   ProviderApiKeyGroup,
@@ -56,6 +59,57 @@ function normalizeSettings(input?: Partial<AppSettings>): AppSettings {
   };
 }
 
+function groupMemberKey(member: GroupRouteMember) {
+  return `${member.siteId}::${member.apiKeyId}::${member.model}`;
+}
+
+function normalizeMatchRule(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeGroupStrategy(value: unknown): GroupRouteStrategy {
+  if (value === "sequential") return "sequential";
+  if (value === "random") return "random";
+  if (value === "stable-first" || value == null || value === "") return "stable-first";
+  throw new Error("请选择有效的分组策略");
+}
+
+function matchRuleTokens(rule: string) {
+  return rule
+    .split(/[\n,，;；]+/)
+    .map((token) => token.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function modelMatchesRule(model: string, rule: string) {
+  const normalizedModel = model.trim().toLowerCase();
+  if (!normalizedModel) return false;
+  return matchRuleTokens(rule).some((token) => normalizedModel.startsWith(token));
+}
+
+function modelMatchTokens(value: string) {
+  return value
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function smartModelMatches(model: string, query: string) {
+  if (modelMatchesRule(model, query)) return true;
+  const modelTokens = modelMatchTokens(model);
+  const queryTokens = modelMatchTokens(query);
+  if (modelTokens.length === 0 || queryTokens.length === 0) return false;
+  const modelCounts = new Map<string, number>();
+  for (const token of modelTokens) modelCounts.set(token, (modelCounts.get(token) || 0) + 1);
+  return queryTokens.every((token) => {
+    const current = modelCounts.get(token) || 0;
+    if (current <= 0) return false;
+    modelCounts.set(token, current - 1);
+    return true;
+  });
+}
+
 function createEmptyDatabase(): AppDatabase {
   return {
     sites: [],
@@ -80,6 +134,7 @@ export class JsonStore {
     this.logsPath = path.join(this.dataDir, "request-logs.jsonl");
     mkdirSync(this.dataDir, { recursive: true });
     this.db = this.load();
+    this.refreshGroupRouteMembers();
   }
 
   snapshot() {
@@ -177,6 +232,7 @@ export class JsonStore {
     this.db.sites = this.db.sites.filter((site) => site.id !== id);
     this.db.providerApiKeyGroups = this.db.providerApiKeyGroups.filter((group) => group.siteId !== id);
     this.db.routes = this.db.routes.filter((route) => route.type !== "switch" || route.siteId !== id);
+    this.refreshGroupRouteMembers();
     this.persist();
   }
 
@@ -236,6 +292,7 @@ export class JsonStore {
       });
       if (previousSiteId !== input.siteId) this.syncSiteModelsFromProviderKeys(previousSiteId);
       this.syncSiteModelsFromProviderKeys(input.siteId);
+      this.refreshGroupRouteMembers();
       this.persist();
       return this.toProviderApiKeyGroupView(current);
     }
@@ -253,6 +310,7 @@ export class JsonStore {
     };
     this.db.providerApiKeyGroups.unshift(created);
     this.syncSiteModelsFromProviderKeys(input.siteId);
+    this.refreshGroupRouteMembers();
     this.persist();
     return this.toProviderApiKeyGroupView(created);
   }
@@ -261,6 +319,7 @@ export class JsonStore {
     const current = this.db.providerApiKeyGroups.find((group) => group.id === id);
     this.db.providerApiKeyGroups = this.db.providerApiKeyGroups.filter((group) => group.id !== id);
     if (current) this.syncSiteModelsFromProviderKeys(current.siteId);
+    this.refreshGroupRouteMembers();
     this.persist();
   }
 
@@ -273,6 +332,7 @@ export class JsonStore {
     apiKey.lastCheckedAt = checkedAt;
     group.updatedAt = now();
     this.syncSiteModelsFromProviderKeys(group.siteId);
+    this.refreshGroupRouteMembers();
     this.persist();
     return this.toProviderApiKeyGroupView(group);
   }
@@ -330,12 +390,20 @@ export class JsonStore {
   deleteHeaderTemplate(id: string) {
     this.db.headerTemplates = this.db.headerTemplates.filter((template) => template.id !== id);
     this.db.routes = this.db.routes.map((route) => {
-      if (route.type === "switch" && route.headerTemplateId === id) {
+      if ((route.type === "switch" || route.type === "group") && route.headerTemplateId === id) {
         return { ...route, headerTemplateId: undefined, updatedAt: now() };
       }
       return route;
     });
     this.persist();
+  }
+
+  upsertRoute(input: Partial<RouteRecord>) {
+    const current = input.id ? this.db.routes.find((route) => route.id === input.id) : undefined;
+    const routeType = input.type || current?.type || "switch";
+    return routeType === "group"
+      ? this.upsertGroupRoute(input as Partial<GroupRoute>)
+      : this.upsertSwitchRoute(input as Partial<SwitchRoute>);
   }
 
   upsertSwitchRoute(input: Partial<SwitchRoute>) {
@@ -360,14 +428,77 @@ export class JsonStore {
     };
 
     if (input.id) {
-      const current = this.db.routes.find((route): route is SwitchRoute => route.id === input.id && route.type === "switch");
-      if (!current) throw new Error("路由不存在");
-      Object.assign(current, routeShape);
+      const index = this.db.routes.findIndex((route) => route.id === input.id);
+      if (index < 0) throw new Error("路由不存在");
+      const current = this.db.routes[index];
+      if (current.type === "switch") {
+        Object.assign(current, routeShape);
+      } else {
+        this.db.routes[index] = {
+          id: current.id,
+          createdAt: current.createdAt,
+          ...routeShape
+        };
+      }
       this.persist();
-      return current;
+      return this.db.routes[index] as SwitchRoute;
     }
 
     const created: SwitchRoute = {
+      id: `route-${randomUUID()}`,
+      createdAt: timestamp,
+      ...routeShape
+    };
+    this.db.routes.unshift(created);
+    this.persist();
+    return created;
+  }
+
+  upsertGroupRoute(input: Partial<GroupRoute>) {
+    const timestamp = now();
+    if (!input.name?.trim()) throw new Error("路由名称不能为空");
+    const strategy = normalizeGroupStrategy(input.strategy);
+    const current = input.id ? this.db.routes.find((route) => route.id === input.id) : undefined;
+    const currentGroup = current?.type === "group" ? current : undefined;
+    const matchRule = normalizeMatchRule(input.matchRule ?? currentGroup?.matchRule ?? input.modelGroupId ?? input.name);
+    const members = this.normalizeGroupRouteMembers(
+      input.members ?? currentGroup?.members ?? [],
+      matchRule,
+      input.modelGroupId ?? currentGroup?.modelGroupId
+    );
+    if (members.length === 0) throw new Error("请至少选择一个组内模型，或填写能匹配到模型的规则");
+
+    const routeShape = {
+      name: input.name.trim(),
+      type: "group" as const,
+      strategy,
+      modelGroupId: input.modelGroupId?.trim() || undefined,
+      matchRule,
+      members,
+      endpoint: input.endpoint || "messages",
+      headerTemplateId: input.headerTemplateId || undefined,
+      enabled: input.enabled ?? true,
+      updatedAt: timestamp
+    };
+
+    if (input.id) {
+      const index = this.db.routes.findIndex((route) => route.id === input.id);
+      if (index < 0) throw new Error("路由不存在");
+      const saved = this.db.routes[index];
+      if (saved.type === "group") {
+        Object.assign(saved, routeShape);
+      } else {
+        this.db.routes[index] = {
+          id: saved.id,
+          createdAt: saved.createdAt,
+          ...routeShape
+        };
+      }
+      this.persist();
+      return this.db.routes[index] as GroupRoute;
+    }
+
+    const created: GroupRoute = {
       id: `route-${randomUUID()}`,
       createdAt: timestamp,
       ...routeShape
@@ -394,6 +525,55 @@ export class JsonStore {
       ? this.db.headerTemplates.find((item) => item.id === route.headerTemplateId)
       : undefined;
     return { route, site, addresses, headerTemplate };
+  }
+
+  private normalizeGroupRouteMembers(inputMembers: Array<Partial<GroupRouteMember>> = [], matchRule = "", legacyModelGroupId?: string) {
+    const members = new Map<string, GroupRouteMember>();
+    const addMember = (input: Partial<GroupRouteMember>) => {
+      const siteId = input.siteId?.trim();
+      const apiKeyId = input.apiKeyId?.trim();
+      const model = input.model?.trim();
+      if (!siteId || !apiKeyId || !model) return;
+      const group = this.db.providerApiKeyGroups.find((item) => item.siteId === siteId && item.apiKeys.some((apiKey) => apiKey.id === apiKeyId));
+      const apiKey = group?.apiKeys.find((item) => item.id === apiKeyId);
+      if (!group || !apiKey || !apiKey.models.includes(model)) return;
+      const member = { siteId, apiKeyId, model };
+      members.set(groupMemberKey(member), member);
+    };
+
+    for (const member of inputMembers) addMember(member);
+
+    const addMatchingModels = (rule: string) => {
+      if (!rule.trim()) return;
+      for (const group of this.db.providerApiKeyGroups) {
+        for (const apiKey of group.apiKeys) {
+          for (const model of apiKey.models) {
+            if (smartModelMatches(model, rule)) addMember({ siteId: group.siteId, apiKeyId: apiKey.id, model });
+          }
+        }
+      }
+    };
+
+    addMatchingModels(matchRule);
+    if (members.size === 0 && legacyModelGroupId) addMatchingModels(legacyModelGroupId);
+    return Array.from(members.values());
+  }
+
+  private refreshGroupRouteMembers() {
+    this.db.routes = this.db.routes.map((route) => {
+      if (route.type !== "group") return route;
+      const matchRule = normalizeMatchRule(route.matchRule || route.modelGroupId || route.name);
+      const members = this.normalizeGroupRouteMembers(route.members || [], matchRule, route.modelGroupId);
+      const oldKeys = (route.members || []).map(groupMemberKey).sort().join("\n");
+      const newKeys = members.map(groupMemberKey).sort().join("\n");
+      if (matchRule === route.matchRule && oldKeys === newKeys) return route;
+      return {
+        ...route,
+        matchRule,
+        members,
+        updatedAt: now()
+      };
+    });
   }
 
   private normalizeAddress(address: Partial<SiteAddress>): SiteAddress {

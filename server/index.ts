@@ -12,20 +12,75 @@ import {
   ResponsesToMessagesConverter
 } from "@zenmux/rosetta-ai";
 import { JsonStore, parseHeaderTemplate } from "./store.js";
-import type { ProviderModelSyncResult, RequestLog, RequestLogStatus, Site, SiteAddress } from "../shared/types.js";
+import type {
+  GroupRoute,
+  HeaderTemplate,
+  ProviderApiKeyEntry,
+  ProviderModelSyncResult,
+  RequestLog,
+  RequestLogStatus,
+  RouteRecord,
+  Site,
+  SiteAddress,
+  SwitchRoute
+} from "../shared/types.js";
 
 const PORT = Number(process.env.SAMAPI_PORT || 8787);
 const HOST = process.env.SAMAPI_HOST || "0.0.0.0";
 const store = new JsonStore();
+const routeRuntimeState = new Map<string, { stableCandidateKey?: string }>();
+const DEFAULT_CORS_HEADERS = [
+  "Accept",
+  "Accept-Language",
+  "Authorization",
+  "Cache-Control",
+  "Content-Type",
+  "Priority",
+  "X-API-Key",
+  "X-App",
+  "X-Stainless-Arch",
+  "X-Stainless-Lang",
+  "X-Stainless-OS",
+  "X-Stainless-Package-Version",
+  "X-Stainless-Retry-Count",
+  "X-Stainless-Runtime",
+  "X-Stainless-Runtime-Version",
+  "X-Stainless-Timeout",
+  "Anthropic-Beta",
+  "Anthropic-Dangerous-Direct-Browser-Access",
+  "Anthropic-Version"
+].join(",");
+
+interface ProxyExecutionCandidate {
+  site: Site;
+  addresses: SiteAddress[];
+  model: string;
+  providerApiKey?: ProviderApiKeyEntry;
+  headerTemplate?: HeaderTemplate;
+  index: number;
+}
 
 function sendJson(response: http.ServerResponse, statusCode: number, payload: unknown) {
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type,Authorization,X-API-Key"
+    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS,HEAD",
+    "Access-Control-Allow-Headers": DEFAULT_CORS_HEADERS,
+    "Access-Control-Expose-Headers": "*"
   });
   response.end(JSON.stringify(payload));
+}
+
+function sendCorsPreflight(request: http.IncomingMessage, response: http.ServerResponse) {
+  const requestedHeaders = valueToHeaderText(request.headers["access-control-request-headers"]);
+  response.writeHead(204, {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS,HEAD",
+    "Access-Control-Allow-Headers": requestedHeaders || DEFAULT_CORS_HEADERS,
+    "Access-Control-Max-Age": "86400",
+    Vary: "Access-Control-Request-Headers"
+  });
+  response.end();
 }
 
 async function readJson(request: http.IncomingMessage) {
@@ -69,6 +124,11 @@ function compactPreview(text: string) {
   return responsePreview(text.replace(/\s+/g, " ").trim());
 }
 
+function requestApiKey(request: http.IncomingMessage, url: URL) {
+  const apiKey = request.headers.authorization || request.headers["x-api-key"] || url.searchParams.get("key") || undefined;
+  return Array.isArray(apiKey) ? apiKey[0] : apiKey;
+}
+
 function maskSecret(secret: string) {
   const trimmed = secret.trim();
   return trimmed ? `${trimmed.slice(0, 10)}...` : "";
@@ -93,13 +153,26 @@ function joinUrl(baseUrl: string, suffix: string) {
   return `${baseUrl.replace(/\/+$/, "")}/${suffix.replace(/^\/+/, "")}`;
 }
 
+function v1BaseUrl(baseUrl: string) {
+  try {
+    const parsed = new URL(baseUrl);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    parsed.pathname = /\/v\d+$/i.test(pathname) ? pathname.replace(/\/v\d+$/i, "/v1") : `${pathname}/v1`;
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    return joinUrl(baseUrl, "v1");
+  }
+}
+
 function requestModelName(body: unknown) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return "";
   const model = (body as { model?: unknown }).model;
   return typeof model === "string" ? model.trim() : "";
 }
 
-type ProxyKind = "generic" | "messages" | "chat-completions" | "responses" | "gemini-generate" | "gemini-stream";
+type ProxyKind = "generic" | "models" | "messages" | "chat-completions" | "responses" | "gemini-generate" | "gemini-stream";
 type RouteEndpointKind = "messages" | "chat/completions" | "responses";
 type RosettaConverter = {
   convertRequest: (payload: unknown) => unknown;
@@ -114,6 +187,7 @@ function normalizedProxyPath(pathname: string) {
 function proxyPathInfo(pathname: string): { supported: boolean; kind: ProxyKind; routeNameFromPath?: string } {
   const normalized = normalizedProxyPath(pathname);
   if (normalized === "/proxy") return { supported: true, kind: "generic" };
+  if (["/proxy/models", "/proxy/v1/models", "/proxy/v1beta/models"].includes(normalized)) return { supported: true, kind: "models" };
   if (["/proxy/messages", "/proxy/v1/messages"].includes(normalized)) return { supported: true, kind: "messages" };
   if (
     [
@@ -847,17 +921,79 @@ async function streamRawResponse(input: {
 }
 
 function unsupportedProxyMessage() {
-  return "代理入口支持 /proxy、/proxy/v1/messages、/proxy/v1/chat/completions、/proxy/v1/responses 和 /proxy/v1beta/models/{model}:generateContent";
+  return "代理入口支持 /proxy、/proxy/v1/models、/proxy/v1/messages、/proxy/v1/chat/completions、/proxy/v1/responses 和 /proxy/v1beta/models/{model}:generateContent";
 }
 
 function proxyKindLabel(kind: ProxyKind, pathname: string) {
   if (kind === "generic") return "proxy";
+  if (kind === "models") return "models";
   if (kind === "messages") return "messages";
   if (kind === "chat-completions") return "chat/completions";
   if (kind === "responses") return "responses";
   if (kind === "gemini-generate") return "gemini:generateContent";
   if (kind === "gemini-stream") return "gemini:streamGenerateContent";
   return pathname;
+}
+
+function routeCreatedSeconds(route: RouteRecord) {
+  const timestamp = Date.parse(route.createdAt);
+  return Number.isFinite(timestamp) ? Math.floor(timestamp / 1000) : 0;
+}
+
+function wantsAnthropicModelsFormat(request: http.IncomingMessage, url: URL) {
+  return Boolean(
+    url.searchParams.get("format") === "anthropic" ||
+      request.headers["anthropic-version"] ||
+      request.headers["anthropic-beta"] ||
+      request.headers["anthropic-dangerous-direct-browser-access"]
+  );
+}
+
+function proxyModelsPayload(format: "anthropic" | "openai") {
+  const data = store
+    .getDb()
+    .routes.filter((route) => route.enabled)
+    .map((route) => {
+      if (format === "anthropic") {
+        return {
+          type: "model",
+          id: route.name,
+          display_name: route.name,
+          created_at: route.createdAt
+        };
+      }
+
+      return {
+        id: route.name,
+        object: "model",
+        type: "model",
+        display_name: route.name,
+        created: routeCreatedSeconds(route),
+        created_at: route.createdAt,
+        owned_by: "samapi",
+        route_id: route.id,
+        route_type: route.type,
+        endpoint: route.endpoint,
+        ...(route.type === "group"
+          ? {
+              strategy: route.strategy,
+              match_rule: route.matchRule,
+              member_count: route.members.length
+            }
+          : {
+              site_id: route.siteId
+            })
+      };
+    });
+
+  const payload = {
+    data,
+    has_more: false,
+    first_id: typeof data[0]?.id === "string" ? data[0].id : null,
+    last_id: typeof data[data.length - 1]?.id === "string" ? data[data.length - 1].id : null
+  };
+
+  return format === "anthropic" ? payload : { object: "list", ...payload };
 }
 
 function chainSummary(input: {
@@ -886,39 +1022,141 @@ function setHeader(headers: Record<string, string>, name: string, value: string)
   headers[existingKey || name] = value;
 }
 
+function enabledSiteAddresses(site: Site) {
+  return site.addresses.filter((address) => address.enabled);
+}
+
+function routeHeaderTemplate(route: SwitchRoute | GroupRoute) {
+  return route.headerTemplateId ? store.getDb().headerTemplates.find((item) => item.id === route.headerTemplateId) : undefined;
+}
+
+function candidateKey(candidate: ProxyExecutionCandidate) {
+  return `${candidate.site.id}::${candidate.providerApiKey?.id || ""}::${candidate.model}`;
+}
+
+function candidateLogKey(candidate: ProxyExecutionCandidate) {
+  return `${candidate.site.id}::${candidate.model}`;
+}
+
+function preferredStableCandidateKey(route: GroupRoute, candidates: ProxyExecutionCandidate[]) {
+  const runtimeKey = routeRuntimeState.get(route.id)?.stableCandidateKey;
+  if (runtimeKey && candidates.some((candidate) => candidateKey(candidate) === runtimeKey)) return runtimeKey;
+
+  const recentSuccess = store
+    .listRequestLogs()
+    .find((log) => log.routeId === route.id && log.status === "success" && log.providerId && log.model);
+  if (!recentSuccess?.providerId || !recentSuccess.model) return undefined;
+
+  return candidates.find((candidate) => candidateLogKey(candidate) === `${recentSuccess.providerId}::${recentSuccess.model}`)
+    ? `${recentSuccess.providerId}::${recentSuccess.model}`
+    : undefined;
+}
+
+function orderedGroupCandidates(route: GroupRoute, candidates: ProxyExecutionCandidate[]) {
+  if (route.strategy === "random") {
+    const shuffled = [...candidates];
+    for (let index = shuffled.length - 1; index > 0; index -= 1) {
+      const swapIndex = Math.floor(Math.random() * (index + 1));
+      [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+    }
+    return shuffled;
+  }
+  if (route.strategy === "stable-first") {
+    const preferredKey = preferredStableCandidateKey(route, candidates);
+    if (!preferredKey) return candidates;
+    const preferredIndex = candidates.findIndex(
+      (candidate) => candidateKey(candidate) === preferredKey || candidateLogKey(candidate) === preferredKey
+    );
+    if (preferredIndex <= 0) return candidates;
+    const preferred = candidates[preferredIndex];
+    return [preferred, ...candidates.filter((_, index) => index !== preferredIndex)];
+  }
+  return candidates;
+}
+
+function markCandidateSuccess(route: RouteRecord, candidate: ProxyExecutionCandidate) {
+  if (route.type !== "group" || route.strategy !== "stable-first") return;
+  routeRuntimeState.set(route.id, {
+    stableCandidateKey: candidateKey(candidate)
+  });
+}
+
+function routeMemberKey(member: { siteId: string; apiKeyId: string; model: string }) {
+  return `${member.siteId}::${member.apiKeyId}::${member.model}`;
+}
+
+function resolveProxyExecution(routeNameOrId: string) {
+  const db = store.getDb();
+  const route = db.routes.find((item) => item.id === routeNameOrId || item.name === routeNameOrId);
+  if (!route || !route.enabled) throw new Error("路由不存在或已停用");
+
+  if (route.type === "switch") {
+    const site = db.sites.find((item) => item.id === route.siteId);
+    const addresses = site ? enabledSiteAddresses(site) : [];
+    if (!site || addresses.length === 0) throw new Error("路由绑定的供应商地址不可用");
+    return {
+      route,
+      candidates: [
+        {
+          site,
+          addresses,
+          model: route.model,
+          providerApiKey: store.resolveProviderApiKey(site.id, route.model),
+          headerTemplate: routeHeaderTemplate(route),
+          index: 0
+        }
+      ]
+    };
+  }
+
+  const headerTemplate = routeHeaderTemplate(route);
+  const candidates: ProxyExecutionCandidate[] = [];
+  const usedMembers = new Set<string>();
+  const members =
+    route.members?.length > 0
+      ? route.members
+      : db.providerApiKeyGroups.flatMap((group) =>
+          group.apiKeys.flatMap((apiKey) =>
+            apiKey.models
+              .filter((model) => model === route.modelGroupId)
+              .map((model) => ({ siteId: group.siteId, apiKeyId: apiKey.id, model }))
+          )
+        );
+  for (const member of members) {
+    const memberKey = routeMemberKey(member);
+    if (usedMembers.has(memberKey)) continue;
+    usedMembers.add(memberKey);
+    const site = db.sites.find((item) => item.id === member.siteId);
+    if (!site) continue;
+    const addresses = enabledSiteAddresses(site);
+    if (addresses.length === 0) continue;
+    const group = db.providerApiKeyGroups.find((item) => item.siteId === member.siteId && item.apiKeys.some((apiKey) => apiKey.id === member.apiKeyId));
+    const apiKey = group?.apiKeys.find((item) => item.id === member.apiKeyId);
+    if (!apiKey?.enabled || !apiKey.models.includes(member.model)) continue;
+    candidates.push({
+      site,
+      addresses,
+      model: member.model,
+      providerApiKey: apiKey,
+      headerTemplate,
+      index: candidates.length
+    });
+  }
+  if (candidates.length === 0) throw new Error(`分组路由 ${route.name} 没有可用模型`);
+  return { route, candidates: orderedGroupCandidates(route, candidates) };
+}
+
 function looksLikeHtml(contentType: string | undefined, text: string) {
   const compact = text.trim().slice(0, 80).toLowerCase();
   return Boolean(contentType?.toLowerCase().includes("text/html") || compact.startsWith("<!doctype") || compact.startsWith("<html"));
 }
 
 function proxyEndpointCandidates(baseUrl: string, endpoint: string) {
-  const candidates: string[] = [];
-  try {
-    const parsed = new URL(baseUrl);
-    const pathname = parsed.pathname.replace(/\/+$/, "");
-    if (!/\/v\d+$/i.test(pathname)) {
-      candidates.push(joinUrl(baseUrl, `v1/${endpoint}`));
-    }
-  } catch {
-    // Base URLs are validated before storage; keep the primary candidate if this ever fails.
-  }
-  candidates.push(joinUrl(baseUrl, endpoint));
-  return Array.from(new Set(candidates));
+  return [joinUrl(v1BaseUrl(baseUrl), endpoint)];
 }
 
 function modelEndpointCandidates(baseUrl: string) {
-  const candidates: string[] = [];
-  try {
-    const parsed = new URL(baseUrl);
-    const pathname = parsed.pathname.replace(/\/+$/, "");
-    if (!/\/v\d+$/i.test(pathname)) {
-      candidates.push(joinUrl(baseUrl, "v1/models"));
-    }
-  } catch {
-    // Base URLs are validated before storage; keep the primary candidate if this ever fails.
-  }
-  candidates.push(joinUrl(baseUrl, "models"));
-  return Array.from(new Set(candidates));
+  return [joinUrl(v1BaseUrl(baseUrl), "models")];
 }
 
 function newApiPricingEndpointCandidates(baseUrl: string) {
@@ -1375,22 +1613,31 @@ async function syncAllProviderModels(request: http.IncomingMessage): Promise<Pro
 }
 
 function resolveLogContext(routeNameOrId: string): Partial<RequestLog> {
-  try {
-    const resolved = store.resolveRoute(routeNameOrId);
-    const firstAddress = resolved.addresses[0];
-    return {
-      routeId: resolved.route.id,
-      routeName: resolved.route.name,
-      endpoint: resolved.route.endpoint,
-      providerName: resolved.site.name,
-      providerId: resolved.site.id,
-      addressLabel: firstAddress?.label,
-      model: resolved.route.model,
-      upstreamUrl: firstAddress ? joinUrl(firstAddress.baseUrl, resolved.route.endpoint) : undefined
-    };
-  } catch {
+  const route = store.getDb().routes.find((item) => item.id === routeNameOrId || item.name === routeNameOrId);
+  if (!route) {
     return {};
   }
+  if (route.type === "group") {
+    return {
+      routeId: route.id,
+      routeName: route.name,
+      endpoint: route.endpoint,
+      providerName: "分组路由",
+      model: route.name
+    };
+  }
+  const site = store.getDb().sites.find((item) => item.id === route.siteId);
+  const firstAddress = site?.addresses.find((address) => address.enabled);
+  return {
+    routeId: route.id,
+    routeName: route.name,
+    endpoint: route.endpoint,
+    providerName: site?.name,
+    providerId: site?.id,
+    addressLabel: firstAddress?.label,
+    model: route.model,
+    upstreamUrl: firstAddress ? proxyEndpointCandidates(firstAddress.baseUrl, route.endpoint)[0] : undefined
+  };
 }
 
 async function handleApi(request: http.IncomingMessage, response: http.ServerResponse, url: URL) {
@@ -1482,8 +1729,8 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
 
     if (parts[1] === "routes") {
       if (method === "GET") return sendJson(response, 200, store.getDb().routes);
-      if (method === "POST") return sendJson(response, 201, store.upsertSwitchRoute(await readJson(request)));
-      if (method === "PATCH") return sendJson(response, 200, store.upsertSwitchRoute({ ...(await readJson(request)), id: routeParam(parts, 2) }));
+      if (method === "POST") return sendJson(response, 201, store.upsertRoute(await readJson(request)));
+      if (method === "PATCH") return sendJson(response, 200, store.upsertRoute({ ...(await readJson(request)), id: routeParam(parts, 2) }));
       if (method === "DELETE") {
         store.deleteRoute(routeParam(parts, 2));
         return sendJson(response, 200, { ok: true });
@@ -1550,18 +1797,18 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
   const routeLogContext = resolveLogContext(routeNameOrId);
   const requestLogBase = {
     ...baseLog,
-    routeName: routeNameOrId || "unknown"
+    routeName: proxyInfo.kind === "models" ? "proxy-models" : routeNameOrId || "unknown"
   };
   const downstreamLog = {
-    model: routeNameOrId || requestModelName(body) || "unknown",
+    model: proxyInfo.kind === "models" ? "模型列表" : routeNameOrId || requestModelName(body) || "unknown",
     endpoint: downstreamEndpoint,
     userAgent: downstreamUa,
     path: url.pathname,
     method: request.method || "POST"
   };
 
-  const apiKey = request.headers.authorization || request.headers["x-api-key"] || url.searchParams.get("key") || undefined;
-  if (!store.verifyApiKey(Array.isArray(apiKey) ? apiKey[0] : apiKey)) {
+  const apiKey = requestApiKey(request, url);
+  if (!store.verifyApiKey(apiKey)) {
     store.recordRequestLog({
       ...requestLogBase,
       ...routeLogContext,
@@ -1575,40 +1822,48 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
     return;
   }
 
+  if (proxyInfo.kind === "models") {
+    if (request.method !== "GET") {
+      store.recordRequestLog({
+        ...requestLogBase,
+        routeName: "proxy-models",
+        providerName: "模型列表",
+        model: "模型列表",
+        requestBody: body,
+        status: "failed",
+        statusCode: 405,
+        durationMs: Date.now() - startedAt,
+        errorMessage: "Models endpoint only supports GET",
+        downstream: downstreamLog
+      });
+      sendJson(response, 405, { error: "Models endpoint only supports GET" });
+      return;
+    }
+
+    const modelsFormat = wantsAnthropicModelsFormat(request, url) ? "anthropic" : "openai";
+    const payload = proxyModelsPayload(modelsFormat);
+    const modelIds = payload.data.map((item) => item.id).filter((item): item is string => typeof item === "string");
+    store.recordRequestLog({
+      ...requestLogBase,
+      routeName: "proxy-models",
+      providerName: "模型列表",
+      model: "模型列表",
+      requestBody: undefined,
+      status: "success",
+      statusCode: 200,
+      durationMs: Date.now() - startedAt,
+      responsePreview: responsePreview(JSON.stringify({ modelCount: modelIds.length, models: modelIds.slice(0, 80) }, null, 2)),
+      downstream: downstreamLog,
+      summary: `下游 models (${url.pathname} / ${downstreamUa || "unknown ua"}) -> 返回 ${modelIds.length} 个可用模型 (${modelsFormat})`
+    });
+    sendJson(response, 200, payload);
+    return;
+  }
+
   try {
     if (!routeNameOrId) throw new Error("请求体中的 model 必须填写路由名称");
-    const { route, site, addresses, headerTemplate } = store.resolveRoute(routeNameOrId);
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      ...parseHeaderTemplate(headerTemplate?.headersText)
-    };
-    const providerApiKey = store.resolveProviderApiKey(site.id, route.model);
-    if (!providerApiKey && !headerValue(headers, "Authorization")) throw new Error(`未找到支持模型 ${route.model} 的上游 API Key`);
-    if (providerApiKey) setHeader(headers, "Authorization", `Bearer ${providerApiKey.secret}`);
-    const routeUa = headerValue(headers, "User-Agent") || "fetch default";
-    const routeTargetLog = {
-      routeName: route.name,
-      model: route.model,
-      endpoint: route.endpoint,
-      providerName: site.name,
-      userAgent: routeUa
-    };
-    const upstreamAuthLog: Record<string, string> = providerApiKey
-      ? {
-          "upstream-api-key": providerApiKey.label,
-          "upstream-authorization": `Bearer ${maskSecret(providerApiKey.secret)}`
-        }
-      : {
-          "upstream-authorization": "Header 模版已提供"
-        };
+    const { route, candidates } = resolveProxyExecution(routeNameOrId);
     const downstreamStream = isStreamingRequest(body) || proxyInfo.kind === "gemini-stream";
-    const converted = convertedRouteRequestBody(body, route.model, route.endpoint, proxyInfo.kind);
-    const responseConverter = converted.converter;
-    const forwardedBody = downstreamStream ? applyStreamingFlag(converted.body, true) : converted.body;
-    const upstreamRequestHeaders = {
-      ...maskedStringHeaders(headers),
-      ...upstreamAuthLog
-    };
 
     const errors: string[] = [];
     let lastFailure:
@@ -1620,9 +1875,51 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
           contentType?: string;
         }
       | undefined;
+    let lastAttemptContext:
+      | {
+          candidate: ProxyExecutionCandidate;
+          routeUa: string;
+          routeTargetLog: RequestLog["routeTarget"];
+          upstreamAuthLog: Record<string, string>;
+        }
+      | undefined;
     const upstreamAttempts: NonNullable<RequestLog["upstreamAttempts"]> = [];
 
-    for (const address of addresses) {
+    for (const candidate of candidates) {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        ...parseHeaderTemplate(candidate.headerTemplate?.headersText)
+      };
+      if (!candidate.providerApiKey && !headerValue(headers, "Authorization")) {
+        throw new Error(`未找到支持模型 ${candidate.model} 的上游 API Key`);
+      }
+      if (candidate.providerApiKey) setHeader(headers, "Authorization", `Bearer ${candidate.providerApiKey.secret}`);
+      const routeUa = headerValue(headers, "User-Agent") || "fetch default";
+      const routeTargetLog = {
+        routeName: route.name,
+        model: candidate.model,
+        endpoint: route.endpoint,
+        providerName: candidate.site.name,
+        userAgent: routeUa
+      };
+      const upstreamAuthLog: Record<string, string> = candidate.providerApiKey
+        ? {
+            "upstream-api-key": candidate.providerApiKey.label,
+            "upstream-authorization": `Bearer ${maskSecret(candidate.providerApiKey.secret)}`
+          }
+        : {
+            "upstream-authorization": "Header 模版已提供"
+          };
+      const converted = convertedRouteRequestBody(body, candidate.model, route.endpoint, proxyInfo.kind);
+      const responseConverter = converted.converter;
+      const forwardedBody = downstreamStream ? applyStreamingFlag(converted.body, true) : converted.body;
+      const upstreamRequestHeaders = {
+        ...maskedStringHeaders(headers),
+        ...upstreamAuthLog
+      };
+      lastAttemptContext = { candidate, routeUa, routeTargetLog, upstreamAuthLog };
+
+      for (const address of candidate.addresses) {
       for (const target of proxyEndpointCandidates(address.baseUrl, route.endpoint)) {
         const attemptStartedAt = Date.now();
         try {
@@ -1652,7 +1949,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                         response,
                         proxyKind: proxyInfo.kind,
                         routeEndpoint: route.endpoint,
-                        routeModel: route.model,
+                        routeModel: candidate.model,
                         requestBody: forwardedBody,
                         converter: responseConverter
                       })
@@ -1662,7 +1959,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                   addressLabel: address.label,
                   upstreamUrl: target,
                   method: request.method || "POST",
-                  model: route.model,
+                  model: candidate.model,
                   endpoint: route.endpoint,
                   userAgent: routeUa,
                   requestHeaders: upstreamRequestHeaders,
@@ -1678,10 +1975,10 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                   routeId: route.id,
                   routeName: route.name,
                   endpoint: route.endpoint,
-                  providerName: site.name,
-                  providerId: site.id,
+                  providerName: candidate.site.name,
+                  providerId: candidate.site.id,
                   addressLabel: address.label,
-                  model: route.model,
+                  model: candidate.model,
                   requestBody: body,
                   status: "success",
                   statusCode: upstream.status,
@@ -1700,12 +1997,13 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                     downstreamModel: downstreamLog.model,
                     downstreamEndpoint,
                     downstreamUa,
-                    routeModel: route.model,
+                    routeModel: candidate.model,
                     routeEndpoint: route.endpoint,
                     routeUa,
                     status: "success"
                   })
                 });
+                markCandidateSuccess(route, candidate);
                 return;
               } catch (streamError) {
                 const errorMessage = streamError instanceof Error ? streamError.message : "流式转发失败";
@@ -1713,7 +2011,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                   addressLabel: address.label,
                   upstreamUrl: target,
                   method: request.method || "POST",
-                  model: route.model,
+                  model: candidate.model,
                   endpoint: route.endpoint,
                   userAgent: routeUa,
                   requestHeaders: upstreamRequestHeaders,
@@ -1730,10 +2028,10 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                   routeId: route.id,
                   routeName: route.name,
                   endpoint: route.endpoint,
-                  providerName: site.name,
-                  providerId: site.id,
+                  providerName: candidate.site.name,
+                  providerId: candidate.site.id,
                   addressLabel: address.label,
-                  model: route.model,
+                  model: candidate.model,
                   requestBody: body,
                   status: "failed",
                   statusCode: 599,
@@ -1753,7 +2051,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                     downstreamModel: downstreamLog.model,
                     downstreamEndpoint,
                     downstreamUa,
-                    routeModel: route.model,
+                    routeModel: candidate.model,
                     routeEndpoint: route.endpoint,
                     routeUa,
                     status: "failed"
@@ -1772,7 +2070,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                 addressLabel: address.label,
                 upstreamUrl: target,
                 method: request.method || "POST",
-                model: route.model,
+                model: candidate.model,
                 endpoint: route.endpoint,
                 userAgent: routeUa,
                 requestHeaders: upstreamRequestHeaders,
@@ -1804,7 +2102,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
               addressLabel: address.label,
               upstreamUrl: target,
               method: request.method || "POST",
-              model: route.model,
+              model: candidate.model,
               endpoint: route.endpoint,
               userAgent: routeUa,
               requestHeaders: upstreamRequestHeaders,
@@ -1820,10 +2118,10 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
               routeId: route.id,
               routeName: route.name,
               endpoint: route.endpoint,
-              providerName: site.name,
-              providerId: site.id,
+              providerName: candidate.site.name,
+              providerId: candidate.site.id,
               addressLabel: address.label,
-              model: route.model,
+              model: candidate.model,
               requestBody: body,
               status: "success",
               statusCode: upstream.status,
@@ -1842,12 +2140,13 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                 downstreamModel: downstreamLog.model,
                 downstreamEndpoint,
                 downstreamUa,
-                routeModel: route.model,
+                routeModel: candidate.model,
                 routeEndpoint: route.endpoint,
                 routeUa,
                 status: "success"
               })
             });
+            markCandidateSuccess(route, candidate);
             response.writeHead(upstream.status, {
               "Content-Type": adapted.contentType || "application/json; charset=utf-8",
               "Access-Control-Allow-Origin": "*"
@@ -1864,7 +2163,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
             addressLabel: address.label,
             upstreamUrl: target,
             method: request.method || "POST",
-            model: route.model,
+            model: candidate.model,
             endpoint: route.endpoint,
             userAgent: routeUa,
             requestHeaders: upstreamRequestHeaders,
@@ -1890,7 +2189,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
             addressLabel: address.label,
             upstreamUrl: target,
             method: request.method || "POST",
-            model: route.model,
+            model: candidate.model,
             endpoint: route.endpoint,
             userAgent: routeUa,
             requestHeaders: upstreamRequestHeaders,
@@ -1912,40 +2211,51 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
         }
       }
     }
+    }
 
     const message = `上游地址均不可用：${errors.join("；") || "没有可用地址"}`;
-    const failedAddress = lastFailure?.address || addresses[0];
+    const failedCandidate = lastAttemptContext?.candidate || candidates[0];
+    const failedAddress = lastFailure?.address || failedCandidate?.addresses[0];
+    const failedRouteUa = lastAttemptContext?.routeUa || "fetch default";
+    const failedRouteTargetLog =
+      lastAttemptContext?.routeTargetLog || {
+        routeName: route.name,
+        model: failedCandidate?.model || (route.type === "group" ? route.name : route.model),
+        endpoint: route.endpoint,
+        providerName: failedCandidate?.site.name || (route.type === "group" ? "分组路由" : "未匹配"),
+        userAgent: failedRouteUa
+      };
     store.recordRequestLog({
       ...requestLogBase,
       routeId: route.id,
       routeName: route.name,
       endpoint: route.endpoint,
-      providerName: site.name,
-      providerId: site.id,
+      providerName: failedCandidate?.site.name || "未匹配",
+      providerId: failedCandidate?.site.id,
       addressLabel: failedAddress?.label,
-      model: route.model,
+      model: failedCandidate?.model || (route.type === "group" ? route.name : route.model),
       requestBody: body,
       status: "failed",
       statusCode: lastFailure?.statusCode || 502,
       durationMs: Date.now() - startedAt,
       requestHeaders: {
         ...requestLogBase.requestHeaders,
-        ...upstreamAuthLog
+        ...(lastAttemptContext?.upstreamAuthLog || {})
       },
       upstreamUrl: lastFailure?.target,
       upstreamContentType: lastFailure?.contentType,
       responsePreview: lastFailure?.text ? responsePreview(lastFailure.text) : undefined,
       errorMessage: message,
       downstream: downstreamLog,
-      routeTarget: routeTargetLog,
+      routeTarget: failedRouteTargetLog,
       upstreamAttempts,
       summary: chainSummary({
         downstreamModel: downstreamLog.model,
         downstreamEndpoint,
         downstreamUa,
-        routeModel: route.model,
+        routeModel: failedRouteTargetLog.model,
         routeEndpoint: route.endpoint,
-        routeUa,
+        routeUa: failedRouteUa,
         status: "failed"
       })
     });
@@ -2003,7 +2313,7 @@ async function handleUnsupportedProxyPath(request: http.IncomingMessage, respons
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
   if (request.method === "OPTIONS") {
-    sendJson(response, 204, {});
+    sendCorsPreflight(request, response);
     return;
   }
   if (url.pathname.startsWith("/api/")) {
