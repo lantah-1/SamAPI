@@ -905,7 +905,12 @@ export default function App() {
             </div>
             <div className="break-all">{snapshot.dbPath}</div>
           </div>
-          <NavButton item={settingsNavItem} active={section === settingsNavItem.id} onClick={setSection} className="app-settings-nav" />
+          <div className="app-bottom-actions">
+            <NavButton item={settingsNavItem} active={section === settingsNavItem.id} onClick={setSection} className="app-settings-nav" />
+            <button className="nav-button nav-refresh-button" type="button" onClick={load} disabled={busy} title="刷新数据" aria-label="刷新数据">
+              <RefreshCw className={`h-5 w-5 ${busy ? "animate-spin" : ""}`} />
+            </button>
+          </div>
         </aside>
 
         <section className="app-content flex min-w-0 flex-1 flex-col gap-4">
@@ -916,17 +921,14 @@ export default function App() {
                 {allNavItems.find((item) => item.id === section)?.label}
               </h1>
             </div>
-            <div className="app-header-actions flex items-center gap-2">
-              <ActionButton tone="ghost" onClick={load} disabled={busy} title="刷新">
-                <RefreshCw className={`h-4 w-4 ${busy ? "animate-spin" : ""}`} />
-              </ActionButton>
-              {canAddInSection ? (
+            {canAddInSection ? (
+              <div className="app-header-actions flex items-center gap-2">
                 <ActionButton type="button" onClick={openNewForSection}>
                   <Plus className="h-4 w-4" />
                   添加
                 </ActionButton>
-              ) : null}
-            </div>
+              </div>
+            ) : null}
           </header>
 
           <div
@@ -1157,7 +1159,11 @@ function RoutesView(props: {
               const models = siteModels(quickSite);
               const modelOptions = Array.from(new Set([quick.model, ...models].filter(Boolean))).sort();
               const isOpen = Boolean(expanded[route.id]);
-              const hasChanges = quick.siteId !== route.siteId || quick.model !== route.model || quick.enabled !== route.enabled;
+              const hasChanges =
+                quick.siteId !== route.siteId ||
+                quick.model !== route.model ||
+                quick.endpoint !== route.endpoint ||
+                quick.enabled !== route.enabled;
               const toggleRoute = () => setExpanded((current) => ({ ...current, [route.id]: !isOpen }));
               return (
                 <article
@@ -1236,12 +1242,19 @@ function RoutesView(props: {
                             <strong>{models.length} 个</strong>
                           </div>
                         </div>
-                        <div className="route-quick-control">
+                        <label className="route-quick-control">
                           <span className="route-quick-label">Endpoint</span>
-                          <div className="route-quick-body route-quick-stat route-quick-endpoint">
-                            <strong>{endpointLabels[route.endpoint]}</strong>
-                          </div>
-                        </div>
+                          <SelectInput
+                            value={quick.endpoint || route.endpoint}
+                            onChange={(event) => updateRouteDraft(route, { endpoint: event.target.value as EndpointKind })}
+                          >
+                            {props.snapshot.endpoints.map((endpoint) => (
+                              <option key={endpoint} value={endpoint}>
+                                {endpointLabels[endpoint]}
+                              </option>
+                            ))}
+                          </SelectInput>
+                        </label>
                         <label className="route-quick-control">
                           <span className="route-quick-label">状态</span>
                           <span className="route-quick-body route-quick-toggle">

@@ -46,6 +46,10 @@ textarea {
   backdrop-filter: blur(18px);
 }
 
+.panel:has(.select-shell-open) {
+  z-index: 80;
+}
+
 .app-shell,
 .app-content,
 .app-header-title,
@@ -150,6 +154,62 @@ textarea {
 
 .app-database {
   margin-top: auto;
+}
+
+.app-bottom-actions {
+  display: flex;
+  width: 100%;
+  align-items: stretch;
+  gap: 0.35rem;
+}
+
+.app-bottom-actions .app-settings-nav {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.nav-refresh-button {
+  display: grid;
+  flex: 0 0 44px;
+  width: 44px;
+  min-height: 44px;
+  place-items: center;
+  gap: 0;
+  padding: 0;
+}
+
+.nav-refresh-button svg {
+  margin: 0;
+}
+
+.nav-refresh-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+  transform: none;
+}
+
+.nav-refresh-button:disabled:hover {
+  background: transparent;
+  color: rgba(21, 24, 27, 0.68);
+}
+
+@media (min-width: 761px) and (max-width: 1023px) {
+  .app-nav {
+    width: 116px !important;
+  }
+
+  .app-bottom-actions {
+    justify-content: center;
+  }
+
+  .app-bottom-actions .app-settings-nav,
+  .app-bottom-actions .nav-refresh-button {
+    flex: 0 0 44px;
+    width: 44px;
+    min-height: 44px;
+    padding-right: 0;
+    padding-left: 0;
+  }
 }
 
 .workspace-grid {
@@ -436,6 +496,7 @@ label {
   position: relative;
   display: grid;
   width: 100%;
+  grid-template-columns: minmax(0, 1fr);
   align-items: stretch;
   gap: 0;
   padding: 0;
@@ -453,6 +514,13 @@ label {
   text-align: left;
 }
 
+.route-record-main,
+.route-quick-panel,
+.route-detail-panel {
+  grid-column: 1 / -1;
+  justify-self: stretch;
+}
+
 .route-record-main > .min-w-0 {
   flex: 1 1 auto;
   width: 100%;
@@ -460,6 +528,10 @@ label {
 
 .route-record-open .route-record-main {
   align-items: flex-start;
+}
+
+.route-record:has(.select-shell-open) {
+  z-index: 85;
 }
 
 .route-record:focus-visible {
@@ -1458,6 +1530,10 @@ label {
     display: none !important;
   }
 
+  .app-bottom-actions {
+    display: contents;
+  }
+
   .nav-button {
     min-height: 54px;
     flex: 0 0 74px;
@@ -1467,6 +1543,19 @@ label {
     padding: 0.38rem 0.25rem;
     font-size: 0.66rem;
     line-height: 1.1;
+  }
+
+  .app-bottom-actions .app-settings-nav {
+    flex: 0 0 74px;
+    width: auto;
+    padding: 0.38rem 0.25rem;
+  }
+
+  .app-bottom-actions .nav-refresh-button {
+    flex: 0 0 54px;
+    width: 54px;
+    min-height: 54px;
+    padding: 0;
   }
 
   .app-database {
@@ -1489,15 +1578,21 @@ label {
 
   .app-header {
     min-height: 0;
-    flex-wrap: wrap;
-    align-items: flex-start !important;
-    gap: 0.7rem;
+    flex-wrap: nowrap;
+    align-items: center !important;
+    gap: 0.75rem;
     padding: 0.9rem;
+  }
+
+  .app-header-title {
+    flex: 1 1 auto;
+    min-width: 0;
   }
 
   .app-header h1 {
     font-size: 1.45rem;
     line-height: 1.12;
+    overflow-wrap: anywhere;
   }
 
   .app-header .text-xs {
@@ -1505,12 +1600,41 @@ label {
   }
 
   .app-header-actions {
-    width: 100%;
-    justify-content: space-between;
+    width: auto;
+    flex: 0 0 auto;
+    justify-content: flex-end;
+    margin-left: auto;
   }
 
   .app-header-actions .action {
     min-height: 42px;
+    white-space: nowrap;
+  }
+
+  .route-quick-panel,
+  .route-quick-grid,
+  .route-quick-control,
+  .route-quick-control .select-shell,
+  .route-quick-control .select-trigger,
+  .route-quick-body,
+  .route-quick-actions,
+  .route-quick-actions .action {
+    width: 100%;
+    max-width: none;
+  }
+
+  .route-record > *,
+  .route-quick-grid > * {
+    min-width: 0;
+  }
+
+  .route-quick-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .route-quick-actions {
+    display: flex;
+    flex-direction: column-reverse;
   }
 
   .panel {
@@ -1586,7 +1710,7 @@ label {
   }
 }
 
-@media (max-width: 680px) {
+@media (max-width: 760px) {
   .record {
     flex-direction: column;
     min-height: 0;
@@ -1610,6 +1734,7 @@ label {
 
   .route-record-actions {
     position: static;
+    width: calc(100% - 1.8rem);
     transform: none;
     margin: 0 0.9rem 0.9rem;
   }
@@ -1619,6 +1744,10 @@ label {
     flex-wrap: wrap;
     align-items: center;
     justify-content: flex-end;
+  }
+
+  .record-actions.route-record-actions {
+    width: calc(100% - 1.8rem);
   }
 
   .route-quick-panel {
