@@ -569,10 +569,14 @@ export default function App() {
   const [createdKey, setCreatedKey] = useState<ApiKeyCreated | null>(null);
   const [toast, setToast] = useState<string>("");
   const [appScrollbarVisible, setAppScrollbarVisible] = useState(false);
+  const [appScrollbarThumb, setAppScrollbarThumb] = useState({ height: 0, scrollable: false, top: 0 });
   const [logsAutoRefresh, setLogsAutoRefresh] = useState(true);
+  const [logsRefreshing, setLogsRefreshing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [modelSyncing, setModelSyncing] = useState(false);
   const [modelDiscoveringIndex, setModelDiscoveringIndex] = useState<number | null>(null);
+  const appScrollRef = useRef<HTMLDivElement | null>(null);
+  const appScrollContentRef = useRef<HTMLDivElement | null>(null);
   const toastTimerRef = useRef<number | undefined>(undefined);
   const toastStartedAtRef = useRef(0);
   const toastRemainingMsRef = useRef(0);
@@ -632,10 +636,52 @@ export default function App() {
     setAppScrollbarVisible(false);
   };
 
+  const updateAppScrollbar = () => {
+    const element = appScrollRef.current;
+    if (!element) return;
+    const { clientHeight, scrollHeight, scrollTop } = element;
+    const scrollable = scrollHeight > clientHeight + 1;
+    if (!scrollable) {
+      setAppScrollbarThumb((current) => (current.scrollable ? { height: 0, scrollable: false, top: 0 } : current));
+      return;
+    }
+    const inset = 8;
+    const trackHeight = Math.max(0, clientHeight - inset * 2);
+    const height = Math.min(trackHeight, Math.max(44, (clientHeight / scrollHeight) * trackHeight));
+    const maxTop = Math.max(0, trackHeight - height);
+    const maxScrollTop = Math.max(1, scrollHeight - clientHeight);
+    const top = inset + (scrollTop / maxScrollTop) * maxTop;
+    setAppScrollbarThumb((current) =>
+      current.scrollable &&
+      Math.abs(current.height - height) < 0.5 &&
+      Math.abs(current.top - top) < 0.5
+        ? current
+        : { height, scrollable: true, top }
+    );
+  };
+
+  const revealAppScrollbar = () => {
+    updateAppScrollbar();
+    showAppScrollbar();
+  };
+
   const load = async () => {
     const next = await api.snapshot();
     setSnapshot(next);
     setRouteDraft((current) => (current.name ? current : emptyRoute(next)));
+  };
+
+  const refreshLogs = async (showSuccess = false) => {
+    setLogsRefreshing(true);
+    try {
+      const requestLogs = await api.listLogs();
+      setSnapshot((current) => (current ? { ...current, requestLogs } : current));
+      if (showSuccess) setToast("日志已刷新");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "日志刷新失败");
+    } finally {
+      setLogsRefreshing(false);
+    }
   };
 
   useEffect(() => {
@@ -651,9 +697,24 @@ export default function App() {
   useEffect(() => clearAppScrollbarTimer, []);
 
   useEffect(() => {
+    const scrollElement = appScrollRef.current;
+    const contentElement = appScrollContentRef.current;
+    if (!scrollElement || !contentElement) return;
+    updateAppScrollbar();
+    const observer = new ResizeObserver(updateAppScrollbar);
+    observer.observe(scrollElement);
+    observer.observe(contentElement);
+    window.addEventListener("resize", updateAppScrollbar);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateAppScrollbar);
+    };
+  }, [section, snapshot]);
+
+  useEffect(() => {
     if (section !== "logs" || !logsAutoRefresh) return;
     const interval = window.setInterval(() => {
-      load().catch((error) => setToast(error instanceof Error ? error.message : "日志自动刷新失败"));
+      refreshLogs();
     }, 5000);
     return () => window.clearInterval(interval);
   }, [section, logsAutoRefresh]);
@@ -891,7 +952,7 @@ export default function App() {
               <ShieldCheck className="h-5 w-5" />
             </div>
             <div className="app-brand-copy hidden lg:block">
-              <div className="font-display text-lg font-black tracking-normal">SamAPI</div>
+              <div className="font-display text-lg font-black">SamAPI</div>
               <div className="text-xs text-ink/55">Local model gateway</div>
             </div>
           </div>
@@ -916,28 +977,39 @@ export default function App() {
         <section className="app-content flex min-w-0 flex-1 flex-col gap-4">
           <header className="app-header panel flex min-h-16 items-center justify-between gap-4 px-4 py-3">
             <div className="app-header-title">
-              <div className="text-xs font-bold uppercase tracking-[0.24em] text-rust">Control Plane</div>
-              <h1 className="font-display text-2xl font-black tracking-normal md:text-3xl">
+              <div className="text-xs font-bold text-rust">Control Plane</div>
+              <h1 className="font-display text-2xl font-black md:text-3xl">
                 {allNavItems.find((item) => item.id === section)?.label}
               </h1>
             </div>
-            {canAddInSection ? (
+            {canAddInSection || section === "logs" ? (
               <div className="app-header-actions flex items-center gap-2">
-                <ActionButton type="button" onClick={openNewForSection}>
-                  <Plus className="h-4 w-4" />
-                  添加
-                </ActionButton>
+                {section === "logs" ? (
+                  <ActionButton
+                    className="app-header-icon-action"
+                    type="button"
+                    tone="ghost"
+                    onClick={() => refreshLogs(true)}
+                    disabled={logsRefreshing}
+                    title="刷新日志"
+                    aria-label="刷新日志"
+                  >
+                    <RefreshCw className={`h-4 w-4 ${logsRefreshing ? "animate-spin" : ""}`} />
+                  </ActionButton>
+                ) : null}
+                {canAddInSection ? (
+                  <ActionButton type="button" onClick={openNewForSection}>
+                    <Plus className="h-4 w-4" />
+                    添加
+                  </ActionButton>
+                ) : null}
               </div>
             ) : null}
           </header>
 
-          <div
-            className={`app-scroll ${appScrollbarVisible ? "app-scroll-visible" : ""}`}
-            onMouseEnter={showAppScrollbar}
-            onMouseMove={showAppScrollbar}
-            onMouseLeave={hideAppScrollbar}
-            onScroll={showAppScrollbar}
-          >
+          <div className="app-scroll-frame" onMouseEnter={revealAppScrollbar} onMouseMove={revealAppScrollbar} onMouseLeave={hideAppScrollbar}>
+            <div ref={appScrollRef} className="app-scroll" onScroll={revealAppScrollbar}>
+              <div ref={appScrollContentRef} className="app-scroll-content">
             {section === "routes" && (
               <RoutesView
                 snapshot={snapshot}
@@ -1031,6 +1103,17 @@ export default function App() {
               />
             )}
             {section === "docs" && <DocsView snapshot={snapshot} onCopy={copyText} />}
+              </div>
+            </div>
+            <div className={`app-scrollbar-float ${appScrollbarVisible && appScrollbarThumb.scrollable ? "app-scrollbar-float-visible" : ""}`}>
+              <div
+                className="app-scrollbar-thumb"
+                style={{
+                  height: `${appScrollbarThumb.height}px`,
+                  transform: `translateY(${appScrollbarThumb.top}px)`
+                }}
+              />
+            </div>
           </div>
         </section>
       </div>
@@ -2513,6 +2596,21 @@ model = ${modelName}`;
   -H "Authorization: Bearer sk-samapi-..."`;
   return (
     <section className="panel usage-panel p-4">
+      <div className="grid gap-3 md:grid-cols-3">
+        <div className="metric">
+          <span>{props.snapshot.sites.length}</span>
+          站点
+        </div>
+        <div className="metric">
+          <span>{props.snapshot.routes.length}</span>
+          路由
+        </div>
+        <div className="metric">
+          <span>{props.snapshot.apiKeys.length}</span>
+          密钥
+        </div>
+      </div>
+
       <div className="usage-hero">
         <div>
           <p>下游接入</p>
@@ -2574,21 +2672,6 @@ model = ${modelName}`;
           {(enabledRoutes.length > 0 ? enabledRoutes : props.snapshot.routes).length > 12 ? (
             <strong>+{(enabledRoutes.length > 0 ? enabledRoutes : props.snapshot.routes).length - 12}</strong>
           ) : null}
-        </div>
-      </div>
-
-      <div className="mt-4 grid gap-3 md:grid-cols-3">
-        <div className="metric">
-          <span>{props.snapshot.sites.length}</span>
-          站点
-        </div>
-        <div className="metric">
-          <span>{props.snapshot.routes.length}</span>
-          路由
-        </div>
-        <div className="metric">
-          <span>{props.snapshot.apiKeys.length}</span>
-          密钥
         </div>
       </div>
     </section>

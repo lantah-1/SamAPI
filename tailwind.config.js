@@ -8,14 +8,14 @@ export default {
         display: ["Satoshi", "Aptos", "ui-sans-serif", "system-ui", "sans-serif"]
       },
       colors: {
-        ink: "#15181b",
-        paper: "#f5f2ea",
-        moss: "#36584b",
-        citron: "#d7ef69",
-        rust: "#b85b38"
+        ink: "#0f172a",
+        paper: "#f6f8fb",
+        moss: "#0f766e",
+        citron: "#99f6e4",
+        rust: "#0e7490"
       },
       boxShadow: {
-        panel: "0 18px 60px rgba(21, 24, 27, 0.10)"
+        panel: "0 18px 50px rgba(15, 23, 42, 0.08)"
       }
     }
   },

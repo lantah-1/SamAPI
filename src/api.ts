@@ -7,6 +7,7 @@ import type {
   ProviderApiKeyGroupInput,
   ProviderApiKeyGroupView,
   ProviderModelSyncResult,
+  RequestLog,
   RouteRecord,
   Site,
 } from "../shared/types";
@@ -82,6 +83,7 @@ export const api = {
       body: JSON.stringify(route)
     }),
   deleteRoute: (id: string) => request<{ ok: true }>(`/api/routes/${id}`, { method: "DELETE" }),
+  listLogs: () => request<RequestLog[]>("/api/logs"),
   deleteLog: (id: string) => request<{ ok: true }>(`/api/logs/${id}`, { method: "DELETE" }),
   clearLogs: () => request<{ ok: true }>("/api/logs/clear", { method: "DELETE" }),
   updateSettings: (settings: Partial<AppSettings>) =>
