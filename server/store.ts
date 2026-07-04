@@ -6,6 +6,7 @@ import type {
   ApiKeyRecord,
   AppDatabase,
   AppSettings,
+  AppThemeId,
   GroupRoute,
   GroupRouteMember,
   GroupRouteStrategy,
@@ -17,12 +18,23 @@ import type {
   RouteRecord,
   Site,
   SiteAddress,
-  SwitchRoute
+  SwitchRoute,
+  TemporaryAccount,
+  TemporaryAccountAvailability,
+  TemporaryAccountGroup,
+  TemporaryAccountImportInput,
+  TemporaryAccountQuotaStage
 } from "../shared/types.js";
 
 const ENDPOINTS = ["messages", "chat/completions", "responses"] as const;
+const THEME_IDS: AppThemeId[] = ["fresh", "salt", "citrus", "rose", "midnight"];
+const OPENAI_BASE_URL = "https://api.openai.com/v1";
+const OPENAI_DEFAULT_MODELS = ["gpt-5.5"];
 const DEFAULT_SETTINGS: AppSettings = {
-  maxRequestLogs: 100
+  maxRequestLogs: 100,
+  themeId: "fresh",
+  adminSessionTtlMinutes: 30,
+  temporaryAccountStrategy: "sequential"
 };
 
 function now() {
@@ -31,6 +43,10 @@ function now() {
 
 function hashSecret(secret: string) {
   return createHash("sha256").update(secret).digest("hex");
+}
+
+function normalizePasswordHash(value: unknown) {
+  return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value) ? value.toLowerCase() : undefined;
 }
 
 function normalizeBaseUrl(value: string) {
@@ -54,8 +70,16 @@ function normalizeSiteType(value: unknown) {
 
 function normalizeSettings(input?: Partial<AppSettings>): AppSettings {
   const maxRequestLogs = Number(input?.maxRequestLogs ?? DEFAULT_SETTINGS.maxRequestLogs);
+  const adminSessionTtlMinutes = Number(input?.adminSessionTtlMinutes ?? DEFAULT_SETTINGS.adminSessionTtlMinutes);
+  const themeId = THEME_IDS.includes(input?.themeId as AppThemeId) ? (input?.themeId as AppThemeId) : DEFAULT_SETTINGS.themeId;
+  const temporaryAccountStrategy = normalizeGroupStrategy(input?.temporaryAccountStrategy ?? DEFAULT_SETTINGS.temporaryAccountStrategy);
   return {
-    maxRequestLogs: Number.isFinite(maxRequestLogs) ? Math.min(5000, Math.max(1, Math.floor(maxRequestLogs))) : DEFAULT_SETTINGS.maxRequestLogs
+    maxRequestLogs: Number.isFinite(maxRequestLogs) ? Math.min(5000, Math.max(1, Math.floor(maxRequestLogs))) : DEFAULT_SETTINGS.maxRequestLogs,
+    themeId,
+    adminSessionTtlMinutes: Number.isFinite(adminSessionTtlMinutes)
+      ? Math.min(60 * 24 * 30, Math.max(1, Math.floor(adminSessionTtlMinutes)))
+      : DEFAULT_SETTINGS.adminSessionTtlMinutes,
+    temporaryAccountStrategy
   };
 }
 
@@ -110,11 +134,309 @@ function smartModelMatches(model: string, query: string) {
   });
 }
 
+function normalizeModelList(value: unknown): string[] {
+  const values = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[\n,，;；\s]+/)
+      : [];
+  return Array.from(new Set(values.map((model) => String(model).trim()).filter(Boolean))).sort();
+}
+
+function extractTemporarySecret(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const bearerMatch = trimmed.match(/Bearer\s+([A-Za-z0-9._\-]+(?:-[A-Za-z0-9._\-]+)*)/i);
+  if (bearerMatch?.[1]) return bearerMatch[1];
+  const skMatch = trimmed.match(/\b(sk-[A-Za-z0-9][A-Za-z0-9._\-]{8,}|sk-proj-[A-Za-z0-9._\-]{8,})\b/);
+  if (skMatch?.[1]) return skMatch[1];
+  if (/^[A-Za-z0-9._\-]{20,}$/.test(trimmed)) return trimmed;
+  return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function temporaryAccountLabel(record: Record<string, unknown>, fallback: string) {
+  for (const key of ["label", "name", "email", "username", "account", "remark", "备注"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return fallback;
+}
+
+function stringField(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function firstStringField(records: Record<string, unknown>[], keys: string[]) {
+  for (const record of records) {
+    for (const key of keys) {
+      const value = stringField(record, key);
+      if (value) return value;
+    }
+  }
+  return undefined;
+}
+
+function firstTemporarySecret(records: Record<string, unknown>[], keys: string[]) {
+  for (const record of records) {
+    for (const key of keys) {
+      const secret = extractTemporarySecret(record[key]);
+      if (secret) return secret;
+    }
+  }
+  return undefined;
+}
+
+function temporaryAccountLabelFromRecords(records: Record<string, unknown>[], fallback: string) {
+  for (const record of records) {
+    const label = temporaryAccountLabel(record, "");
+    if (label) return label;
+  }
+  return fallback;
+}
+
+function temporaryAccountType(record: Record<string, unknown>, secret: string, accountId?: string): TemporaryAccount["accountType"] {
+  const type = stringField(record, "type")?.toLowerCase();
+  if (type === "codex") return "codex";
+  if (type === "oauth") return "codex";
+  if (accountId || stringField(record, "account_id") || stringField(record, "chatgpt_account_id")) return "codex";
+  return secret.startsWith("sk-") ? "openai-api-key" : "codex";
+}
+
+function numberLike(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const normalized = Number(value.replace(/,/g, "").trim());
+    return Number.isFinite(normalized) ? normalized : value.trim();
+  }
+  return undefined;
+}
+
+function quotaStageFromRecord(label: string, record: Record<string, unknown>, unit?: string): TemporaryAccountQuotaStage | undefined {
+  const remaining = numberLike(record.remaining ?? record.remain ?? record.left ?? record.available ?? record.balance ?? record.quota_remaining ?? record["剩余"]);
+  const total = numberLike(record.total ?? record.limit ?? record.quota ?? record.amount ?? record["总量"]);
+  const used = numberLike(record.used ?? record.usage ?? record.consumed ?? record["已用"]);
+  const resetAt = typeof (record.resetAt ?? record.reset_at ?? record.expiresAt ?? record.expires_at ?? record.expire_at ?? record["重置时间"]) === "string"
+    ? String(record.resetAt ?? record.reset_at ?? record.expiresAt ?? record.expires_at ?? record.expire_at ?? record["重置时间"]).trim()
+    : undefined;
+  if (remaining == null && total == null && used == null && !resetAt) return undefined;
+  return {
+    label,
+    remaining,
+    total,
+    used,
+    unit: unit || (typeof record.unit === "string" ? record.unit : undefined),
+    resetAt
+  };
+}
+
+function normalizeTemporaryAccountAvailability(value: unknown): TemporaryAccountAvailability {
+  if (value === "available" || value === "unavailable") return value;
+  return "unknown";
+}
+
+function numericQuotaValue(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return undefined;
+  const normalized = Number(value.replace(/,/g, "").replace(/%$/, "").trim());
+  return Number.isFinite(normalized) ? normalized : undefined;
+}
+
+function accountHasUsableQuota(account: TemporaryAccount) {
+  const numericRemaining = account.quotaStages
+    .map((stage) => numericQuotaValue(stage.remaining))
+    .filter((value): value is number => value != null);
+  if (numericRemaining.length === 0) return true;
+  return numericRemaining.some((value) => value > 0);
+}
+
+function temporaryAccountCanBeUsed(account: TemporaryAccount) {
+  if (!account.enabled) return false;
+  if (account.availability === "unavailable") return false;
+  return accountHasUsableQuota(account);
+}
+
+function extractQuotaStages(record: Record<string, unknown>): TemporaryAccountQuotaStage[] {
+  const stages: TemporaryAccountQuotaStage[] = [];
+  const pushStage = (stage?: TemporaryAccountQuotaStage) => {
+    if (stage && !stages.some((item) => item.label === stage.label)) stages.push(stage);
+  };
+  pushStage(quotaStageFromRecord("总额度", record));
+  for (const key of ["quota", "balance", "usage", "limit", "remain", "remaining", "credit"]) {
+    const value = record[key];
+    if (value && typeof value === "object" && !Array.isArray(value)) pushStage(quotaStageFromRecord(key, value as Record<string, unknown>));
+  }
+  for (const key of ["stages", "quotaStages", "quotas", "plans", "periods", "阶段", "额度"]) {
+    const value = record[key];
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => {
+        if (item && typeof item === "object") {
+          const itemRecord = item as Record<string, unknown>;
+          const label = typeof itemRecord.label === "string" || typeof itemRecord.name === "string"
+            ? String(itemRecord.label || itemRecord.name)
+            : `阶段 ${index + 1}`;
+          pushStage(quotaStageFromRecord(label, itemRecord));
+        }
+      });
+    } else if (value && typeof value === "object") {
+      for (const [label, item] of Object.entries(value as Record<string, unknown>)) {
+        if (item && typeof item === "object") pushStage(quotaStageFromRecord(label, item as Record<string, unknown>));
+        else pushStage({ label, remaining: numberLike(item) });
+      }
+    }
+  }
+  return stages;
+}
+
+function mergeQuotaStages(records: Record<string, unknown>[]) {
+  const stages: TemporaryAccountQuotaStage[] = [];
+  for (const record of records) {
+    for (const stage of extractQuotaStages(record)) {
+      if (!stages.some((item) => item.label === stage.label)) stages.push(stage);
+    }
+  }
+  return stages;
+}
+
+function modelsFromRecord(record: Record<string, unknown>) {
+  return normalizeModelList(record.models || record.model || record["模型"]);
+}
+
+function temporaryAccountFromRecord(
+  record: Record<string, unknown>,
+  models: string[],
+  fallbackLabel: string
+) {
+  const credentials = isRecord(record.credentials) ? record.credentials : {};
+  const extra = isRecord(record.extra) ? record.extra : {};
+  const records = [record, credentials, extra];
+  const recordModels = records.flatMap((item) => modelsFromRecord(item));
+  const mergedModels = recordModels.length > 0 ? recordModels : models;
+  const secret = firstTemporarySecret(records, [
+    "api_key",
+    "apiKey",
+    "key",
+    "token",
+    "access_token",
+    "accessToken",
+    "secret",
+    "authorization",
+    "Authorization",
+    "sk"
+  ]);
+  if (!secret) return undefined;
+
+  const accountId = firstStringField(records, ["account_id", "chatgpt_account_id", "chatgptAccountId"]);
+  return {
+    label: temporaryAccountLabelFromRecords(records, fallbackLabel),
+    secret,
+    accountType: temporaryAccountType(record, secret, accountId),
+    accountId,
+    email: firstStringField(records, ["email", "mail", "username"]),
+    refreshToken: firstStringField(records, ["refresh_token", "refreshToken"]),
+    idToken: firstStringField(records, ["id_token", "idToken"]),
+    sessionToken: firstStringField(records, ["session_token", "sessionToken"]),
+    models: mergedModels,
+    quotaStages: mergeQuotaStages(records)
+  };
+}
+
+function collectTemporaryAccounts(
+  value: unknown,
+  models: string[],
+  output: Array<{
+    label: string;
+    secret: string;
+    accountType?: TemporaryAccount["accountType"];
+    accountId?: string;
+    email?: string;
+    refreshToken?: string;
+    idToken?: string;
+    sessionToken?: string;
+    models: string[];
+    quotaStages: TemporaryAccountQuotaStage[];
+  }>
+) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectTemporaryAccounts(item, models, output);
+    return;
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const account = temporaryAccountFromRecord(record, models, `账号 ${output.length + 1}`);
+    if (account) {
+      output.push(account);
+      return;
+    }
+    const containerModels = modelsFromRecord(record);
+    const nestedModels = containerModels.length > 0 ? containerModels : models;
+    for (const nestedKey of ["accounts", "data", "items", "list", "keys", "tokens", "subscriptions", "result"]) {
+      if (nestedKey in record) collectTemporaryAccounts(record[nestedKey], nestedModels, output);
+    }
+    return;
+  }
+  const secret = extractTemporarySecret(value);
+  if (secret) output.push({ label: `账号 ${output.length + 1}`, secret, accountType: secret.startsWith("sk-") ? "openai-api-key" : "codex", models, quotaStages: [] });
+}
+
+function parseTemporaryAccountImport(content: string, models: string[]) {
+  const output: Array<{
+    label: string;
+    secret: string;
+    accountType?: TemporaryAccount["accountType"];
+    accountId?: string;
+    email?: string;
+    refreshToken?: string;
+    idToken?: string;
+    sessionToken?: string;
+    models: string[];
+    quotaStages: TemporaryAccountQuotaStage[];
+  }> = [];
+  const trimmed = content.trim();
+  if (!trimmed) return output;
+
+  try {
+    collectTemporaryAccounts(JSON.parse(trimmed), models, output);
+  } catch {
+    // Fall through to line parser.
+  }
+
+  for (const rawLine of trimmed.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    try {
+      collectTemporaryAccounts(JSON.parse(line), models, output);
+      continue;
+    } catch {
+      // Not JSONL.
+    }
+    const secret = extractTemporarySecret(line);
+    if (!secret) continue;
+    const label = line
+      .replace(secret, "")
+      .replace(/[,\t|:;]+/g, " ")
+      .trim();
+    output.push({ label: label || `账号 ${output.length + 1}`, secret, accountType: secret.startsWith("sk-") ? "openai-api-key" : "codex", models, quotaStages: [] });
+  }
+
+  const unique = new Map<string, (typeof output)[number]>();
+  for (const account of output) {
+    if (!unique.has(account.secret)) unique.set(account.secret, account);
+  }
+  return Array.from(unique.values());
+}
+
 function createEmptyDatabase(): AppDatabase {
   return {
     sites: [],
     apiKeys: [],
     providerApiKeyGroups: [],
+    temporaryAccountGroups: [],
     headerTemplates: [],
     routes: [],
     settings: { ...DEFAULT_SETTINGS }
@@ -125,26 +447,36 @@ export class JsonStore {
   readonly dataDir: string;
   readonly dbPath: string;
   readonly logsPath: string;
+  readonly temporaryAccountsPath: string;
   private db: AppDatabase;
   private requestLogs: RequestLog[] = [];
+  private temporaryAccountIndex = 0;
 
   constructor(dataDir = process.env.SAMAPI_DATA_DIR || path.resolve(process.cwd(), "data")) {
     this.dataDir = path.resolve(dataDir);
     this.dbPath = path.join(this.dataDir, "samapi.json");
     this.logsPath = path.join(this.dataDir, "request-logs.jsonl");
+    this.temporaryAccountsPath = path.join(this.dataDir, "temporary-accounts.json");
     mkdirSync(this.dataDir, { recursive: true });
     this.db = this.load();
+    this.ensureOfficialOpenAiSite();
+    if (this.syncOpenAiModelsFromTemporaryAccounts()) this.persist();
     this.refreshGroupRouteMembers();
   }
 
-  snapshot() {
+  snapshot(options: { includeRequestLogs?: boolean; includeTemporaryAccounts?: boolean } = {}) {
+    const { adminPasswordHash, ...database } = this.db;
     return {
-      ...this.db,
+      ...database,
+      temporaryAccountGroups: options.includeTemporaryAccounts === false ? [] : database.temporaryAccountGroups,
       providerApiKeyGroups: this.db.providerApiKeyGroups.map((group) => this.toProviderApiKeyGroupView(group)),
-      requestLogs: this.listRequestLogs(),
+      requestLogs: options.includeRequestLogs === false ? [] : this.listRequestLogs(),
       dbPath: this.dbPath,
       dataDir: this.dataDir,
-      endpoints: [...ENDPOINTS]
+      endpoints: [...ENDPOINTS],
+      security: {
+        adminPasswordCustomized: Boolean(adminPasswordHash)
+      }
     };
   }
 
@@ -179,6 +511,211 @@ export class JsonStore {
     return this.db.settings;
   }
 
+  getAdminPasswordHash() {
+    return this.db.adminPasswordHash;
+  }
+
+  updateAdminPasswordHash(password: string) {
+    const normalized = password.trim();
+    if (normalized.length < 8) throw new Error("新管理密码至少需要 8 个字符");
+    this.db.adminPasswordHash = hashSecret(normalized);
+    this.persist();
+  }
+
+  ensureOfficialOpenAiSite() {
+    const existing = this.officialOpenAiSite();
+    if (existing) return existing;
+    const timestamp = now();
+    const created: Site = {
+      id: `site-${randomUUID()}`,
+      name: "OpenAI",
+      siteType: "unknown",
+      addresses: [
+        {
+          id: `addr-${randomUUID()}`,
+          label: "官方 API",
+          baseUrl: OPENAI_BASE_URL,
+          enabled: true,
+          models: [...OPENAI_DEFAULT_MODELS]
+        }
+      ],
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    this.db.sites.unshift(created);
+    this.persist();
+    return created;
+  }
+
+  officialOpenAiSite() {
+    return this.db.sites.find((site) =>
+      site.addresses.some((address) => {
+        try {
+          const parsed = new URL(address.baseUrl);
+          return parsed.hostname.toLowerCase() === "api.openai.com";
+        } catch {
+          return false;
+        }
+      })
+    );
+  }
+
+  isOfficialOpenAiSite(siteId: string) {
+    return this.officialOpenAiSite()?.id === siteId;
+  }
+
+  importTemporaryAccounts(input: TemporaryAccountImportInput) {
+    const site = this.ensureOfficialOpenAiSite();
+    const timestamp = now();
+    const source = input.source === "subapi" ? "subapi" : "cpa";
+    const models = normalizeModelList(input.models);
+    const importContents = [input.content, ...(Array.isArray(input.contents) ? input.contents : [])].filter((content) => typeof content === "string" && content.trim());
+    const parsedAccounts = importContents.flatMap((content) => parseTemporaryAccountImport(content, models));
+    if (parsedAccounts.length === 0) throw new Error("没有解析到可用账号密钥");
+    const seen = new Set<string>(
+      this.db.temporaryAccountGroups.flatMap((group) => group.accounts.map((account) => hashSecret(account.secret)))
+    );
+    const accounts: TemporaryAccount[] = [];
+    let skipped = 0;
+    for (const account of parsedAccounts) {
+      const secret = account.secret.trim();
+      const hash = hashSecret(secret);
+      if (seen.has(hash)) {
+        skipped += 1;
+        continue;
+      }
+      seen.add(hash);
+      accounts.push({
+        id: `temp-account-${randomUUID()}`,
+        label: account.label || `账号 ${accounts.length + 1}`,
+        prefix: secret.slice(0, 12),
+        secret,
+        accountType: account.accountType,
+        accountId: account.accountId,
+        email: account.email,
+        refreshToken: account.refreshToken,
+        idToken: account.idToken,
+        sessionToken: account.sessionToken,
+        enabled: true,
+        models: account.models.length > 0 ? account.models : models,
+        availability: "unknown",
+        quotaStages: account.quotaStages || [],
+        importedAt: timestamp
+      });
+    }
+    if (accounts.length === 0) throw new Error("导入内容里没有新的可用账号");
+    const group: TemporaryAccountGroup = {
+      id: `temp-account-group-${randomUUID()}`,
+      name: input.name?.trim() || `${source.toUpperCase()} 临时账号`,
+      source,
+      siteId: site.id,
+      enabled: true,
+      accounts,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    this.db.temporaryAccountGroups.unshift(group);
+    this.syncOpenAiModelsFromTemporaryAccounts();
+    this.persist();
+    return { site, group, imported: accounts.length, skipped };
+  }
+
+  updateTemporaryAccountGroup(id: string, input: Partial<TemporaryAccountGroup>) {
+    const group = this.db.temporaryAccountGroups.find((item) => item.id === id);
+    if (!group) throw new Error("临时账号组不存在");
+    if (typeof input.name === "string" && input.name.trim()) group.name = input.name.trim();
+    if (typeof input.enabled === "boolean") group.enabled = input.enabled;
+    group.updatedAt = now();
+    this.persist();
+    return group;
+  }
+
+  deleteTemporaryAccountGroup(id: string) {
+    this.db.temporaryAccountGroups = this.db.temporaryAccountGroups.filter((group) => group.id !== id);
+    this.syncOpenAiModelsFromTemporaryAccounts();
+    this.persist();
+  }
+
+  private orderedTemporaryAccountPool(pool: TemporaryAccount[]) {
+    if (pool.length === 0) return pool;
+    const strategy = this.db.settings.temporaryAccountStrategy;
+    if (strategy === "random") {
+      const shuffled = [...pool];
+      for (let index = shuffled.length - 1; index > 0; index -= 1) {
+        const swapIndex = Math.floor(Math.random() * (index + 1));
+        [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+      }
+      return shuffled;
+    }
+    if (strategy === "sequential") {
+      const start = this.temporaryAccountIndex % pool.length;
+      this.temporaryAccountIndex = (this.temporaryAccountIndex + 1) % pool.length;
+      return [...pool.slice(start), ...pool.slice(0, start)];
+    }
+    return pool;
+  }
+
+  resolveTemporaryOpenAiAccounts(model: string) {
+    const allEnabledAccounts = this.db.temporaryAccountGroups
+      .filter((group) => group.enabled)
+      .flatMap((group) => group.accounts.filter((account) => account.enabled));
+    const candidates = allEnabledAccounts.filter((account) => account.models.length === 0 || account.models.includes(model));
+    const pool = candidates.length > 0 ? candidates : allEnabledAccounts;
+    const usable = pool.filter(temporaryAccountCanBeUsed);
+    if (usable.length === 0) return [];
+    const available = usable.filter((account) => account.availability === "available");
+    const unchecked = usable.filter((account) => account.availability !== "available");
+    return [...this.orderedTemporaryAccountPool(available), ...this.orderedTemporaryAccountPool(unchecked)];
+  }
+
+  resolveTemporaryOpenAiAccount(model: string) {
+    return this.resolveTemporaryOpenAiAccounts(model)[0];
+  }
+
+  temporaryAccountCheckTargets(groupId?: string) {
+    return this.db.temporaryAccountGroups
+      .filter((group) => !groupId || group.id === groupId)
+      .flatMap((group) => group.accounts.map((account) => ({ group, account })));
+  }
+
+  updateTemporaryAccountCheckResult(
+    accountId: string,
+    input: {
+      availability?: TemporaryAccountAvailability;
+      quotaStages?: TemporaryAccountQuotaStage[];
+      lastQuotaCheckedAt?: string;
+      lastCheckStatusCode?: number;
+      lastCheckError?: string;
+      secret?: string;
+      refreshToken?: string;
+      idToken?: string;
+      accountId?: string;
+      email?: string;
+    }
+  ) {
+    for (const group of this.db.temporaryAccountGroups) {
+      const account = group.accounts.find((item) => item.id === accountId);
+      if (!account) continue;
+      if (input.availability) account.availability = input.availability;
+      if (input.quotaStages) account.quotaStages = input.quotaStages;
+      if (input.lastQuotaCheckedAt) account.lastQuotaCheckedAt = input.lastQuotaCheckedAt;
+      if (typeof input.lastCheckStatusCode === "number") account.lastCheckStatusCode = input.lastCheckStatusCode;
+      account.lastCheckError = input.lastCheckError;
+      if (typeof input.secret === "string" && input.secret.trim()) {
+        account.secret = input.secret.trim();
+        account.prefix = account.secret.slice(0, 12);
+      }
+      if (typeof input.refreshToken === "string" && input.refreshToken.trim()) account.refreshToken = input.refreshToken.trim();
+      if (typeof input.idToken === "string" && input.idToken.trim()) account.idToken = input.idToken.trim();
+      if (typeof input.accountId === "string" && input.accountId.trim()) account.accountId = input.accountId.trim();
+      if (typeof input.email === "string" && input.email.trim()) account.email = input.email.trim();
+      group.updatedAt = now();
+      this.persist();
+      return account;
+    }
+    return undefined;
+  }
+
   deleteRequestLog(id: string) {
     this.requestLogs = this.requestLogs.filter((log) => log.id !== id);
     this.rewriteRequestLogFile();
@@ -208,9 +745,6 @@ export class JsonStore {
         addresses,
         updatedAt: timestamp
       });
-      this.db.providerApiKeyGroups = this.db.providerApiKeyGroups.map((group) =>
-        group.siteId === current.id ? { ...group, groupName: current.name, updatedAt: timestamp } : group
-      );
       this.persist();
       return current;
     }
@@ -231,6 +765,7 @@ export class JsonStore {
   deleteSite(id: string) {
     this.db.sites = this.db.sites.filter((site) => site.id !== id);
     this.db.providerApiKeyGroups = this.db.providerApiKeyGroups.filter((group) => group.siteId !== id);
+    this.db.temporaryAccountGroups = this.db.temporaryAccountGroups.filter((group) => group.siteId !== id);
     this.db.routes = this.db.routes.filter((route) => route.type !== "switch" || route.siteId !== id);
     this.refreshGroupRouteMembers();
     this.persist();
@@ -276,7 +811,7 @@ export class JsonStore {
 
     const site = this.db.sites.find((item) => item.id === input.siteId);
     if (!site) throw new Error("供应商不存在");
-    const groupName = site.name;
+    const groupName = input.groupName?.trim() || site.name;
 
     if (input.id) {
       const current = this.db.providerApiKeyGroups.find((group) => group.id === input.id);
@@ -594,7 +1129,8 @@ export class JsonStore {
   private load(): AppDatabase {
     if (!existsSync(this.dbPath)) {
       const empty = createEmptyDatabase();
-      writeFileSync(this.dbPath, JSON.stringify(empty, null, 2));
+      this.persistDatabase(empty);
+      this.persistTemporaryAccounts(empty.temporaryAccountGroups);
       return empty;
     }
     const parsed = JSON.parse(readFileSync(this.dbPath, "utf8")) as Partial<AppDatabase>;
@@ -604,14 +1140,39 @@ export class JsonStore {
     if (!existsSync(this.logsPath) && legacyRequestLogs.length > 0) {
       this.rewriteRequestLogFile();
     }
-    return {
+    const legacyTemporaryAccountGroups = parsed.temporaryAccountGroups || [];
+    const db: AppDatabase = {
       sites: (parsed.sites || []).map((site) => ({ ...site, siteType: normalizeSiteType(site.siteType) })),
       apiKeys: parsed.apiKeys || [],
       providerApiKeyGroups: parsed.providerApiKeyGroups || [],
+      temporaryAccountGroups: this.loadTemporaryAccountGroups(legacyTemporaryAccountGroups),
       headerTemplates: parsed.headerTemplates || [],
       routes: (parsed.routes || []) as RouteRecord[],
-      settings
+      settings,
+      adminPasswordHash: normalizePasswordHash(parsed.adminPasswordHash)
     };
+    if (legacyTemporaryAccountGroups.length > 0) {
+      this.persistDatabase(db);
+      this.persistTemporaryAccounts(db.temporaryAccountGroups);
+    }
+    return db;
+  }
+
+  private loadTemporaryAccountGroups(fallback: TemporaryAccountGroup[] = []) {
+    const source = existsSync(this.temporaryAccountsPath)
+      ? JSON.parse(readFileSync(this.temporaryAccountsPath, "utf8")) as TemporaryAccountGroup[]
+      : fallback;
+    return source.map((group) => ({
+      ...group,
+      strategy: normalizeGroupStrategy(group.strategy),
+      accounts: (group.accounts || []).map((account) => ({
+        ...account,
+        accountType: account.accountType || (account.accountId ? "codex" : account.secret?.startsWith("sk-") ? "openai-api-key" : undefined),
+        models: normalizeModelList(account.models),
+        availability: normalizeTemporaryAccountAvailability(account.availability),
+        quotaStages: Array.isArray(account.quotaStages) ? account.quotaStages : []
+      }))
+    }));
   }
 
   private loadRequestLogs(limit: number, fallback: RequestLog[] = []) {
@@ -642,9 +1203,22 @@ export class JsonStore {
   }
 
   private persist() {
+    this.persistDatabase(this.db);
+    this.persistTemporaryAccounts(this.db.temporaryAccountGroups);
+  }
+
+  private persistDatabase(db: AppDatabase) {
+    const { temporaryAccountGroups, ...database } = db;
+    void temporaryAccountGroups;
     const tempPath = `${this.dbPath}.tmp`;
-    writeFileSync(tempPath, JSON.stringify(this.db, null, 2));
+    writeFileSync(tempPath, JSON.stringify(database, null, 2));
     renameSync(tempPath, this.dbPath);
+  }
+
+  private persistTemporaryAccounts(groups: TemporaryAccountGroup[]) {
+    const tempPath = `${this.temporaryAccountsPath}.tmp`;
+    writeFileSync(tempPath, JSON.stringify(groups, null, 2));
+    renameSync(tempPath, this.temporaryAccountsPath);
   }
 
   private normalizeProviderApiKeyEntry(input: Partial<ProviderApiKeyEntry>, index: number, existingKeys: ProviderApiKeyEntry[] = []): ProviderApiKeyEntry {
@@ -669,9 +1243,26 @@ export class JsonStore {
     const site = this.db.sites.find((item) => item.id === group.siteId);
     return {
       ...group,
-      groupName: site?.name || group.groupName,
+      groupName: group.groupName || site?.name || "API Key 分组",
       apiKeys: group.apiKeys.map((apiKey) => ({ ...apiKey }))
     };
+  }
+
+  private syncOpenAiModelsFromTemporaryAccounts() {
+    const site = this.officialOpenAiSite();
+    if (!site) return false;
+    const importedModels = this.db.temporaryAccountGroups
+      .filter((group) => group.siteId === site.id)
+      .flatMap((group) => group.accounts.flatMap((account) => account.models));
+    const models = Array.from(new Set([...OPENAI_DEFAULT_MODELS, ...importedModels].filter(Boolean))).sort();
+    let changed = false;
+    site.addresses = site.addresses.map((address) => {
+      if (JSON.stringify(address.models) === JSON.stringify(models)) return address;
+      changed = true;
+      return { ...address, models };
+    });
+    if (changed) site.updatedAt = now();
+    return changed;
   }
 
   private syncSiteModelsFromProviderKeys(siteId: string) {

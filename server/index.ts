@@ -1,5 +1,10 @@
 import http from "node:http";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createReadStream, existsSync, statSync } from "node:fs";
+import path from "node:path";
 import { URL } from "node:url";
+import { ProxyAgent, setGlobalDispatcher } from "undici";
 import {
   ChatCompletionToMessagesConverter,
   ChatCompletionToResponsesConverter,
@@ -22,12 +27,22 @@ import type {
   RouteRecord,
   Site,
   SiteAddress,
-  SwitchRoute
+  SwitchRoute,
+  TemporaryAccount,
+  TemporaryAccountCheckItemResult,
+  TemporaryAccountCheckResult,
+  TemporaryAccountQuotaStage
 } from "../shared/types.js";
 
-const PORT = Number(process.env.SAMAPI_PORT || 8787);
+const PORT = Number(process.env.SAMAPI_PORT || process.env.PORT || 8787);
 const HOST = process.env.SAMAPI_HOST || "0.0.0.0";
+const WEB_DIR = path.resolve(process.env.SAMAPI_WEB_DIR || path.join(process.cwd(), "dist"));
 const store = new JsonStore();
+const ADMIN_PASSWORD = process.env.SAMAPI_ADMIN_PASSWORD || "samapi-admin";
+const ADMIN_PASSWORD_IS_DEFAULT = !process.env.SAMAPI_ADMIN_PASSWORD;
+const ADMIN_SESSION_COOKIE = "samapi_admin";
+const ADMIN_SESSION_SECRET = process.env.SAMAPI_ADMIN_SESSION_SECRET || randomBytes(32).toString("base64url");
+const ADMIN_COOKIE_SECURE = process.env.SAMAPI_ADMIN_COOKIE_SECURE === "true";
 const routeRuntimeState = new Map<string, { stableCandidateKey?: string }>();
 const DEFAULT_CORS_HEADERS = [
   "Accept",
@@ -51,22 +66,132 @@ const DEFAULT_CORS_HEADERS = [
   "Anthropic-Version"
 ].join(",");
 
+function normalizedProxyUrl(value?: string) {
+  const trimmed = value?.trim();
+  if (!trimmed || ["0", "false", "off", "none", "direct"].includes(trimmed.toLowerCase())) return undefined;
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+}
+
+function proxyFromAppEnvironment() {
+  return normalizedProxyUrl(process.env.SAMAPI_PROXY_URL);
+}
+
+function proxyFromGenericEnvironment() {
+  return normalizedProxyUrl(
+    process.env.HTTPS_PROXY ||
+      process.env.https_proxy ||
+      process.env.HTTP_PROXY ||
+      process.env.http_proxy ||
+      process.env.ALL_PROXY ||
+      process.env.all_proxy
+  );
+}
+
+function parseKeyValueProxyValue(output: string, key: string) {
+  const match = output.match(new RegExp(`${key}\\s*:\\s*([^\\n]+)`));
+  return match?.[1]?.trim();
+}
+
+function proxyUrlFromHostPort(host?: string, port?: string | number, protocol = "http") {
+  const normalizedHost = host?.trim();
+  const normalizedPort = String(port || "").trim();
+  if (!normalizedHost || !normalizedPort || normalizedHost === "0.0.0.0") return undefined;
+  return `${protocol}://${normalizedHost}:${normalizedPort}`;
+}
+
+function proxyFromMacOsScutil() {
+  if (process.platform !== "darwin") return undefined;
+  try {
+    const output = execFileSync("scutil", ["--proxy"], { encoding: "utf8", timeout: 1200 });
+    const httpsEnabled = parseKeyValueProxyValue(output, "HTTPSEnable") === "1";
+    const httpEnabled = parseKeyValueProxyValue(output, "HTTPEnable") === "1";
+    if (httpsEnabled) {
+      return proxyUrlFromHostPort(parseKeyValueProxyValue(output, "HTTPSProxy"), parseKeyValueProxyValue(output, "HTTPSPort"));
+    }
+    if (httpEnabled) {
+      return proxyUrlFromHostPort(parseKeyValueProxyValue(output, "HTTPProxy"), parseKeyValueProxyValue(output, "HTTPPort"));
+    }
+    const socksEnabled = parseKeyValueProxyValue(output, "SOCKSEnable") === "1";
+    if (socksEnabled) {
+      return proxyUrlFromHostPort(parseKeyValueProxyValue(output, "SOCKSProxy"), parseKeyValueProxyValue(output, "SOCKSPort"), "socks5");
+    }
+  } catch {
+    // Fall through to networksetup.
+  }
+  return undefined;
+}
+
+function parseNetworkSetupProxy(output: string) {
+  const enabled = parseKeyValueProxyValue(output, "Enabled")?.toLowerCase() === "yes";
+  if (!enabled) return undefined;
+  return proxyUrlFromHostPort(parseKeyValueProxyValue(output, "Server"), parseKeyValueProxyValue(output, "Port"));
+}
+
+function macOsNetworkServices() {
+  try {
+    const output = execFileSync("networksetup", ["-listallnetworkservices"], { encoding: "utf8", timeout: 1500 });
+    return output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("An asterisk") && !line.startsWith("*"));
+  } catch {
+    return [];
+  }
+}
+
+function proxyFromMacOsNetworkSetup() {
+  if (process.platform !== "darwin") return undefined;
+  for (const service of macOsNetworkServices()) {
+    for (const [command, protocol] of [
+      ["-getsecurewebproxy", "http"],
+      ["-getwebproxy", "http"],
+      ["-getsocksfirewallproxy", "socks5"]
+    ] as const) {
+      try {
+        const output = execFileSync("networksetup", [command, service], { encoding: "utf8", timeout: 1500 });
+        const proxyUrl = parseNetworkSetupProxy(output)?.replace(/^http:\/\//, `${protocol}://`);
+        if (proxyUrl) return proxyUrl;
+      } catch {
+        // Try the next service or proxy kind.
+      }
+    }
+  }
+  return undefined;
+}
+
+function proxyFromSystemSettings() {
+  if (process.platform === "darwin") return proxyFromMacOsScutil() || proxyFromMacOsNetworkSetup();
+  return undefined;
+}
+
+function configureFetchProxy() {
+  const proxyUrl = proxyFromAppEnvironment() || proxyFromSystemSettings() || proxyFromGenericEnvironment();
+  if (!proxyUrl) return undefined;
+  setGlobalDispatcher(new ProxyAgent(proxyUrl));
+  return proxyUrl;
+}
+
+const FETCH_PROXY_URL = configureFetchProxy();
+
 interface ProxyExecutionCandidate {
   site: Site;
   addresses: SiteAddress[];
   model: string;
   providerApiKey?: ProviderApiKeyEntry;
+  temporaryAccount?: TemporaryAccount;
+  temporaryApiKeyAccount?: TemporaryAccount;
   headerTemplate?: HeaderTemplate;
   index: number;
 }
 
-function sendJson(response: http.ServerResponse, statusCode: number, payload: unknown) {
+function sendJson(response: http.ServerResponse, statusCode: number, payload: unknown, headers: http.OutgoingHttpHeaders = {}) {
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS,HEAD",
     "Access-Control-Allow-Headers": DEFAULT_CORS_HEADERS,
-    "Access-Control-Expose-Headers": "*"
+    "Access-Control-Expose-Headers": "*",
+    ...headers
   });
   response.end(JSON.stringify(payload));
 }
@@ -91,12 +216,168 @@ async function readJson(request: http.IncomingMessage) {
   return text ? JSON.parse(text) : {};
 }
 
+function hashText(value: string) {
+  return createHash("sha256").update(value).digest();
+}
+
+function safeEqualText(left: string, right: string) {
+  return timingSafeEqual(hashText(left), hashText(right));
+}
+
+function safeEqualPasswordHash(password: string, expectedHash?: string) {
+  if (!expectedHash || !/^[a-f0-9]{64}$/i.test(expectedHash)) return false;
+  return timingSafeEqual(hashText(password), Buffer.from(expectedHash, "hex"));
+}
+
+function verifyAdminPassword(password: string) {
+  const savedHash = store.getAdminPasswordHash();
+  return savedHash ? safeEqualPasswordHash(password, savedHash) : safeEqualText(password, ADMIN_PASSWORD);
+}
+
+function parseCookies(request: http.IncomingMessage) {
+  const cookieHeader = request.headers.cookie || "";
+  const cookies = new Map<string, string>();
+  for (const segment of cookieHeader.split(";")) {
+    const [rawName, ...rawValue] = segment.split("=");
+    const name = rawName?.trim();
+    if (!name) continue;
+    cookies.set(name, decodeURIComponent(rawValue.join("=").trim()));
+  }
+  return cookies;
+}
+
+function signAdminSession(payload: string) {
+  return createHmac("sha256", ADMIN_SESSION_SECRET).update(payload).digest("base64url");
+}
+
+function adminSessionTtlMs() {
+  return store.getDb().settings.adminSessionTtlMinutes * 60 * 1000;
+}
+
+function createAdminSession() {
+  const nowMs = Date.now();
+  const expiresAtMs = nowMs + adminSessionTtlMs();
+  const payload = Buffer.from(
+    JSON.stringify({
+      iat: nowMs,
+      exp: expiresAtMs,
+      nonce: randomBytes(16).toString("base64url")
+    })
+  ).toString("base64url");
+  return {
+    token: `${payload}.${signAdminSession(payload)}`,
+    expiresAt: new Date(expiresAtMs).toISOString()
+  };
+}
+
+function verifyAdminSessionToken(token?: string) {
+  if (!token) return false;
+  const [payload, signature] = token.split(".");
+  if (!payload || !signature || !safeEqualText(signature, signAdminSession(payload))) return false;
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { exp?: unknown; iat?: unknown };
+    const nowMs = Date.now();
+    if (typeof parsed.exp !== "number" || parsed.exp <= nowMs) return false;
+    if (typeof parsed.iat === "number" && nowMs - parsed.iat > adminSessionTtlMs()) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasAdminSession(request: http.IncomingMessage) {
+  return verifyAdminSessionToken(parseCookies(request).get(ADMIN_SESSION_COOKIE));
+}
+
+function adminSessionCookie(token: string) {
+  const maxAge = Math.max(0, Math.floor(adminSessionTtlMs() / 1000));
+  return `${ADMIN_SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${maxAge}${ADMIN_COOKIE_SECURE ? "; Secure" : ""}`;
+}
+
+function clearAdminSessionCookie() {
+  return `${ADMIN_SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${ADMIN_COOKIE_SECURE ? "; Secure" : ""}`;
+}
+
+function isPublicApiPath(method: string, pathname: string) {
+  return (
+    (method === "GET" && pathname === "/api/health") ||
+    (method === "GET" && pathname === "/api/auth/session") ||
+    (method === "POST" && pathname === "/api/auth/login") ||
+    (method === "POST" && pathname === "/api/auth/logout")
+  );
+}
+
+function requireAdminSession(request: http.IncomingMessage, response: http.ServerResponse, url: URL) {
+  const method = request.method || "GET";
+  if (isPublicApiPath(method, url.pathname) || hasAdminSession(request)) return true;
+  sendJson(response, 401, { error: "请先输入管理密码" });
+  return false;
+}
+
 function routeParam(parts: string[], index: number) {
   return decodeURIComponent(parts[index] || "");
 }
 
 function notFound(response: http.ServerResponse) {
   sendJson(response, 404, { error: "Not found" });
+}
+
+function staticContentType(filePath: string) {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === ".html") return "text/html; charset=utf-8";
+  if (extension === ".js") return "text/javascript; charset=utf-8";
+  if (extension === ".css") return "text/css; charset=utf-8";
+  if (extension === ".json") return "application/json; charset=utf-8";
+  if (extension === ".svg") return "image/svg+xml";
+  if (extension === ".png") return "image/png";
+  if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
+  if (extension === ".webp") return "image/webp";
+  if (extension === ".ico") return "image/x-icon";
+  return "application/octet-stream";
+}
+
+function safeStaticPath(pathname: string) {
+  let decoded = "/";
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return undefined;
+  }
+  const relativePath = decoded === "/" ? "index.html" : decoded.replace(/^\/+/, "");
+  const resolved = path.resolve(WEB_DIR, relativePath);
+  const root = WEB_DIR.endsWith(path.sep) ? WEB_DIR : `${WEB_DIR}${path.sep}`;
+  if (resolved !== WEB_DIR && !resolved.startsWith(root)) return undefined;
+  return resolved;
+}
+
+function sendStaticFile(request: http.IncomingMessage, response: http.ServerResponse, filePath: string) {
+  let stats;
+  try {
+    stats = statSync(filePath);
+  } catch {
+    return false;
+  }
+  if (!stats.isFile()) return false;
+  response.writeHead(200, {
+    "Content-Type": staticContentType(filePath),
+    "Content-Length": stats.size,
+    "Cache-Control": path.basename(filePath) === "index.html" ? "no-store" : "public, max-age=31536000, immutable"
+  });
+  if (request.method === "HEAD") {
+    response.end();
+    return true;
+  }
+  createReadStream(filePath).pipe(response);
+  return true;
+}
+
+function handleStatic(request: http.IncomingMessage, response: http.ServerResponse, url: URL) {
+  if (!["GET", "HEAD"].includes(request.method || "")) return false;
+  if (!existsSync(WEB_DIR)) return false;
+  const filePath = safeStaticPath(url.pathname);
+  if (filePath && sendStaticFile(request, response, filePath)) return true;
+  const indexPath = path.join(WEB_DIR, "index.html");
+  return sendStaticFile(request, response, indexPath);
 }
 
 function valueToHeaderText(value: string | string[] | undefined) {
@@ -149,6 +430,81 @@ function extractUpstreamError(text: string) {
   return compactPreview(text);
 }
 
+function maskedProxyUrl(proxyUrl: string) {
+  try {
+    const parsed = new URL(proxyUrl);
+    if (parsed.username || parsed.password) {
+      parsed.username = "***";
+      parsed.password = "";
+    }
+    return parsed.toString();
+  } catch {
+    return proxyUrl.replace(/\/\/[^/@]+@/, "//***@");
+  }
+}
+
+function errorText(value: unknown) {
+  return value instanceof Error && value.message.trim() ? value.message.trim() : "";
+}
+
+function errorCode(value: unknown) {
+  if (!isRecord(value)) return "";
+  const code = value.code;
+  return typeof code === "string" && code.trim() ? code.trim() : "";
+}
+
+function errorDetailValue(value: unknown, key: string) {
+  if (!isRecord(value)) return "";
+  const detail = value[key];
+  return typeof detail === "string" || typeof detail === "number" ? String(detail) : "";
+}
+
+function nestedErrorCause(error: unknown) {
+  if (!isRecord(error)) return undefined;
+  if (error.cause) return error.cause;
+  const errors = error.errors;
+  return Array.isArray(errors) ? errors.find(Boolean) : undefined;
+}
+
+function networkErrorReason(code: string) {
+  const normalized = code.toUpperCase();
+  if (normalized === "ENOTFOUND" || normalized === "EAI_AGAIN") return "DNS 解析失败";
+  if (normalized === "ECONNREFUSED") return "连接被拒绝";
+  if (normalized === "ECONNRESET" || normalized === "UND_ERR_SOCKET") return "连接被重置";
+  if (normalized === "ETIMEDOUT" || normalized === "UND_ERR_CONNECT_TIMEOUT" || normalized === "UND_ERR_HEADERS_TIMEOUT") return "连接超时";
+  if (normalized.includes("CERT") || normalized.includes("TLS") || normalized.includes("SSL")) return "TLS 证书校验失败";
+  return "";
+}
+
+function upstreamNetworkErrorMessage(error: unknown, fallback: string) {
+  const cause = nestedErrorCause(error);
+  const causeCause = nestedErrorCause(cause);
+  const detailSource = causeCause || cause || error;
+  const code = errorCode(detailSource) || errorCode(cause) || errorCode(error);
+  const reason = networkErrorReason(code);
+  const host = errorDetailValue(detailSource, "hostname") || errorDetailValue(detailSource, "host");
+  const port = errorDetailValue(detailSource, "port");
+  const address = errorDetailValue(detailSource, "address");
+  const message = errorText(error);
+  const causeMessage = errorText(detailSource);
+  const parts = [
+    reason,
+    code,
+    host ? `host ${host}` : "",
+    port ? `port ${port}` : "",
+    address ? `address ${address}` : "",
+    causeMessage && causeMessage !== message ? causeMessage : ""
+  ].filter(Boolean);
+
+  if (message && message !== "fetch failed" && parts.length === 0) return message;
+
+  const proxyHint = FETCH_PROXY_URL
+    ? `当前代理 ${maskedProxyUrl(FETCH_PROXY_URL)}，请确认代理可访问 OpenAI/Codex`
+    : "当前未配置代理，请确认服务器可直连 OpenAI/Codex，或设置 SAMAPI_PROXY_URL";
+  const detailText = parts.length > 0 ? `${parts.join("；")}；${proxyHint}` : proxyHint;
+  return `${fallback}：${detailText}`;
+}
+
 function joinUrl(baseUrl: string, suffix: string) {
   return `${baseUrl.replace(/\/+$/, "")}/${suffix.replace(/^\/+/, "")}`;
 }
@@ -181,7 +537,7 @@ type RosettaConverter = {
 };
 
 function normalizedProxyPath(pathname: string) {
-  return pathname.replace(/\/+$/, "") || "/proxy";
+  return pathname.replace(/\/+$/, "") || "/";
 }
 
 function proxyPathInfo(pathname: string): { supported: boolean; kind: ProxyKind; routeNameFromPath?: string } {
@@ -920,6 +1276,476 @@ async function streamRawResponse(input: {
   return preview;
 }
 
+const CODEX_BACKEND_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
+const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_USER_AGENT = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)";
+const CODEX_ORIGINATOR = "codex-tui";
+const CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
+const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_MODELS_URL = "https://api.openai.com/v1/models";
+
+interface CodexRateLimitWindowRecord {
+  used_percent?: unknown;
+  limit_window_seconds?: unknown;
+  reset_after_seconds?: unknown;
+  reset_at?: unknown;
+}
+
+interface CodexRateLimitRecord {
+  allowed?: unknown;
+  limit_reached?: unknown;
+  primary_window?: unknown;
+  secondary_window?: unknown;
+}
+
+function jwtPayload(token?: string) {
+  const parts = token?.split(".") || [];
+  if (parts.length !== 3 || !parts[1]) return undefined;
+  try {
+    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+function codexAccountIdFromIdToken(idToken?: string) {
+  const payload = jwtPayload(idToken);
+  const auth = isRecord(payload?.["https://api.openai.com/auth"]) ? payload?.["https://api.openai.com/auth"] : undefined;
+  const accountId = isRecord(auth) ? auth.chatgpt_account_id : undefined;
+  return typeof accountId === "string" && accountId.trim() ? accountId.trim() : undefined;
+}
+
+function emailFromIdToken(idToken?: string) {
+  const email = jwtPayload(idToken)?.email;
+  return typeof email === "string" && email.trim() ? email.trim() : undefined;
+}
+
+async function refreshCodexTemporaryAccountToken(account: TemporaryAccount) {
+  if (!account.refreshToken?.trim()) return undefined;
+  const body = new URLSearchParams({
+    client_id: CODEX_OAUTH_CLIENT_ID,
+    grant_type: "refresh_token",
+    refresh_token: account.refreshToken.trim(),
+    scope: "openid profile email"
+  });
+  const response = await fetch(CODEX_OAUTH_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`刷新 Codex token 失败：${response.status} ${extractUpstreamError(text)}`);
+  const payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  const accessToken = typeof payload.access_token === "string" ? payload.access_token.trim() : "";
+  if (!accessToken) throw new Error("刷新 Codex token 失败：响应缺少 access_token");
+  const refreshToken = typeof payload.refresh_token === "string" && payload.refresh_token.trim() ? payload.refresh_token.trim() : undefined;
+  const idToken = typeof payload.id_token === "string" && payload.id_token.trim() ? payload.id_token.trim() : undefined;
+  return {
+    secret: accessToken,
+    refreshToken,
+    idToken,
+    accountId: codexAccountIdFromIdToken(idToken) || account.accountId,
+    email: emailFromIdToken(idToken) || account.email
+  };
+}
+
+function codexQuotaHeaders(account: TemporaryAccount, accessToken = account.secret) {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${accessToken}`,
+    "OpenAI-Beta": "codex-1",
+    "OAI-Language": "zh-CN",
+    Originator: "Codex Desktop",
+    Accept: "application/json",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Dest": "empty",
+    Priority: "u=4, i",
+    "User-Agent": CODEX_USER_AGENT
+  };
+  if (account.accountId) headers["Chatgpt-Account-Id"] = account.accountId;
+  return headers;
+}
+
+function numberField(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function codexWindowLabel(prefix: string, windowSeconds?: number) {
+  if (!windowSeconds || !Number.isFinite(windowSeconds)) return prefix;
+  const hours = windowSeconds / 3600;
+  if (hours >= 24 * 6) return `${prefix} 7天`;
+  if (hours >= 4 && hours <= 6) return `${prefix} 5小时`;
+  if (hours >= 24) return `${prefix} ${Math.round(hours / 24)}天`;
+  if (hours >= 1) return `${prefix} ${Math.round(hours)}小时`;
+  return `${prefix} ${Math.max(1, Math.round(windowSeconds / 60))}分钟`;
+}
+
+function codexWindowResetAt(window: Record<string, unknown>) {
+  const resetAtSeconds = numberField(window, "reset_at");
+  if (resetAtSeconds && resetAtSeconds > 0) return new Date(resetAtSeconds * 1000).toISOString();
+  const resetAfterSeconds = numberField(window, "reset_after_seconds");
+  if (resetAfterSeconds && resetAfterSeconds > 0) return new Date(Date.now() + resetAfterSeconds * 1000).toISOString();
+  return undefined;
+}
+
+function stageFromCodexWindow(prefix: string, rawWindow: unknown): TemporaryAccountQuotaStage | undefined {
+  if (!isRecord(rawWindow)) return undefined;
+  const used = numberField(rawWindow, "used_percent");
+  const windowSeconds = numberField(rawWindow, "limit_window_seconds");
+  if (used == null && !windowSeconds) return undefined;
+  return {
+    label: codexWindowLabel(prefix, windowSeconds),
+    remaining: used == null ? undefined : Math.max(0, 100 - used),
+    total: 100,
+    used,
+    unit: "%",
+    resetAt: codexWindowResetAt(rawWindow)
+  };
+}
+
+function stagesFromCodexRateLimit(prefix: string, rawRateLimit: unknown) {
+  if (!isRecord(rawRateLimit)) return [];
+  return [
+    stageFromCodexWindow(prefix, rawRateLimit.primary_window),
+    stageFromCodexWindow(prefix, rawRateLimit.secondary_window)
+  ].filter((stage): stage is TemporaryAccountQuotaStage => Boolean(stage));
+}
+
+function codexRateLimitIsAvailable(rawRateLimit: unknown) {
+  if (!isRecord(rawRateLimit)) return undefined;
+  if (rawRateLimit.allowed === false || rawRateLimit.limit_reached === true) return false;
+  const windows = [rawRateLimit.primary_window, rawRateLimit.secondary_window].filter(isRecord);
+  if (windows.some((window) => (numberField(window, "used_percent") || 0) >= 100)) return false;
+  return true;
+}
+
+function codexUsageCheckResult(payload: unknown) {
+  const stages: TemporaryAccountQuotaStage[] = [];
+  if (!isRecord(payload)) return { availability: "available" as const, stages };
+
+  stages.push(...stagesFromCodexRateLimit("总额度", payload.rate_limit));
+  let selectedAvailability = codexRateLimitIsAvailable(payload.rate_limit);
+
+  const additional = Array.isArray(payload.additional_rate_limits) ? payload.additional_rate_limits : [];
+  for (const item of additional) {
+    if (!isRecord(item)) continue;
+    const feature = typeof item.metered_feature === "string" ? item.metered_feature : "";
+    const limitName = typeof item.limit_name === "string" ? item.limit_name : "";
+    const isCodex = `${feature} ${limitName}`.toLowerCase().includes("codex");
+    const label = isCodex ? "Codex" : limitName || feature || "附加额度";
+    stages.push(...stagesFromCodexRateLimit(label, item.rate_limit));
+    if (isCodex) selectedAvailability = codexRateLimitIsAvailable(item.rate_limit);
+  }
+
+  const resetCredits = isRecord(payload.rate_limit_reset_credits) ? payload.rate_limit_reset_credits : undefined;
+  const availableCount = typeof resetCredits?.available_count === "number" ? resetCredits.available_count : undefined;
+  if (availableCount != null) {
+    stages.push({
+      label: "主动重置次数",
+      remaining: availableCount,
+      unit: "次"
+    });
+  }
+
+  return {
+    availability: selectedAvailability === false ? "unavailable" as const : "available" as const,
+    stages
+  };
+}
+
+async function fetchCodexUsage(account: TemporaryAccount, accessToken = account.secret) {
+  const response = await fetch(CODEX_USAGE_URL, {
+    headers: codexQuotaHeaders(account, accessToken)
+  });
+  return {
+    response,
+    text: await response.text()
+  };
+}
+
+async function checkCodexTemporaryAccount(account: TemporaryAccount, checkedAt: string) {
+  let tokenPatch:
+    | {
+        secret: string;
+        refreshToken?: string;
+        idToken?: string;
+        accountId?: string;
+        email?: string;
+      }
+    | undefined;
+  let attempt = await fetchCodexUsage(account);
+  if ([401, 403].includes(attempt.response.status) && account.refreshToken) {
+    const refreshedTokenPatch = await refreshCodexTemporaryAccountToken(account);
+    if (refreshedTokenPatch) {
+      tokenPatch = refreshedTokenPatch;
+      const refreshedAccount = { ...account, ...tokenPatch };
+      attempt = await fetchCodexUsage(refreshedAccount, tokenPatch.secret);
+    }
+  }
+
+  if (!attempt.response.ok) {
+    const errorMessage = extractUpstreamError(attempt.text) || `HTTP ${attempt.response.status}`;
+    return {
+      patch: {
+        ...tokenPatch,
+        availability: "unavailable" as const,
+        quotaStages: account.quotaStages,
+        lastQuotaCheckedAt: checkedAt,
+        lastCheckStatusCode: attempt.response.status,
+        lastCheckError: errorMessage
+      },
+      result: {
+        availability: "unavailable" as const,
+        status: "failed" as const,
+        statusCode: attempt.response.status,
+        quotaStages: account.quotaStages,
+        errorMessage,
+        checkedAt
+      }
+    };
+  }
+
+  let payload: unknown = {};
+  try {
+    payload = attempt.text ? JSON.parse(attempt.text) : {};
+  } catch {
+    const errorMessage = "Codex usage 返回内容不是合法 JSON";
+    return {
+      patch: {
+        ...tokenPatch,
+        availability: "unavailable" as const,
+        quotaStages: account.quotaStages,
+        lastQuotaCheckedAt: checkedAt,
+        lastCheckStatusCode: attempt.response.status,
+        lastCheckError: errorMessage
+      },
+      result: {
+        availability: "unavailable" as const,
+        status: "failed" as const,
+        statusCode: attempt.response.status,
+        quotaStages: account.quotaStages,
+        errorMessage,
+        checkedAt
+      }
+    };
+  }
+
+  const parsed = codexUsageCheckResult(payload);
+  const errorMessage = parsed.availability === "available" ? undefined : "Codex 额度已耗尽或当前不允许请求";
+  return {
+    patch: {
+      ...tokenPatch,
+      availability: parsed.availability,
+      quotaStages: parsed.stages,
+      lastQuotaCheckedAt: checkedAt,
+      lastCheckStatusCode: attempt.response.status,
+      lastCheckError: errorMessage
+    },
+    result: {
+      availability: parsed.availability,
+      status: parsed.availability === "available" ? "success" as const : "failed" as const,
+      statusCode: attempt.response.status,
+      quotaStages: parsed.stages,
+      errorMessage,
+      checkedAt
+    }
+  };
+}
+
+async function checkOpenAiApiKeyTemporaryAccount(account: TemporaryAccount, checkedAt: string) {
+  const response = await fetch(OPENAI_MODELS_URL, {
+    headers: {
+      Authorization: `Bearer ${account.secret}`,
+      Accept: "application/json"
+    }
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    const errorMessage = extractUpstreamError(text) || `HTTP ${response.status}`;
+    return {
+      patch: {
+        availability: "unavailable" as const,
+        quotaStages: account.quotaStages,
+        lastQuotaCheckedAt: checkedAt,
+        lastCheckStatusCode: response.status,
+        lastCheckError: errorMessage
+      },
+      result: {
+        availability: "unavailable" as const,
+        status: "failed" as const,
+        statusCode: response.status,
+        quotaStages: account.quotaStages,
+        errorMessage,
+        checkedAt
+      }
+    };
+  }
+  return {
+    patch: {
+      availability: "available" as const,
+      quotaStages: account.quotaStages,
+      lastQuotaCheckedAt: checkedAt,
+      lastCheckStatusCode: response.status,
+      lastCheckError: undefined
+    },
+    result: {
+      availability: "available" as const,
+      status: "success" as const,
+      statusCode: response.status,
+      quotaStages: account.quotaStages,
+      checkedAt
+    }
+  };
+}
+
+async function checkTemporaryAccount(groupId: string, account: TemporaryAccount): Promise<TemporaryAccountCheckItemResult> {
+  const checkedAt = new Date().toISOString();
+  try {
+    const accountIsCodex = account.accountType === "codex" || Boolean(account.accountId);
+    const check = accountIsCodex
+      ? await checkCodexTemporaryAccount(account, checkedAt)
+      : await checkOpenAiApiKeyTemporaryAccount(account, checkedAt);
+    const updated = store.updateTemporaryAccountCheckResult(account.id, check.patch);
+    return {
+      groupId,
+      accountId: account.id,
+      label: account.label,
+      availability: check.result.availability,
+      status: check.result.status,
+      statusCode: check.result.statusCode,
+      quotaStages: updated?.quotaStages || check.result.quotaStages,
+      errorMessage: check.result.errorMessage,
+      checkedAt
+    };
+  } catch (error) {
+    const errorMessage = upstreamNetworkErrorMessage(error, "账号检查请求上游失败");
+    const updated = store.updateTemporaryAccountCheckResult(account.id, {
+      availability: "unavailable",
+      quotaStages: account.quotaStages,
+      lastQuotaCheckedAt: checkedAt,
+      lastCheckStatusCode: 599,
+      lastCheckError: errorMessage
+    });
+    return {
+      groupId,
+      accountId: account.id,
+      label: account.label,
+      availability: "unavailable",
+      status: "failed",
+      statusCode: 599,
+      quotaStages: updated?.quotaStages || account.quotaStages,
+      errorMessage,
+      checkedAt
+    };
+  }
+}
+
+async function checkTemporaryAccounts(groupId?: string): Promise<TemporaryAccountCheckResult> {
+  const targets = store.temporaryAccountCheckTargets(groupId);
+  if (groupId && targets.length === 0) throw new Error("临时账号组不存在");
+  const results: TemporaryAccountCheckItemResult[] = [];
+  for (const { group, account } of targets) {
+    results.push(await checkTemporaryAccount(group.id, account));
+  }
+  return {
+    total: results.length,
+    available: results.filter((item) => item.availability === "available").length,
+    unavailable: results.filter((item) => item.availability === "unavailable").length,
+    unknown: results.filter((item) => item.availability === "unknown").length,
+    results
+  };
+}
+
+function shouldMarkTemporaryAccountUnavailable(statusCode: number, errorMessage = "") {
+  if ([401, 403, 429].includes(statusCode)) return true;
+  const normalized = errorMessage.toLowerCase();
+  return (
+    normalized.includes("html") ||
+    normalized.includes("chatgpt") ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("insufficient_quota") ||
+    normalized.includes("usage_limit") ||
+    normalized.includes("rate_limit") ||
+    normalized.includes("quota") ||
+    normalized.includes("额度")
+  );
+}
+
+function markTemporaryAccountAttempt(candidate: ProxyExecutionCandidate, statusCode: number, errorMessage?: string) {
+  const account = candidate.temporaryAccount || candidate.temporaryApiKeyAccount;
+  if (!account) return;
+  const checkedAt = new Date().toISOString();
+  if (statusCode >= 200 && statusCode < 300 && !errorMessage) {
+    store.updateTemporaryAccountCheckResult(account.id, {
+      availability: "available",
+      lastQuotaCheckedAt: checkedAt,
+      lastCheckStatusCode: statusCode,
+      lastCheckError: undefined
+    });
+    return;
+  }
+  if (!shouldMarkTemporaryAccountUnavailable(statusCode, errorMessage)) return;
+  store.updateTemporaryAccountCheckResult(account.id, {
+    availability: "unavailable",
+    lastQuotaCheckedAt: checkedAt,
+    lastCheckStatusCode: statusCode,
+    lastCheckError: errorMessage || `HTTP ${statusCode}`
+  });
+}
+
+function codexTemporaryHeaders(account: TemporaryAccount, templateHeaders: Record<string, string>, stream: boolean) {
+  const headers: Record<string, string> = {
+    ...templateHeaders,
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${account.secret}`,
+    Accept: stream ? "text/event-stream" : "application/json",
+    Connection: "Keep-Alive"
+  };
+  if (!headerValue(headers, "User-Agent")) setHeader(headers, "User-Agent", CODEX_USER_AGENT);
+  if (!headerValue(headers, "Originator")) setHeader(headers, "Originator", CODEX_ORIGINATOR);
+  if (!headerValue(headers, "Session_id")) setHeader(headers, "Session_id", randomBytes(16).toString("hex"));
+  if (account.accountId && !headerValue(headers, "Chatgpt-Account-Id")) setHeader(headers, "Chatgpt-Account-Id", account.accountId);
+  return headers;
+}
+
+function codexTemporaryRequestBody(body: unknown, model: string) {
+  const source: Record<string, unknown> = isRecord(body) ? { ...body } : { input: body };
+  source.model = model;
+  source.store = false;
+  source.stream = true;
+  delete source.metadata;
+  delete source.max_output_tokens;
+  delete source.previous_response_id;
+  delete source.prompt_cache_retention;
+  delete source.safety_identifier;
+  delete source.stream_options;
+  return source;
+}
+
+async function collectCodexResponsesBody(stream: ReadableStream<Uint8Array>) {
+  let preview = "";
+  let completedResponse: unknown;
+  for await (const event of sseJsonObjectsFromReadable(stream)) {
+    const chunk = `data: ${JSON.stringify(event)}\n\n`;
+    preview += chunk;
+    if (preview.length > 1200) preview = preview.slice(0, 1200);
+    if (isRecord(event) && event.type === "response.completed" && isRecord(event.response)) {
+      completedResponse = event.response;
+    } else if (isRecord(event) && isRecord(event.response)) {
+      completedResponse = event.response;
+    }
+  }
+  if (!completedResponse) throw new Error("Codex 上游未返回 response.completed");
+  return {
+    text: JSON.stringify(completedResponse),
+    preview
+  };
+}
+
 function unsupportedProxyMessage() {
   return "代理入口支持 /proxy、/proxy/v1/models、/proxy/v1/messages、/proxy/v1/chat/completions、/proxy/v1/responses 和 /proxy/v1beta/models/{model}:generateContent";
 }
@@ -1031,7 +1857,7 @@ function routeHeaderTemplate(route: SwitchRoute | GroupRoute) {
 }
 
 function candidateKey(candidate: ProxyExecutionCandidate) {
-  return `${candidate.site.id}::${candidate.providerApiKey?.id || ""}::${candidate.model}`;
+  return `${candidate.site.id}::${candidate.providerApiKey?.id || candidate.temporaryAccount?.id || ""}::${candidate.model}`;
 }
 
 function candidateLogKey(candidate: ProxyExecutionCandidate) {
@@ -1094,18 +1920,39 @@ function resolveProxyExecution(routeNameOrId: string) {
     const site = db.sites.find((item) => item.id === route.siteId);
     const addresses = site ? enabledSiteAddresses(site) : [];
     if (!site || addresses.length === 0) throw new Error("路由绑定的供应商地址不可用");
-    return {
-      route,
-      candidates: [
-        {
+    const temporaryAccounts = store.isOfficialOpenAiSite(site.id) ? store.resolveTemporaryOpenAiAccounts(route.model) : [];
+    if (temporaryAccounts.length > 0) {
+      const candidates: ProxyExecutionCandidate[] = temporaryAccounts.map((temporaryAccount, index) => {
+        const temporaryAccountIsCodex = temporaryAccount.accountType === "codex" || Boolean(temporaryAccount.accountId);
+        return {
           site,
           addresses,
           model: route.model,
-          providerApiKey: store.resolveProviderApiKey(site.id, route.model),
+          providerApiKey: temporaryAccountIsCodex ? undefined : temporaryAccount,
+          temporaryAccount: temporaryAccountIsCodex ? temporaryAccount : undefined,
+          temporaryApiKeyAccount: temporaryAccountIsCodex ? undefined : temporaryAccount,
           headerTemplate: routeHeaderTemplate(route),
-          index: 0
-        }
-      ]
+          index
+        };
+      });
+      return {
+        route,
+        candidates
+      };
+    }
+    const candidates: ProxyExecutionCandidate[] = [
+      {
+        site,
+        addresses,
+        model: route.model,
+        providerApiKey: store.resolveProviderApiKey(site.id, route.model),
+        headerTemplate: routeHeaderTemplate(route),
+        index: 0
+      }
+    ];
+    return {
+      route,
+      candidates
     };
   }
 
@@ -1651,17 +2498,60 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
 
   try {
     if (method === "GET" && url.pathname === "/api/health") {
-      sendJson(response, 200, { ok: true, dataDir: store.dataDir, dbPath: store.dbPath });
+      sendJson(response, 200, { ok: true, dataDir: store.dataDir, dbPath: store.dbPath, temporaryAccountsPath: store.temporaryAccountsPath });
       return;
     }
+
+    if (parts[1] === "auth") {
+      if (method === "GET" && parts[2] === "session") {
+        sendJson(response, 200, { authenticated: hasAdminSession(request) });
+        return;
+      }
+      if (method === "POST" && parts[2] === "login") {
+        const body = await readJson(request);
+        const password = typeof body.password === "string" ? body.password : "";
+        if (!verifyAdminPassword(password)) {
+          sendJson(response, 401, { error: "管理密码不正确" });
+          return;
+        }
+        const session = createAdminSession();
+        sendJson(
+          response,
+          200,
+          { authenticated: true, expiresAt: session.expiresAt },
+          { "Set-Cookie": adminSessionCookie(session.token) }
+        );
+        return;
+      }
+      if (method === "POST" && parts[2] === "logout") {
+        sendJson(response, 200, { authenticated: false }, { "Set-Cookie": clearAdminSessionCookie() });
+        return;
+      }
+    }
+
+    if (!requireAdminSession(request, response, url)) return;
 
     if (method === "GET" && url.pathname === "/api/snapshot") {
       sendJson(response, 200, store.snapshot());
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/snapshot/initial") {
+      sendJson(response, 200, store.snapshot({ includeRequestLogs: false, includeTemporaryAccounts: false }));
+      return;
+    }
+
     if (parts[1] === "settings") {
       if (method === "PATCH") return sendJson(response, 200, store.updateSettings(await readJson(request)));
+    }
+
+    if (parts[1] === "auth" && method === "POST" && parts[2] === "password") {
+      const body = await readJson(request);
+      const currentPassword = typeof body.currentPassword === "string" ? body.currentPassword : "";
+      const nextPassword = typeof body.nextPassword === "string" ? body.nextPassword : "";
+      if (!verifyAdminPassword(currentPassword)) return sendJson(response, 401, { error: "当前管理密码不正确" });
+      store.updateAdminPasswordHash(nextPassword);
+      return sendJson(response, 200, { authenticated: false }, { "Set-Cookie": clearAdminSessionCookie() });
     }
 
     if (parts[1] === "logs") {
@@ -1709,10 +2599,27 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
         );
       }
       if (method === "POST" && parts[2] === "sync-models") return sendJson(response, 200, await syncAllProviderModels(request));
-      if (method === "GET") return sendJson(response, 200, store.snapshot().providerApiKeyGroups);
+      if (method === "GET") return sendJson(response, 200, store.snapshot({ includeRequestLogs: false, includeTemporaryAccounts: false }).providerApiKeyGroups);
       if (method === "POST") return sendJson(response, 201, store.upsertProviderApiKeyGroup(await readJson(request)));
       if (method === "DELETE") {
         store.deleteProviderApiKeyGroup(routeParam(parts, 2));
+        return sendJson(response, 200, { ok: true });
+      }
+    }
+
+    if (parts[1] === "temporary-accounts") {
+      if (method === "GET") return sendJson(response, 200, store.getDb().temporaryAccountGroups);
+      if (method === "POST" && parts[2] === "import") {
+        const imported = store.importTemporaryAccounts(await readJson(request));
+        const checkResult = await checkTemporaryAccounts(imported.group.id);
+        const updatedGroup = store.getDb().temporaryAccountGroups.find((group) => group.id === imported.group.id) || imported.group;
+        return sendJson(response, 201, { ...imported, group: updatedGroup, checkResult });
+      }
+      if (method === "POST" && parts[2] === "check") return sendJson(response, 200, await checkTemporaryAccounts());
+      if (method === "POST" && parts[3] === "check") return sendJson(response, 200, await checkTemporaryAccounts(routeParam(parts, 2)));
+      if (method === "PATCH") return sendJson(response, 200, store.updateTemporaryAccountGroup(routeParam(parts, 2), await readJson(request)));
+      if (method === "DELETE") {
+        store.deleteTemporaryAccountGroup(routeParam(parts, 2));
         return sendJson(response, 200, { ok: true });
       }
     }
@@ -1890,7 +2797,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
         "Content-Type": "application/json",
         ...parseHeaderTemplate(candidate.headerTemplate?.headersText)
       };
-      if (!candidate.providerApiKey && !headerValue(headers, "Authorization")) {
+      if (!candidate.providerApiKey && !candidate.temporaryAccount && !headerValue(headers, "Authorization")) {
         throw new Error(`未找到支持模型 ${candidate.model} 的上游 API Key`);
       }
       if (candidate.providerApiKey) setHeader(headers, "Authorization", `Bearer ${candidate.providerApiKey.secret}`);
@@ -1907,6 +2814,11 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
             "upstream-api-key": candidate.providerApiKey.label,
             "upstream-authorization": `Bearer ${maskSecret(candidate.providerApiKey.secret)}`
           }
+        : candidate.temporaryAccount
+          ? {
+              "upstream-api-key": candidate.temporaryAccount.label,
+              "upstream-authorization": `Bearer ${maskSecret(candidate.temporaryAccount.secret)}`
+            }
         : {
             "upstream-authorization": "Header 模版已提供"
           };
@@ -1918,6 +2830,285 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
         ...upstreamAuthLog
       };
       lastAttemptContext = { candidate, routeUa, routeTargetLog, upstreamAuthLog };
+
+      if (candidate.temporaryAccount) {
+        const codexHeaders = codexTemporaryHeaders(candidate.temporaryAccount, headers, true);
+        const codexRouteUa = headerValue(codexHeaders, "User-Agent") || CODEX_USER_AGENT;
+        const codexRouteTargetLog = {
+          ...routeTargetLog,
+          userAgent: codexRouteUa
+        };
+        const codexAuthLog: Record<string, string> = {
+          "upstream-api-key": candidate.temporaryAccount.label,
+          "upstream-authorization": `Bearer ${maskSecret(candidate.temporaryAccount.secret)}`,
+          "upstream-account-id": candidate.temporaryAccount.accountId ? maskSecret(candidate.temporaryAccount.accountId) : "未提供"
+        };
+        lastAttemptContext = { candidate, routeUa: codexRouteUa, routeTargetLog: codexRouteTargetLog, upstreamAuthLog: codexAuthLog };
+        const convertedForCodex = convertedRouteRequestBody(body, candidate.model, "responses", proxyInfo.kind);
+        const codexForwardedBody = codexTemporaryRequestBody(convertedForCodex.body, candidate.model);
+        const codexUpstreamRequestHeaders = {
+          ...maskedStringHeaders(codexHeaders),
+          ...codexAuthLog
+        };
+        const attemptStartedAt = Date.now();
+        try {
+          const upstream = await fetch(CODEX_BACKEND_RESPONSES_URL, {
+            method: "POST",
+            headers: codexHeaders,
+            body: JSON.stringify(codexForwardedBody)
+          });
+          const contentType = upstream.headers.get("content-type") || undefined;
+
+          if (upstream.ok && upstream.body && !looksLikeHtml(contentType, "")) {
+            if (downstreamStream) {
+              response.socket?.setNoDelay(true);
+              response.writeHead(upstream.status, {
+                "Content-Type": streamResponseContentType(proxyInfo.kind, contentType),
+                "Cache-Control": "no-cache, no-transform",
+                Connection: "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Access-Control-Allow-Origin": "*"
+              });
+              response.flushHeaders();
+              try {
+                const streamPreviewText =
+                  convertedForCodex.converter?.convertStream
+                    ? await streamConvertedResponse({
+                        upstreamBody: upstream.body,
+                        response,
+                        proxyKind: proxyInfo.kind,
+                        routeEndpoint: "responses",
+                        routeModel: candidate.model,
+                        requestBody: codexForwardedBody,
+                        converter: convertedForCodex.converter
+                      })
+                    : await streamRawResponse({ upstreamBody: upstream.body, response });
+                response.end();
+                upstreamAttempts.push({
+                  addressLabel: "Codex Backend",
+                  upstreamUrl: CODEX_BACKEND_RESPONSES_URL,
+                  method: "POST",
+                  model: candidate.model,
+                  endpoint: "responses",
+                  userAgent: codexRouteUa,
+                  requestHeaders: codexUpstreamRequestHeaders,
+                  requestBody: codexForwardedBody,
+                  status: "success",
+                  statusCode: upstream.status,
+                  durationMs: Date.now() - attemptStartedAt,
+                  contentType,
+                  responsePreview: responsePreview(streamPreviewText)
+                });
+                store.recordRequestLog({
+                  ...requestLogBase,
+                  routeId: route.id,
+                  routeName: route.name,
+                  endpoint: route.endpoint,
+                  providerName: candidate.site.name,
+                  providerId: candidate.site.id,
+                  addressLabel: "Codex Backend",
+                  model: candidate.model,
+                  requestBody: body,
+                  status: "success",
+                  statusCode: upstream.status,
+                  durationMs: Date.now() - startedAt,
+                  requestHeaders: {
+                    ...requestLogBase.requestHeaders,
+                    ...codexAuthLog
+                  },
+                  upstreamUrl: CODEX_BACKEND_RESPONSES_URL,
+                  upstreamContentType: contentType,
+                  responsePreview: responsePreview(streamPreviewText),
+                  downstream: downstreamLog,
+                  routeTarget: codexRouteTargetLog,
+                  upstreamAttempts,
+                  summary: chainSummary({
+                    downstreamModel: downstreamLog.model,
+                    downstreamEndpoint,
+                    downstreamUa,
+                    routeModel: candidate.model,
+                    routeEndpoint: route.endpoint,
+                    routeUa: codexRouteUa,
+                    status: "success"
+                  })
+                });
+                markTemporaryAccountAttempt(candidate, upstream.status);
+                markCandidateSuccess(route, candidate);
+                return;
+              } catch (streamError) {
+                const errorMessage = streamError instanceof Error ? streamError.message : "Codex 流式转发失败";
+                markTemporaryAccountAttempt(candidate, 599, errorMessage);
+                upstreamAttempts.push({
+                  addressLabel: "Codex Backend",
+                  upstreamUrl: CODEX_BACKEND_RESPONSES_URL,
+                  method: "POST",
+                  model: candidate.model,
+                  endpoint: "responses",
+                  userAgent: codexRouteUa,
+                  requestHeaders: codexUpstreamRequestHeaders,
+                  requestBody: codexForwardedBody,
+                  status: "failed",
+                  statusCode: 599,
+                  durationMs: Date.now() - attemptStartedAt,
+                  contentType,
+                  responsePreview: responsePreview(JSON.stringify({ error: errorMessage })),
+                  errorMessage
+                });
+                store.recordRequestLog({
+                  ...requestLogBase,
+                  routeId: route.id,
+                  routeName: route.name,
+                  endpoint: route.endpoint,
+                  providerName: candidate.site.name,
+                  providerId: candidate.site.id,
+                  addressLabel: "Codex Backend",
+                  model: candidate.model,
+                  requestBody: body,
+                  status: "failed",
+                  statusCode: 599,
+                  durationMs: Date.now() - startedAt,
+                  requestHeaders: {
+                    ...requestLogBase.requestHeaders,
+                    ...codexAuthLog
+                  },
+                  upstreamUrl: CODEX_BACKEND_RESPONSES_URL,
+                  upstreamContentType: contentType,
+                  responsePreview: responsePreview(JSON.stringify({ error: errorMessage })),
+                  errorMessage,
+                  downstream: downstreamLog,
+                  routeTarget: codexRouteTargetLog,
+                  upstreamAttempts,
+                  summary: chainSummary({
+                    downstreamModel: downstreamLog.model,
+                    downstreamEndpoint,
+                    downstreamUa,
+                    routeModel: candidate.model,
+                    routeEndpoint: route.endpoint,
+                    routeUa: codexRouteUa,
+                    status: "failed"
+                  })
+                });
+                response.end();
+                return;
+              }
+            }
+
+            const codexCollected = await collectCodexResponsesBody(upstream.body);
+            const adapted = convertUpstreamResponseText({
+              text: codexCollected.text,
+              contentType: "application/json; charset=utf-8",
+              proxyKind: proxyInfo.kind,
+              converter: convertedForCodex.converter,
+              downstreamStream
+            });
+            upstreamAttempts.push({
+              addressLabel: "Codex Backend",
+              upstreamUrl: CODEX_BACKEND_RESPONSES_URL,
+              method: "POST",
+              model: candidate.model,
+              endpoint: "responses",
+              userAgent: codexRouteUa,
+              requestHeaders: codexUpstreamRequestHeaders,
+              requestBody: codexForwardedBody,
+              status: "success",
+              statusCode: upstream.status,
+              durationMs: Date.now() - attemptStartedAt,
+              contentType,
+              responsePreview: responsePreview(adapted.text || codexCollected.preview)
+            });
+            store.recordRequestLog({
+              ...requestLogBase,
+              routeId: route.id,
+              routeName: route.name,
+              endpoint: route.endpoint,
+              providerName: candidate.site.name,
+              providerId: candidate.site.id,
+              addressLabel: "Codex Backend",
+              model: candidate.model,
+              requestBody: body,
+              status: "success",
+              statusCode: upstream.status,
+              durationMs: Date.now() - startedAt,
+              requestHeaders: {
+                ...requestLogBase.requestHeaders,
+                ...codexAuthLog
+              },
+              upstreamUrl: CODEX_BACKEND_RESPONSES_URL,
+              upstreamContentType: contentType,
+              responsePreview: responsePreview(adapted.text || codexCollected.preview),
+              downstream: downstreamLog,
+              routeTarget: codexRouteTargetLog,
+              upstreamAttempts,
+              summary: chainSummary({
+                downstreamModel: downstreamLog.model,
+                downstreamEndpoint,
+                downstreamUa,
+                routeModel: candidate.model,
+                routeEndpoint: route.endpoint,
+                routeUa: codexRouteUa,
+                status: "success"
+              })
+            });
+            markTemporaryAccountAttempt(candidate, upstream.status);
+            markCandidateSuccess(route, candidate);
+            response.writeHead(upstream.status, {
+              "Content-Type": adapted.contentType || "application/json; charset=utf-8",
+              "Access-Control-Allow-Origin": "*"
+            });
+            response.end(adapted.text);
+            return;
+          }
+
+          const text = await upstream.text();
+          const htmlMessage = looksLikeHtml(contentType, text) ? "返回了 HTML 页面，请检查 Codex 账号、代理或 ChatGPT 访问状态" : "";
+          const errorMessage = htmlMessage || extractUpstreamError(text) || `HTTP ${upstream.status}`;
+          markTemporaryAccountAttempt(candidate, upstream.status, errorMessage);
+          errors.push(`Codex Backend：${upstream.status} ${errorMessage}`);
+          upstreamAttempts.push({
+            addressLabel: "Codex Backend",
+            upstreamUrl: CODEX_BACKEND_RESPONSES_URL,
+            method: "POST",
+            model: candidate.model,
+            endpoint: "responses",
+            userAgent: codexRouteUa,
+            requestHeaders: codexUpstreamRequestHeaders,
+            requestBody: codexForwardedBody,
+            status: "failed",
+            statusCode: upstream.status,
+            durationMs: Date.now() - attemptStartedAt,
+            contentType,
+            responsePreview: responsePreview(text),
+            errorMessage
+          });
+          lastFailure = {
+            address: candidate.addresses[0],
+            target: CODEX_BACKEND_RESPONSES_URL,
+            statusCode: upstream.status,
+            text,
+            contentType
+          };
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : "请求 Codex 上游失败";
+          markTemporaryAccountAttempt(candidate, 599, errorMessage);
+          errors.push(`Codex Backend：${errorMessage}`);
+          upstreamAttempts.push({
+            addressLabel: "Codex Backend",
+            upstreamUrl: CODEX_BACKEND_RESPONSES_URL,
+            method: "POST",
+            model: candidate.model,
+            endpoint: "responses",
+            userAgent: codexRouteUa,
+            requestHeaders: codexUpstreamRequestHeaders,
+            requestBody: codexForwardedBody,
+            status: "failed",
+            statusCode: 599,
+            durationMs: Date.now() - attemptStartedAt,
+            responsePreview: responsePreview(JSON.stringify({ error: errorMessage })),
+            errorMessage
+          });
+        }
+        continue;
+      }
 
       for (const address of candidate.addresses) {
       for (const target of proxyEndpointCandidates(address.baseUrl, route.endpoint)) {
@@ -2003,10 +3194,12 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                     status: "success"
                   })
                 });
+                markTemporaryAccountAttempt(candidate, upstream.status);
                 markCandidateSuccess(route, candidate);
                 return;
               } catch (streamError) {
                 const errorMessage = streamError instanceof Error ? streamError.message : "流式转发失败";
+                markTemporaryAccountAttempt(candidate, 599, errorMessage);
                 upstreamAttempts.push({
                   addressLabel: address.label,
                   upstreamUrl: target,
@@ -2146,6 +3339,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                 status: "success"
               })
             });
+            markTemporaryAccountAttempt(candidate, upstream.status);
             markCandidateSuccess(route, candidate);
             response.writeHead(upstream.status, {
               "Content-Type": adapted.contentType || "application/json; charset=utf-8",
@@ -2158,6 +3352,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
           const text = await upstream.text();
           const htmlMessage = looksLikeHtml(contentType, text) ? "返回了 HTML 页面，请检查站点地址是否为 API Base URL" : "";
           const errorMessage = htmlMessage || extractUpstreamError(text) || `HTTP ${upstream.status}`;
+          markTemporaryAccountAttempt(candidate, upstream.status, errorMessage);
           errors.push(`${address.label} ${target}：${upstream.status} ${errorMessage}`);
           upstreamAttempts.push({
             addressLabel: address.label,
@@ -2184,6 +3379,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
           };
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : "请求上游失败";
+          markTemporaryAccountAttempt(candidate, 599, errorMessage);
           errors.push(`${address.label} ${target}：${errorMessage}`);
           upstreamAttempts.push({
             addressLabel: address.label,
@@ -2328,6 +3524,7 @@ const server = http.createServer(async (request, response) => {
     await handleUnsupportedProxyPath(request, response, url);
     return;
   }
+  if (handleStatic(request, response, url)) return;
   notFound(response);
 });
 
@@ -2335,4 +3532,9 @@ server.listen(PORT, HOST, () => {
   console.log(`SamAPI API is running at http://${HOST}:${PORT}`);
   console.log(`Local access: http://127.0.0.1:${PORT}`);
   console.log(`Database: ${store.dbPath}`);
+  console.log(`Web UI: ${WEB_DIR}`);
+  console.log(`Fetch proxy: ${FETCH_PROXY_URL || "direct"}`);
+  if (ADMIN_PASSWORD_IS_DEFAULT && !store.getAdminPasswordHash()) {
+    console.warn("Admin password is using the local default: samapi-admin. Set SAMAPI_ADMIN_PASSWORD before exposing SamAPI publicly.");
+  }
 });

@@ -7,6 +7,8 @@ import {
   Copy,
   Database,
   KeyRound,
+  LockKeyhole,
+  LogIn,
   Map,
   Plus,
   RefreshCw,
@@ -16,14 +18,17 @@ import {
   Settings,
   ShieldCheck,
   Trash2,
+  Upload,
   Wand2,
   X
 } from "lucide-react";
 import { Children, FormEvent, isValidElement, useEffect, useId, useMemo, useRef, useState } from "react";
-import { api } from "./api";
+import { api, isUnauthorizedError } from "./api";
 import type {
   ApiKeyCreated,
+  AppSettings,
   AppSnapshot,
+  AppThemeId,
   EndpointKind,
   GroupRoute,
   GroupRouteMember,
@@ -36,10 +41,16 @@ import type {
   Site,
   SiteAddress,
   SiteType,
-  SwitchRoute
+  SwitchRoute,
+  TemporaryAccount,
+  TemporaryAccountAvailability,
+  TemporaryAccountCheckResult,
+  TemporaryAccountGroup,
+  TemporaryAccountImportSource
 } from "../shared/types";
 
-type Section = "routes" | "sites" | "providerKeys" | "keys" | "headers" | "logs" | "settings" | "docs";
+type Section = "routes" | "sites" | "providerKeys" | "temporaryAccounts" | "keys" | "headers" | "logs" | "settings" | "docs";
+type AuthStatus = "checking" | "signed-out" | "signed-in";
 
 interface RouteDraft {
   id?: string;
@@ -73,6 +84,15 @@ interface ProviderKeyGroupDraft {
   siteId: string;
   groupName: string;
   apiKeys: ProviderApiKeyDraft[];
+}
+
+interface TemporaryAccountImportDraft {
+  name: string;
+  source: TemporaryAccountImportSource;
+  modelsText: string;
+  content: string;
+  contents: string[];
+  fileNames: string[];
 }
 
 interface HeaderKeyValue {
@@ -128,10 +148,55 @@ const groupStrategyLabels: Record<GroupRouteStrategy, string> = {
   random: "随机调用"
 };
 
+const temporaryAccountSourceLabels: Record<TemporaryAccountImportSource, string> = {
+  cpa: "CPA",
+  subapi: "SubAPI"
+};
+
+const temporaryAccountAvailabilityLabels: Record<TemporaryAccountAvailability, string> = {
+  available: "可用",
+  unavailable: "不可用",
+  unknown: "未检查"
+};
+
+const themeOptions = [
+  {
+    id: "fresh",
+    name: "清泉",
+    description: "冷白底色配青绿色状态，清爽、安静、适合默认使用。",
+    swatches: ["#f6f8fb", "#0f766e", "#99f6e4"]
+  },
+  {
+    id: "salt",
+    name: "海盐蓝",
+    description: "蓝灰与海水蓝，界面更冷静，长时间查看日志也舒服。",
+    swatches: ["#f5f9ff", "#2563eb", "#67e8f9"]
+  },
+  {
+    id: "citrus",
+    name: "青柚绿",
+    description: "偏自然的绿色和浅柠色，轻快但不刺眼。",
+    swatches: ["#f7faf3", "#3f7d20", "#d9f99d"]
+  },
+  {
+    id: "rose",
+    name: "雾玫瑰",
+    description: "冷灰底上加一点玫瑰红，柔和、干净、有识别度。",
+    swatches: ["#fbf7f9", "#be185d", "#fbcfe8"]
+  },
+  {
+    id: "midnight",
+    name: "深海夜",
+    description: "深色模式，适合夜间调试和低光环境。",
+    swatches: ["#0b1220", "#22d3ee", "#134e4a"]
+  }
+] satisfies Array<{ id: AppThemeId; name: string; description: string; swatches: string[] }>;
+
 const navItems = [
   { id: "routes", label: "路由管理", icon: Route },
   { id: "sites", label: "站点管理", icon: Server },
   { id: "providerKeys", label: "API Key 管理", icon: KeyRound },
+  { id: "temporaryAccounts", label: "临时账号", icon: Upload },
   { id: "keys", label: "客户端密钥", icon: ShieldCheck },
   { id: "headers", label: "Header 模版", icon: Braces },
   { id: "logs", label: "日志管理", icon: Activity },
@@ -345,6 +410,53 @@ function emptyProviderKeyGroup(snapshot?: AppSnapshot): ProviderKeyGroupDraft {
   };
 }
 
+function emptyTemporaryAccountImport(): TemporaryAccountImportDraft {
+  return {
+    name: "GPT 临时账号",
+    source: "cpa",
+    modelsText: "",
+    content: "",
+    contents: [],
+    fileNames: []
+  };
+}
+
+function temporaryAccountCheckSummary(result: TemporaryAccountCheckResult) {
+  return `${result.total} 个账号，${result.available} 可用 / ${result.unavailable} 不可用 / ${result.unknown} 未检查`;
+}
+
+function temporaryAccountAvailabilityStats(accounts: TemporaryAccount[]) {
+  return accounts.reduce(
+    (stats, account) => {
+      const availability = account.availability || "unknown";
+      stats[availability] += 1;
+      return stats;
+    },
+    { available: 0, unavailable: 0, unknown: 0 } satisfies Record<TemporaryAccountAvailability, number>
+  );
+}
+
+function temporaryAccountTypeLabel(account: TemporaryAccount) {
+  if (account.accountType === "openai-api-key") return "OpenAI API Key";
+  if (account.accountType === "codex" || account.accountId) return "Codex";
+  return "临时账号";
+}
+
+function formatQuotaValue(value: TemporaryAccount["quotaStages"][number]["remaining"], unit?: string) {
+  if (value === undefined || value === null || value === "") return "";
+  return `${value}${unit || ""}`;
+}
+
+function temporaryAccountQuotaText(stage: TemporaryAccount["quotaStages"][number]) {
+  const parts = [
+    formatQuotaValue(stage.remaining, stage.unit) ? `剩余 ${formatQuotaValue(stage.remaining, stage.unit)}` : "",
+    formatQuotaValue(stage.used, stage.unit) ? `已用 ${formatQuotaValue(stage.used, stage.unit)}` : "",
+    formatQuotaValue(stage.total, stage.unit) ? `总量 ${formatQuotaValue(stage.total, stage.unit)}` : "",
+    stage.resetAt ? `${formatTime(stage.resetAt)} 重置` : ""
+  ].filter(Boolean);
+  return `${stage.label}${parts.length > 0 ? `：${parts.join(" / ")}` : ""}`;
+}
+
 function formatTime(value: string) {
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
@@ -440,11 +552,11 @@ function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
   }, [open]);
 
   const commitValue = (nextValue: string) => {
+    setOpen(false);
     onChange?.({
       target: { value: nextValue, name },
       currentTarget: { value: nextValue, name }
     } as unknown as React.ChangeEvent<HTMLSelectElement>);
-    setOpen(false);
   };
 
   const moveActive = (direction: 1 | -1) => {
@@ -484,7 +596,11 @@ function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
   };
 
   return (
-    <span ref={rootRef} className={`select-shell ${open ? "select-shell-open" : ""} ${disabled ? "select-shell-disabled" : ""}`}>
+    <span
+      ref={rootRef}
+      className={`select-shell ${open ? "select-shell-open" : ""} ${disabled ? "select-shell-disabled" : ""}`}
+      onClick={(event) => event.stopPropagation()}
+    >
       <button
         type="button"
         className={`field select-trigger ${className || ""}`}
@@ -514,7 +630,15 @@ function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
                 disabled={option.disabled}
                 className={`select-option ${selected ? "select-option-selected" : ""} ${active ? "select-option-active" : ""}`}
                 onMouseEnter={() => setActiveIndex(index)}
-                onClick={() => commitValue(option.value)}
+                onPointerDown={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  if (!option.disabled) commitValue(option.value);
+                }}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  if (!option.disabled) commitValue(option.value);
+                }}
               >
                 <span>{option.label}</span>
                 {selected ? <Check className="h-4 w-4" /> : null}
@@ -553,8 +677,104 @@ function NavButton(props: { item: (typeof allNavItems)[number]; active: boolean;
   );
 }
 
+function AuthLanding(props: {
+  status: AuthStatus;
+  busy: boolean;
+  error: string;
+  onLogin: (password: string) => Promise<void>;
+}) {
+  const [password, setPassword] = useState("");
+  const checking = props.status === "checking";
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (!password.trim() || props.busy || checking) return;
+    props.onLogin(password);
+  };
+
+  return (
+    <main className="auth-page min-h-screen text-ink">
+      <div className="grain" />
+      <div className="auth-shell">
+        <section className="auth-copy" aria-labelledby="auth-title">
+          <div className="auth-kicker">
+            <span className="auth-kicker-mark">
+              <ShieldCheck className="h-4 w-4" />
+            </span>
+            Local model gateway
+          </div>
+          <h1 id="auth-title">SamAPI</h1>
+          <p className="auth-intro">
+            一个面向本地和私有部署的模型路由控制台，用来集中管理上游模型供应商、Header 模版、客户端密钥和路由策略。
+          </p>
+          <div className="auth-metric-row" aria-label="SamAPI capability summary">
+            <div>
+              <strong>Proxy</strong>
+              <span>统一转发入口</span>
+            </div>
+            <div>
+              <strong>Keys</strong>
+              <span>客户端密钥</span>
+            </div>
+            <div>
+              <strong>Logs</strong>
+              <span>请求链路记录</span>
+            </div>
+          </div>
+          <div className="auth-feature-grid">
+            <div className="auth-feature">
+              <Route className="h-4 w-4" />
+              <span>在多个供应商、模型和 endpoint 之间切换路由。</span>
+            </div>
+            <div className="auth-feature">
+              <KeyRound className="h-4 w-4" />
+              <span>把上游 Key 和下游调用密钥分开管理。</span>
+            </div>
+            <div className="auth-feature">
+              <Activity className="h-4 w-4" />
+              <span>记录下游请求、上游响应和失败原因。</span>
+            </div>
+          </div>
+        </section>
+
+        <form className="auth-panel panel" onSubmit={submit}>
+          <div className="auth-lock">
+            <LockKeyhole className="h-5 w-5" />
+          </div>
+          <div>
+            <h2>进入控制台</h2>
+            <p>管理入口已启用密码保护。</p>
+          </div>
+          <label>
+            管理密码
+            <TextInput
+              type="password"
+              value={password}
+              autoFocus
+              autoComplete="current-password"
+              disabled={props.busy || checking}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+          </label>
+          {props.error ? <div className="auth-error" role="alert">{props.error}</div> : null}
+          <ActionButton type="submit" disabled={!password.trim() || props.busy || checking}>
+            {props.busy || checking ? <RefreshCw className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+            {checking ? "检查会话" : "进入"}
+          </ActionButton>
+        </form>
+      </div>
+    </main>
+  );
+}
+
 export default function App() {
+  const [authStatus, setAuthStatus] = useState<AuthStatus>("checking");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
+  const [temporaryAccountsLoaded, setTemporaryAccountsLoaded] = useState(false);
+  const [temporaryAccountsLoading, setTemporaryAccountsLoading] = useState(false);
+  const [temporaryAccountsError, setTemporaryAccountsError] = useState("");
   const [section, setSection] = useState<Section>("routes");
   const [routeDraft, setRouteDraft] = useState<RouteDraft>({});
   const [routeEditorOpen, setRouteEditorOpen] = useState(false);
@@ -562,6 +782,8 @@ export default function App() {
   const [siteEditorOpen, setSiteEditorOpen] = useState(false);
   const [providerKeyDraft, setProviderKeyDraft] = useState<ProviderKeyGroupDraft>(emptyProviderKeyGroup());
   const [providerKeyEditorOpen, setProviderKeyEditorOpen] = useState(false);
+  const [temporaryAccountDraft, setTemporaryAccountDraft] = useState<TemporaryAccountImportDraft>(emptyTemporaryAccountImport());
+  const [temporaryAccountEditorOpen, setTemporaryAccountEditorOpen] = useState(false);
   const [headerDraft, setHeaderDraft] = useState<HeaderTemplateDraft>(emptyHeader());
   const [headerEditorOpen, setHeaderEditorOpen] = useState(false);
   const [keyName, setKeyName] = useState("client-app");
@@ -575,6 +797,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [modelSyncing, setModelSyncing] = useState(false);
   const [modelDiscoveringIndex, setModelDiscoveringIndex] = useState<number | null>(null);
+  const [temporaryAccountChecking, setTemporaryAccountChecking] = useState<string | null>(null);
   const appScrollRef = useRef<HTMLDivElement | null>(null);
   const appScrollContentRef = useRef<HTMLDivElement | null>(null);
   const toastTimerRef = useRef<number | undefined>(undefined);
@@ -665,10 +888,81 @@ export default function App() {
     showAppScrollbar();
   };
 
-  const load = async () => {
-    const next = await api.snapshot();
+  const handleUnauthorized = (error: unknown) => {
+    if (!isUnauthorizedError(error)) return false;
+    setSnapshot(null);
+    setTemporaryAccountsLoaded(false);
+    setTemporaryAccountsLoading(false);
+    setTemporaryAccountsError("");
+    setAuthStatus("signed-out");
+    setAuthError("会话已过期，请重新输入管理密码");
+    return true;
+  };
+
+  const load = async (initial = false) => {
+    const next = initial ? await api.initialSnapshot() : await api.snapshot();
+    setTemporaryAccountsLoaded(!initial);
+    setTemporaryAccountsLoading(false);
+    setTemporaryAccountsError("");
     setSnapshot(next);
     setRouteDraft((current) => (current.name ? current : emptyRoute(next)));
+    setAuthStatus("signed-in");
+    setAuthError("");
+  };
+
+  const loadTemporaryAccountGroups = async () => {
+    if (temporaryAccountsLoading) return;
+    setTemporaryAccountsLoading(true);
+    setTemporaryAccountsError("");
+    try {
+      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
+      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
+      setTemporaryAccountsLoaded(true);
+    } catch (error) {
+      if (handleUnauthorized(error)) return;
+      const message = error instanceof Error ? error.message : "临时账号加载失败";
+      setTemporaryAccountsError(message);
+      setTemporaryAccountsLoaded(true);
+      setToast(message);
+    } finally {
+      setTemporaryAccountsLoading(false);
+    }
+  };
+
+  const bootstrap = async () => {
+    try {
+      const session = await api.authSession();
+      if (!session.authenticated) {
+        setSnapshot(null);
+        setTemporaryAccountsLoaded(false);
+        setTemporaryAccountsLoading(false);
+        setTemporaryAccountsError("");
+        setAuthStatus("signed-out");
+        return;
+      }
+      await load(true);
+    } catch (error) {
+      setSnapshot(null);
+      setTemporaryAccountsLoaded(false);
+      setTemporaryAccountsLoading(false);
+      setTemporaryAccountsError("");
+      setAuthStatus("signed-out");
+      setAuthError(error instanceof Error ? error.message : "认证状态检查失败");
+    }
+  };
+
+  const login = async (password: string) => {
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      await api.login(password);
+      await load(true);
+      setToast("已进入控制台");
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "登录失败");
+    } finally {
+      setAuthBusy(false);
+    }
   };
 
   const refreshLogs = async (showSuccess = false) => {
@@ -678,15 +972,21 @@ export default function App() {
       setSnapshot((current) => (current ? { ...current, requestLogs } : current));
       if (showSuccess) setToast("日志已刷新");
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "日志刷新失败");
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "日志刷新失败");
     } finally {
       setLogsRefreshing(false);
     }
   };
 
   useEffect(() => {
-    load().catch((error) => setToast(error.message));
+    bootstrap();
   }, []);
+
+  useEffect(() => {
+    const themeId = snapshot?.settings.themeId || "fresh";
+    document.documentElement.dataset.theme = themeId;
+    document.documentElement.style.colorScheme = themeId === "midnight" ? "dark" : "light";
+  }, [snapshot?.settings.themeId]);
 
   useEffect(() => {
     if (!toast) return;
@@ -712,12 +1012,18 @@ export default function App() {
   }, [section, snapshot]);
 
   useEffect(() => {
-    if (section !== "logs" || !logsAutoRefresh) return;
+    if (authStatus !== "signed-in" || section !== "temporaryAccounts" || temporaryAccountsLoaded) return;
+    loadTemporaryAccountGroups();
+  }, [authStatus, section, temporaryAccountsLoaded]);
+
+  useEffect(() => {
+    if (authStatus !== "signed-in" || section !== "logs" || !logsAutoRefresh) return;
+    refreshLogs();
     const interval = window.setInterval(() => {
       refreshLogs();
     }, 5000);
     return () => window.clearInterval(interval);
-  }, [section, logsAutoRefresh]);
+  }, [authStatus, section, logsAutoRefresh]);
 
   const selectedSite = useMemo(
     () => snapshot?.sites.find((site) => site.id === routeDraft.siteId),
@@ -732,7 +1038,26 @@ export default function App() {
       await load();
       setToast(message);
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "操作失败");
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "操作失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const changeAdminPassword = async (currentPassword: string, nextPassword: string) => {
+    setBusy(true);
+    try {
+      await api.updateAdminPassword(currentPassword, nextPassword);
+      setSnapshot(null);
+      setTemporaryAccountsLoaded(false);
+      setTemporaryAccountsLoading(false);
+      setTemporaryAccountsError("");
+      setAuthStatus("signed-out");
+      setAuthError("");
+      setToast("");
+    } catch (error) {
+      if (handleUnauthorized(error)) return;
+      throw error;
     } finally {
       setBusy(false);
     }
@@ -760,6 +1085,42 @@ export default function App() {
       await api.saveProviderKeyGroup(providerKeyDraft);
       setProviderKeyEditorOpen(false);
     }, "API Key 分组已保存");
+  };
+
+  const importTemporaryAccounts = (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    (async () => {
+      const result = await api.importTemporaryAccounts({
+        name: temporaryAccountDraft.name,
+        source: temporaryAccountDraft.source,
+        models: temporaryAccountDraft.modelsText.split(/[\n,，;；\s]+/).map((model) => model.trim()).filter(Boolean),
+        content: temporaryAccountDraft.content,
+        contents: temporaryAccountDraft.contents
+      });
+      setTemporaryAccountEditorOpen(false);
+      setTemporaryAccountDraft(emptyTemporaryAccountImport());
+      await load();
+      const checkSummary = result.checkResult ? `；检查结果：${temporaryAccountCheckSummary(result.checkResult)}` : "";
+      setToast(`已导入 ${result.imported} 个临时账号${result.skipped ? `，跳过 ${result.skipped} 个重复项` : ""}${checkSummary}`);
+    })()
+      .catch((error) => {
+        if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号导入失败");
+      })
+      .finally(() => setBusy(false));
+  };
+
+  const checkTemporaryAccounts = async (groupId?: string) => {
+    setTemporaryAccountChecking(groupId || "all");
+    try {
+      const result = groupId ? await api.checkTemporaryAccountGroup(groupId) : await api.checkTemporaryAccounts();
+      await load();
+      setToast(`${groupId ? "账号组检查完成" : "临时账号检查完成"}：${temporaryAccountCheckSummary(result)}`);
+    } catch (error) {
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号检查失败");
+    } finally {
+      setTemporaryAccountChecking(null);
+    }
   };
 
   const saveHeader = (event: FormEvent) => {
@@ -799,6 +1160,11 @@ export default function App() {
     setProviderKeyEditorOpen(true);
   };
 
+  const openNewTemporaryAccounts = () => {
+    setTemporaryAccountDraft(emptyTemporaryAccountImport());
+    setTemporaryAccountEditorOpen(true);
+  };
+
   const openEditProviderKeyGroup = (group: ProviderApiKeyGroupView) => {
     setProviderKeyDraft({
       id: group.id,
@@ -831,7 +1197,7 @@ export default function App() {
       }));
       setToast(`已获取 ${result.models.length} 个模型`);
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "模型获取失败");
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "模型获取失败");
     } finally {
       await load().catch(() => undefined);
       setModelDiscoveringIndex(null);
@@ -858,7 +1224,7 @@ export default function App() {
           : `模型同步完成：成功 ${result.success}/${result.total}`
       );
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "模型同步失败");
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "模型同步失败");
     } finally {
       setModelSyncing(false);
     }
@@ -892,11 +1258,12 @@ export default function App() {
     if (section === "routes") openNewRoute();
     if (section === "sites") openNewSite();
     if (section === "providerKeys") openNewProviderKeyGroup();
+    if (section === "temporaryAccounts") openNewTemporaryAccounts();
     if (section === "keys") openNewKey();
     if (section === "headers") openNewHeader();
   };
 
-  const canAddInSection = ["routes", "sites", "providerKeys", "keys", "headers"].includes(section);
+  const canAddInSection = ["routes", "sites", "providerKeys", "temporaryAccounts", "keys", "headers"].includes(section);
 
   const setRouteSite = (siteId: string) => {
     const site = snapshot?.sites.find((item) => item.id === siteId);
@@ -911,9 +1278,31 @@ export default function App() {
   };
 
   const copyText = async (value: string) => {
-    await navigator.clipboard.writeText(value);
-    setToast("已复制");
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = value;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.left = "-9999px";
+        textarea.style.top = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        const copied = document.execCommand("copy");
+        document.body.removeChild(textarea);
+        if (!copied) throw new Error("copy failed");
+      }
+      setToast("已复制");
+    } catch {
+      setToast("复制失败，请手动选中密钥复制");
+    }
   };
+
+  if (authStatus !== "signed-in") {
+    return <AuthLanding status={authStatus} busy={authBusy} error={authError} onLogin={login} />;
+  }
 
   if (!snapshot) {
     return (
@@ -948,7 +1337,7 @@ export default function App() {
       <div className="app-shell mx-auto flex min-h-screen w-full max-w-[1500px] gap-4 p-4 md:p-6">
         <aside className="app-nav panel flex w-[84px] shrink-0 flex-col items-center gap-3 p-3 lg:w-64 lg:items-stretch">
           <div className="app-brand mb-2 flex h-12 items-center gap-3 lg:px-2">
-            <div className="grid h-10 w-10 place-items-center rounded-lg bg-ink text-citron">
+            <div className="app-brand-mark grid h-10 w-10 place-items-center rounded-lg">
               <ShieldCheck className="h-5 w-5" />
             </div>
             <div className="app-brand-copy hidden lg:block">
@@ -968,9 +1357,6 @@ export default function App() {
           </div>
           <div className="app-bottom-actions">
             <NavButton item={settingsNavItem} active={section === settingsNavItem.id} onClick={setSection} className="app-settings-nav" />
-            <button className="nav-button nav-refresh-button" type="button" onClick={load} disabled={busy} title="刷新数据" aria-label="刷新数据">
-              <RefreshCw className={`h-5 w-5 ${busy ? "animate-spin" : ""}`} />
-            </button>
           </div>
         </aside>
 
@@ -1056,6 +1442,25 @@ export default function App() {
                 onDelete={(id) => mutate(async () => api.deleteProviderKeyGroup(id), "API Key 分组已删除")}
               />
             )}
+            {section === "temporaryAccounts" && (
+              <TemporaryAccountsView
+                snapshot={snapshot}
+                draft={temporaryAccountDraft}
+                editorOpen={temporaryAccountEditorOpen}
+                busy={busy}
+                checking={temporaryAccountChecking}
+                onDraft={setTemporaryAccountDraft}
+                onSubmit={importTemporaryAccounts}
+                onClose={() => setTemporaryAccountEditorOpen(false)}
+                onCheck={checkTemporaryAccounts}
+                onUpdate={(id, patch) => mutate(async () => api.updateTemporaryAccountGroup(id, patch), "临时账号组已更新")}
+                loading={temporaryAccountsLoading || !temporaryAccountsLoaded}
+                error={temporaryAccountsError}
+                onRetry={loadTemporaryAccountGroups}
+                onStrategyChange={(strategy) => mutate(async () => api.updateSettings({ temporaryAccountStrategy: strategy }), "临时账号策略已更新")}
+                onDelete={(id) => mutate(async () => api.deleteTemporaryAccountGroup(id), "临时账号组已删除")}
+              />
+            )}
             {section === "keys" && (
               <KeysView
                 snapshot={snapshot}
@@ -1099,7 +1504,14 @@ export default function App() {
             {section === "settings" && (
               <SettingsView
                 snapshot={snapshot}
-                onSave={(maxRequestLogs) => mutate(async () => api.updateSettings({ maxRequestLogs }), "设置已保存")}
+                busy={busy}
+                onRefresh={load}
+                onSave={(settings) => mutate(async () => api.updateSettings(settings), "设置已保存")}
+                onPasswordChange={changeAdminPassword}
+                onThemeChange={(themeId) => {
+                  setSnapshot((current) => (current ? { ...current, settings: { ...current.settings, themeId } } : current));
+                  mutate(async () => api.updateSettings({ themeId }), "主题已切换");
+                }}
               />
             )}
             {section === "docs" && <DocsView snapshot={snapshot} onCopy={copyText} />}
@@ -1246,6 +1658,7 @@ function RoutesView(props: {
                 quick.siteId !== route.siteId ||
                 quick.model !== route.model ||
                 quick.endpoint !== route.endpoint ||
+                quick.headerTemplateId !== route.headerTemplateId ||
                 quick.enabled !== route.enabled;
               const toggleRoute = () => setExpanded((current) => ({ ...current, [route.id]: !isOpen }));
               return (
@@ -1334,6 +1747,20 @@ function RoutesView(props: {
                             {props.snapshot.endpoints.map((endpoint) => (
                               <option key={endpoint} value={endpoint}>
                                 {endpointLabels[endpoint]}
+                              </option>
+                            ))}
+                          </SelectInput>
+                        </label>
+                        <label className="route-quick-control">
+                          <span className="route-quick-label">Header 模版</span>
+                          <SelectInput
+                            value={quick.headerTemplateId || ""}
+                            onChange={(event) => updateRouteDraft(route, { headerTemplateId: event.target.value || undefined })}
+                          >
+                            <option value="">不使用</option>
+                            {props.snapshot.headerTemplates.map((template) => (
+                              <option key={template.id} value={template.id}>
+                                {template.name}
                               </option>
                             ))}
                           </SelectInput>
@@ -2081,6 +2508,225 @@ function ProviderKeyGroupRecord(props: {
   );
 }
 
+function TemporaryAccountsView(props: {
+  snapshot: AppSnapshot;
+  draft: TemporaryAccountImportDraft;
+  editorOpen: boolean;
+  busy: boolean;
+  loading: boolean;
+  error: string;
+  checking: string | null;
+  onDraft: (value: TemporaryAccountImportDraft) => void;
+  onSubmit: (event: FormEvent) => void;
+  onClose: () => void;
+  onCheck: (id?: string) => void;
+  onUpdate: (id: string, patch: Partial<TemporaryAccountGroup>) => void;
+  onRetry: () => void;
+  onStrategyChange: (strategy: GroupRouteStrategy) => void;
+  onDelete: (id: string) => void;
+}) {
+  const groups = props.snapshot.temporaryAccountGroups || [];
+  const openAiSite = props.snapshot.sites.find((site) => site.addresses.some((address) => address.baseUrl.includes("api.openai.com")));
+  const totalAccounts = groups.reduce((total, group) => total + group.accounts.length, 0);
+  const temporaryAccountStrategy = props.snapshot.settings.temporaryAccountStrategy || "sequential";
+  const hasImportContent = props.draft.content.trim() || props.draft.contents.some((content) => content.trim());
+  const readImportFiles = async (files?: FileList | null) => {
+    const selectedFiles = Array.from(files || []);
+    if (selectedFiles.length === 0) return;
+    const contents = await Promise.all(selectedFiles.map((file) => file.text()));
+    props.onDraft({
+      ...props.draft,
+      contents,
+      fileNames: selectedFiles.map((file) => file.name),
+      name: props.draft.name || selectedFiles[0]?.name.replace(/\.[^.]+$/, "") || ""
+    });
+  };
+  return (
+    <>
+      {props.loading ? (
+        <div className="center-empty">
+          <RefreshCw className="h-4 w-4 animate-spin" />
+          正在加载临时账号...
+        </div>
+      ) : props.error ? (
+        <div className="center-empty center-empty-stack" role="alert">
+          <div className="center-empty-title">临时账号加载失败</div>
+          <div className="center-empty-description">{props.error}</div>
+          <ActionButton type="button" tone="ghost" onClick={props.onRetry}>
+            <RefreshCw className="h-4 w-4" />
+            重试
+          </ActionButton>
+        </div>
+      ) : groups.length === 0 ? (
+        <div className="center-empty">暂无临时账号，导入 CPA 或 SubAPI 数据后可供 OpenAI 路由使用</div>
+      ) : (
+        <section className="panel p-4">
+          <div className="form-head">
+            <div>
+              <h2>临时账号池</h2>
+              <div className="mt-1 text-xs font-bold text-ink/55">
+                {groups.length} 个账号组 / {totalAccounts} 个账号 / {openAiSite?.name || "OpenAI"}
+              </div>
+            </div>
+            <div className="temp-account-toolbar">
+              <ActionButton type="button" tone="ghost" disabled={props.checking !== null || totalAccounts === 0} onClick={() => props.onCheck()}>
+                <RefreshCw className={`h-4 w-4 ${props.checking === "all" ? "animate-spin" : ""}`} />
+                检查账号
+              </ActionButton>
+              <label className="temp-account-strategy">
+                <span>全局复用策略</span>
+                <SelectInput value={temporaryAccountStrategy} onChange={(event) => props.onStrategyChange(event.target.value as GroupRouteStrategy)}>
+                  <option value="stable-first">{groupStrategyLabels["stable-first"]}</option>
+                  <option value="sequential">{groupStrategyLabels.sequential}</option>
+                  <option value="random">{groupStrategyLabels.random}</option>
+                </SelectInput>
+              </label>
+            </div>
+          </div>
+          <div className="site-list">
+            {groups.map((group) => {
+              const enabledAccounts = group.accounts.filter((account) => account.enabled);
+              const availabilityStats = temporaryAccountAvailabilityStats(group.accounts);
+              const models = Array.from(new Set(group.accounts.flatMap((account) => account.models))).sort();
+              return (
+                <article key={group.id} className="record">
+                  <div className="min-w-0">
+                    <div className="record-title">{group.name}</div>
+                    <div className="record-meta">
+                      {temporaryAccountSourceLabels[group.source]} / {enabledAccounts.length} 个启用账号 / {availabilityStats.available} 可用 / {availabilityStats.unavailable} 不可用 / {availabilityStats.unknown} 未检查
+                    </div>
+                    <div className="temp-account-list">
+                      {group.accounts.map((account) => {
+                        const availability = account.availability || "unknown";
+                        return (
+                          <div key={account.id} className={`temp-account-row temp-account-row-${availability}`}>
+                            <div className="temp-account-row-main">
+                              <div className="temp-account-row-title">
+                                <span className={`account-status account-status-${availability}`}>
+                                  {temporaryAccountAvailabilityLabels[availability]}
+                                </span>
+                                {!account.enabled ? <span className="account-status account-status-muted">停用</span> : null}
+                                <span className="temp-account-name">{account.label}</span>
+                              </div>
+                              <div className="temp-account-secret">
+                                {temporaryAccountTypeLabel(account)} / {account.prefix}...
+                                {account.email ? ` / ${account.email}` : ""}
+                                {account.accountId ? ` / ${account.accountId}` : ""}
+                                {account.lastCheckStatusCode ? ` / HTTP ${account.lastCheckStatusCode}` : ""}
+                              </div>
+                              {account.quotaStages.length > 0 ? (
+                                <div className="temp-account-quota-list">
+                                  {account.quotaStages.slice(0, 5).map((stage, index) => (
+                                    <span key={`${account.id}-${stage.label}-${index}`} className="temp-account-quota">
+                                      {temporaryAccountQuotaText(stage)}
+                                    </span>
+                                  ))}
+                                  {account.quotaStages.length > 5 ? <span className="temp-account-quota">+{account.quotaStages.length - 5} 项</span> : null}
+                                </div>
+                              ) : null}
+                              {account.lastCheckError ? <div className="temp-account-error">{account.lastCheckError}</div> : null}
+                            </div>
+                            <div className="temp-account-last-check">
+                              {account.lastQuotaCheckedAt ? formatTime(account.lastQuotaCheckedAt) : "未检查"}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {models.length > 0 ? (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {models.slice(0, 12).map((model) => (
+                          <span key={model} className="pill pill-muted">
+                            {model}
+                          </span>
+                        ))}
+                        {models.length > 12 ? <span className="pill pill-muted">+{models.length - 12}</span> : null}
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="record-actions">
+                    <ActionButton type="button" tone="ghost" disabled={props.checking !== null} onClick={() => props.onCheck(group.id)}>
+                      <RefreshCw className={`h-4 w-4 ${props.checking === group.id ? "animate-spin" : ""}`} />
+                      检查
+                    </ActionButton>
+                    <label className="toggle-row">
+                      <input type="checkbox" checked={group.enabled} onChange={(event) => props.onUpdate(group.id, { enabled: event.target.checked })} />
+                      启用
+                    </label>
+                    <ActionButton tone="danger" onClick={() => props.onDelete(group.id)} title="删除">
+                      <Trash2 className="h-4 w-4" />
+                    </ActionButton>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {props.editorOpen ? (
+        <div className="modal-backdrop" role="presentation">
+          <form onSubmit={props.onSubmit} className="modal-panel temp-account-modal" role="dialog" aria-modal="true" aria-label="临时账号导入">
+            <div className="form-head">
+              <div>
+                <h2>导入临时账号</h2>
+                <div className="mt-1 text-xs font-bold text-ink/55">导入后用于官方 OpenAI 切换型路由</div>
+              </div>
+              <ActionButton type="button" tone="ghost" onClick={props.onClose} title="关闭">
+                <X className="h-4 w-4" />
+              </ActionButton>
+            </div>
+            <div className="form-grid">
+              <label>
+                账号组名称
+                <TextInput value={props.draft.name} onChange={(event) => props.onDraft({ ...props.draft, name: event.target.value })} />
+              </label>
+              <label>
+                导入类型
+                <SelectInput value={props.draft.source} onChange={(event) => props.onDraft({ ...props.draft, source: event.target.value as TemporaryAccountImportSource })}>
+                  <option value="cpa">{temporaryAccountSourceLabels.cpa}</option>
+                  <option value="subapi">{temporaryAccountSourceLabels.subapi}</option>
+                </SelectInput>
+              </label>
+              <label>
+                模型范围
+                <TextInput
+                  value={props.draft.modelsText}
+                  placeholder="留空表示全部模型，例如 gpt-5.5"
+                  onChange={(event) => props.onDraft({ ...props.draft, modelsText: event.target.value })}
+                />
+              </label>
+              <label className="form-span-2">
+                导入文件
+                <input className="field" type="file" accept=".json,.jsonl,.txt,.csv" multiple onChange={(event) => readImportFiles(event.target.files)} />
+                {props.draft.fileNames.length > 0 ? <span className="field-hint">已选择 {props.draft.fileNames.length} 个文件：{props.draft.fileNames.join("，")}</span> : null}
+              </label>
+              <label className="form-span-2">
+                账号数据
+                <textarea
+                  className="field temp-account-textarea"
+                  value={props.draft.content}
+                  placeholder="支持 CPA/SubAPI JSON、JSONL、CSV 或每行一个 sk-/token"
+                  onChange={(event) => props.onDraft({ ...props.draft, content: event.target.value })}
+                />
+              </label>
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <ActionButton type="button" tone="ghost" onClick={props.onClose}>
+                取消
+              </ActionButton>
+              <ActionButton type="submit" disabled={props.busy || !hasImportContent}>
+                <Upload className="h-4 w-4" />
+                导入账号
+              </ActionButton>
+            </div>
+          </form>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 function KeysView(props: {
   snapshot: AppSnapshot;
   keyName: string;
@@ -2119,12 +2765,7 @@ function KeysView(props: {
                       <input type="checkbox" checked={key.enabled} onChange={(event) => props.onToggle(key.id, event.target.checked)} />
                       启用
                     </label>
-                    <ActionButton
-                      tone="ghost"
-                      disabled={!fullKey}
-                      onClick={() => props.onCopy(fullKey)}
-                      title={fullKey ? "复制完整密钥" : "历史密钥未保存完整值"}
-                    >
+                    <ActionButton tone="ghost" onClick={() => props.onCopy(fullKey || key.prefix)} title="复制密钥">
                       <Copy className="h-4 w-4" />
                     </ActionButton>
                     <ActionButton tone="danger" onClick={() => props.onDelete(key.id)} title="删除">
@@ -2452,27 +3093,164 @@ function LogsView(props: {
   );
 }
 
-function SettingsView(props: { snapshot: AppSnapshot; onSave: (maxRequestLogs: number) => void }) {
+function SettingsView(props: {
+  snapshot: AppSnapshot;
+  busy: boolean;
+  onRefresh: () => void;
+  onSave: (settings: Partial<AppSettings>) => void;
+  onPasswordChange: (currentPassword: string, nextPassword: string) => Promise<void>;
+  onThemeChange: (themeId: AppThemeId) => void;
+}) {
   const [maxRequestLogs, setMaxRequestLogs] = useState(String(props.snapshot.settings.maxRequestLogs));
+  const [adminSessionTtlMinutes, setAdminSessionTtlMinutes] = useState(String(props.snapshot.settings.adminSessionTtlMinutes || 30));
+  const [themeId, setThemeId] = useState<AppThemeId>(props.snapshot.settings.themeId || "fresh");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [nextPassword, setNextPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordError, setPasswordError] = useState("");
 
   useEffect(() => {
     setMaxRequestLogs(String(props.snapshot.settings.maxRequestLogs));
-  }, [props.snapshot.settings.maxRequestLogs]);
+    setAdminSessionTtlMinutes(String(props.snapshot.settings.adminSessionTtlMinutes || 30));
+    setThemeId(props.snapshot.settings.themeId || "fresh");
+  }, [props.snapshot.settings.adminSessionTtlMinutes, props.snapshot.settings.maxRequestLogs, props.snapshot.settings.themeId]);
+
+  const chooseTheme = (nextThemeId: AppThemeId) => {
+    setThemeId(nextThemeId);
+    props.onThemeChange(nextThemeId);
+  };
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    props.onSave(Number(maxRequestLogs));
+    props.onSave({ maxRequestLogs: Number(maxRequestLogs), adminSessionTtlMinutes: Number(adminSessionTtlMinutes), themeId });
+  };
+
+  const changePassword = async () => {
+    setPasswordError("");
+    if (!currentPassword.trim()) {
+      setPasswordError("请输入当前管理密码");
+      return;
+    }
+    if (nextPassword.trim().length < 8) {
+      setPasswordError("新管理密码至少需要 8 个字符");
+      return;
+    }
+    if (nextPassword !== confirmPassword) {
+      setPasswordError("两次输入的新密码不一致");
+      return;
+    }
+    try {
+      await props.onPasswordChange(currentPassword, nextPassword);
+      setCurrentPassword("");
+      setNextPassword("");
+      setConfirmPassword("");
+    } catch (error) {
+      setPasswordError(error instanceof Error ? error.message : "管理密码修改失败");
+    }
   };
 
   return (
-    <section className="panel p-4">
+    <section className="panel settings-panel p-4">
       <div className="form-head">
         <div>
           <h2>系统设置</h2>
           <div className="mt-1 text-xs font-bold text-ink/55">当前日志 {props.snapshot.requestLogs.length} 条</div>
         </div>
+        <ActionButton type="button" tone="ghost" onClick={props.onRefresh} disabled={props.busy} title="刷新数据" aria-label="刷新数据">
+          <RefreshCw className={`h-4 w-4 ${props.busy ? "animate-spin" : ""}`} />
+          刷新数据
+        </ActionButton>
       </div>
       <form onSubmit={submit} className="form-grid">
+        <div className="settings-section form-span-2">
+          <div className="settings-section-head">
+            <div>
+              <h3>界面主题</h3>
+              <p>选择后立即生效，并保存到当前项目数据库。</p>
+            </div>
+          </div>
+          <div className="theme-grid">
+            {themeOptions.map((theme) => {
+              const selected = theme.id === themeId;
+              return (
+                <button
+                  key={theme.id}
+                  type="button"
+                  className={`theme-card ${selected ? "theme-card-active" : ""}`}
+                  aria-pressed={selected}
+                  disabled={props.busy && !selected}
+                  onClick={() => chooseTheme(theme.id)}
+                >
+                  <span className="theme-card-top">
+                    <span>
+                      <span className="theme-card-name">{theme.name}</span>
+                      <span className="theme-card-desc">{theme.description}</span>
+                    </span>
+                    <span className="theme-check">{selected ? <Check className="h-4 w-4" /> : null}</span>
+                  </span>
+                  <span className="theme-swatches" aria-hidden="true">
+                    {theme.swatches.map((color) => (
+                      <span key={color} className="theme-swatch" style={{ background: color }} />
+                    ))}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="settings-section form-span-2">
+          <div className="settings-section-head">
+            <div>
+              <h3>管理员密码</h3>
+              <p>{props.snapshot.security.adminPasswordCustomized ? "当前使用本地数据库中的自定义密码。" : "当前使用启动环境变量或本地默认密码。"}</p>
+            </div>
+          </div>
+          <div className="settings-password-grid">
+            <label>
+              当前密码
+              <TextInput
+                type="password"
+                value={currentPassword}
+                autoComplete="current-password"
+                onChange={(event) => setCurrentPassword(event.target.value)}
+              />
+            </label>
+            <label>
+              新密码
+              <TextInput
+                type="password"
+                value={nextPassword}
+                autoComplete="new-password"
+                onChange={(event) => setNextPassword(event.target.value)}
+              />
+            </label>
+            <label>
+              确认新密码
+              <TextInput
+                type="password"
+                value={confirmPassword}
+                autoComplete="new-password"
+                onChange={(event) => setConfirmPassword(event.target.value)}
+              />
+            </label>
+          </div>
+          {passwordError ? <div className="auth-error mt-3" role="alert">{passwordError}</div> : null}
+          <div className="mt-3 flex justify-end">
+            <ActionButton type="button" tone="ghost" disabled={props.busy} onClick={changePassword}>
+              <LockKeyhole className="h-4 w-4" />
+              修改密码
+            </ActionButton>
+          </div>
+        </div>
+
+        <div className="settings-section form-span-2">
+          <div className="settings-section-head">
+            <div>
+              <h3>日志保留</h3>
+              <p>控制日志页面最多展示和保留的请求记录数量。</p>
+            </div>
+          </div>
         <label>
           日志最多保留条数
           <TextInput
@@ -2484,6 +3262,27 @@ function SettingsView(props: { snapshot: AppSnapshot; onSave: (maxRequestLogs: n
             onChange={(event) => setMaxRequestLogs(event.target.value)}
           />
         </label>
+        </div>
+
+        <div className="settings-section form-span-2">
+          <div className="settings-section-head">
+            <div>
+              <h3>会话有效期</h3>
+              <p>超过这个时间未重新登录时，需要再次输入管理员密码。</p>
+            </div>
+          </div>
+          <label>
+            管理会话有效分钟数
+            <TextInput
+              type="number"
+              min={1}
+              max={43200}
+              step={1}
+              value={adminSessionTtlMinutes}
+              onChange={(event) => setAdminSessionTtlMinutes(event.target.value)}
+            />
+          </label>
+        </div>
         <div className="flex justify-end">
           <ActionButton type="submit">
             <Save className="h-4 w-4" />

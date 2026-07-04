@@ -3,6 +3,7 @@ import type {
   ApiKeyRecord,
   AppSettings,
   AppSnapshot,
+  AuthSession,
   HeaderTemplate,
   ProviderApiKeyGroupInput,
   ProviderApiKeyGroupView,
@@ -10,16 +11,41 @@ import type {
   RequestLog,
   RouteRecord,
   Site,
+  TemporaryAccountGroup,
+  TemporaryAccountCheckResult,
+  TemporaryAccountImportInput,
+  TemporaryAccountImportResult,
 } from "../shared/types";
 
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+export function isUnauthorizedError(error: unknown) {
+  return error instanceof ApiError && error.status === 401;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers || {})
-    }
-  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...init,
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        ...(init?.headers || {})
+      }
+    });
+  } catch (error) {
+    const message = error instanceof Error && error.message.trim() ? error.message.trim() : "fetch failed";
+    throw new Error(`API 请求失败：${message}。请确认 dev:api 正在运行且 Vite 代理可访问后端服务`);
+  }
   const contentType = response.headers.get("content-type") || "";
   const isJson = contentType.includes("application/json");
   const text = await response.text();
@@ -32,7 +58,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       ? "API 服务不可用或未启动，请确认 dev:api 正在运行"
       : `Request failed: ${response.status}`;
   if (!response.ok) {
-    throw new Error(payload.error || fallbackMessage);
+    throw new ApiError(payload.error || fallbackMessage, response.status);
   }
   if (text && !isJson && path.startsWith("/api/")) {
     throw new Error("API 返回了非 JSON 内容，请确认后端服务已启动且 Vite 代理生效");
@@ -41,7 +67,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  authSession: () => request<AuthSession>("/api/auth/session"),
+  login: (password: string) =>
+    request<AuthSession>("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ password })
+    }),
+  logout: () =>
+    request<AuthSession>("/api/auth/logout", {
+      method: "POST"
+    }),
+  updateAdminPassword: (currentPassword: string, nextPassword: string) =>
+    request<AuthSession>("/api/auth/password", {
+      method: "POST",
+      body: JSON.stringify({ currentPassword, nextPassword })
+    }),
   snapshot: () => request<AppSnapshot>("/api/snapshot"),
+  initialSnapshot: () => request<AppSnapshot>("/api/snapshot/initial"),
   saveSite: (site: Partial<Site>) =>
     request<Site>(site.id ? `/api/sites/${site.id}` : "/api/sites", {
       method: site.id ? "PATCH" : "POST",
@@ -71,6 +113,20 @@ export const api = {
       body: JSON.stringify({ siteId, apiKey, apiKeyName })
     }),
   syncProviderModels: () => request<ProviderModelSyncResult>("/api/provider-key-groups/sync-models", { method: "POST" }),
+  listTemporaryAccountGroups: () => request<TemporaryAccountGroup[]>("/api/temporary-accounts"),
+  importTemporaryAccounts: (input: TemporaryAccountImportInput) =>
+    request<TemporaryAccountImportResult>("/api/temporary-accounts/import", {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
+  checkTemporaryAccounts: () => request<TemporaryAccountCheckResult>("/api/temporary-accounts/check", { method: "POST" }),
+  checkTemporaryAccountGroup: (id: string) => request<TemporaryAccountCheckResult>(`/api/temporary-accounts/${id}/check`, { method: "POST" }),
+  updateTemporaryAccountGroup: (id: string, input: Partial<TemporaryAccountGroup>) =>
+    request<TemporaryAccountGroup>(`/api/temporary-accounts/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(input)
+    }),
+  deleteTemporaryAccountGroup: (id: string) => request<{ ok: true }>(`/api/temporary-accounts/${id}`, { method: "DELETE" }),
   saveHeader: (template: Partial<HeaderTemplate>) =>
     request<HeaderTemplate>(template.id ? `/api/headers/${template.id}` : "/api/headers", {
       method: template.id ? "PATCH" : "POST",

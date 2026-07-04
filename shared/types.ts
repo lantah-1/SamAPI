@@ -6,6 +6,12 @@ export type SiteType = "newapi" | "unknown";
 
 export type GroupRouteStrategy = "stable-first" | "sequential" | "random";
 
+export type AppThemeId = "fresh" | "salt" | "citrus" | "rose" | "midnight";
+
+export type TemporaryAccountImportSource = "cpa" | "subapi";
+
+export type TemporaryAccountAvailability = "unknown" | "available" | "unavailable";
+
 export interface SiteAddress {
   id: string;
   label: string;
@@ -97,6 +103,84 @@ export interface ProviderModelSyncResult {
   success: number;
   failed: number;
   results: ProviderModelSyncItemResult[];
+}
+
+export interface TemporaryAccount {
+  id: string;
+  label: string;
+  prefix: string;
+  secret: string;
+  accountType?: "codex" | "openai-api-key";
+  accountId?: string;
+  email?: string;
+  refreshToken?: string;
+  idToken?: string;
+  sessionToken?: string;
+  enabled: boolean;
+  models: string[];
+  availability?: TemporaryAccountAvailability;
+  quotaStages: TemporaryAccountQuotaStage[];
+  importedAt: string;
+  lastQuotaCheckedAt?: string;
+  lastCheckStatusCode?: number;
+  lastCheckError?: string;
+}
+
+export interface TemporaryAccountQuotaStage {
+  label: string;
+  remaining?: number | string;
+  total?: number | string;
+  used?: number | string;
+  unit?: string;
+  resetAt?: string;
+}
+
+export interface TemporaryAccountGroup {
+  id: string;
+  name: string;
+  source: TemporaryAccountImportSource;
+  siteId: string;
+  strategy?: GroupRouteStrategy;
+  enabled: boolean;
+  accounts: TemporaryAccount[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TemporaryAccountImportInput {
+  name?: string;
+  source: TemporaryAccountImportSource;
+  content: string;
+  contents?: string[];
+  models?: string[];
+}
+
+export interface TemporaryAccountImportResult {
+  site: Site;
+  group: TemporaryAccountGroup;
+  imported: number;
+  skipped: number;
+  checkResult?: TemporaryAccountCheckResult;
+}
+
+export interface TemporaryAccountCheckItemResult {
+  groupId: string;
+  accountId: string;
+  label: string;
+  availability: TemporaryAccountAvailability;
+  status: RequestLogStatus;
+  statusCode?: number;
+  quotaStages: TemporaryAccountQuotaStage[];
+  errorMessage?: string;
+  checkedAt: string;
+}
+
+export interface TemporaryAccountCheckResult {
+  total: number;
+  available: number;
+  unavailable: number;
+  unknown: number;
+  results: TemporaryAccountCheckItemResult[];
 }
 
 export interface HeaderTemplate {
@@ -210,21 +294,34 @@ export interface RequestLog {
 
 export interface AppSettings {
   maxRequestLogs: number;
+  themeId: AppThemeId;
+  adminSessionTtlMinutes: number;
+  temporaryAccountStrategy: GroupRouteStrategy;
+}
+
+export interface AuthSession {
+  authenticated: boolean;
+  expiresAt?: string;
 }
 
 export interface AppDatabase {
   sites: Site[];
   apiKeys: ApiKeyRecord[];
   providerApiKeyGroups: ProviderApiKeyGroup[];
+  temporaryAccountGroups: TemporaryAccountGroup[];
   headerTemplates: HeaderTemplate[];
   routes: RouteRecord[];
   settings: AppSettings;
+  adminPasswordHash?: string;
 }
 
-export interface AppSnapshot extends Omit<AppDatabase, "providerApiKeyGroups"> {
+export interface AppSnapshot extends Omit<AppDatabase, "providerApiKeyGroups" | "adminPasswordHash"> {
   providerApiKeyGroups: ProviderApiKeyGroupView[];
   requestLogs: RequestLog[];
   dbPath: string;
   dataDir: string;
   endpoints: EndpointKind[];
+  security: {
+    adminPasswordCustomized: boolean;
+  };
 }

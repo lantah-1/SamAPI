@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently \"pnpm dev:api\" \"pnpm dev:web\"",
-    "dev:api": "tsx watch server/index.ts",
+    "dev:api": "SAMAPI_PORT=${SAMAPI_PORT:-8788} tsx watch server/index.ts",
     "dev:web": "vite --host 0.0.0.0",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && pnpm build:server",
+    "build:server": "tsc -p tsconfig.server.build.json",
+    "start": "node build/server/index.js",
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc -b --pretty false"
   },
@@ -17,7 +19,8 @@
     "concurrently": "^9.2.0",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "undici": "^8.6.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
