@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import DatabaseConstructor, { type Database as SqliteDatabase } from "better-sqlite3";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type {
   ApiKeyCreated,
@@ -23,6 +24,8 @@ import type {
   TemporaryAccountAvailability,
   TemporaryAccountGroup,
   TemporaryAccountImportInput,
+  TemporaryAccountImportSource,
+  TemporaryAccountProviderType,
   TemporaryAccountQuotaStage
 } from "../shared/types.js";
 
@@ -30,6 +33,12 @@ const ENDPOINTS = ["messages", "chat/completions", "responses"] as const;
 const THEME_IDS: AppThemeId[] = ["fresh", "salt", "citrus", "rose", "midnight"];
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
 const OPENAI_DEFAULT_MODELS = ["gpt-5.5"];
+const TEMPORARY_ACCOUNT_PROVIDER_LABELS: Record<TemporaryAccountProviderType, string> = {
+  gpt: "GPT",
+  grok: "Grok",
+  claude: "Claude",
+  gemini: "Gemini"
+};
 const DEFAULT_SETTINGS: AppSettings = {
   maxRequestLogs: 100,
   themeId: "fresh",
@@ -240,6 +249,13 @@ function normalizeTemporaryAccountAvailability(value: unknown): TemporaryAccount
   return "unknown";
 }
 
+function normalizeTemporaryAccountProviderType(value: unknown): TemporaryAccountProviderType {
+  if (value === "grok") return "grok";
+  if (value === "claude") return "claude";
+  if (value === "gemini") return "gemini";
+  return "gpt";
+}
+
 function numericQuotaValue(value: unknown) {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value !== "string") return undefined;
@@ -256,7 +272,6 @@ function accountHasUsableQuota(account: TemporaryAccount) {
 }
 
 function temporaryAccountCanBeUsed(account: TemporaryAccount) {
-  if (!account.enabled) return false;
   if (account.availability === "unavailable") return false;
   return accountHasUsableQuota(account);
 }
@@ -448,6 +463,8 @@ export class JsonStore {
   readonly dbPath: string;
   readonly logsPath: string;
   readonly temporaryAccountsPath: string;
+  readonly sqlitePath: string;
+  private readonly sqlite: SqliteDatabase;
   private db: AppDatabase;
   private requestLogs: RequestLog[] = [];
   private temporaryAccountIndex = 0;
@@ -457,35 +474,64 @@ export class JsonStore {
     this.dbPath = path.join(this.dataDir, "samapi.json");
     this.logsPath = path.join(this.dataDir, "request-logs.jsonl");
     this.temporaryAccountsPath = path.join(this.dataDir, "temporary-accounts.json");
+    this.sqlitePath = path.join(this.dataDir, "samapi.sqlite");
     mkdirSync(this.dataDir, { recursive: true });
+    this.sqlite = new DatabaseConstructor(this.sqlitePath);
+    this.initializeSqlite();
     this.db = this.load();
     this.ensureOfficialOpenAiSite();
-    if (this.syncOpenAiModelsFromTemporaryAccounts()) this.persist();
+    const mergedTemporaryAccounts = this.mergeTemporaryAccountTypeGroups();
+    if (this.syncOpenAiModelsFromTemporaryAccounts() || mergedTemporaryAccounts) this.persist();
     this.refreshGroupRouteMembers();
-  }
-
-  snapshot(options: { includeRequestLogs?: boolean; includeTemporaryAccounts?: boolean } = {}) {
-    const { adminPasswordHash, ...database } = this.db;
-    return {
-      ...database,
-      temporaryAccountGroups: options.includeTemporaryAccounts === false ? [] : database.temporaryAccountGroups,
-      providerApiKeyGroups: this.db.providerApiKeyGroups.map((group) => this.toProviderApiKeyGroupView(group)),
-      requestLogs: options.includeRequestLogs === false ? [] : this.listRequestLogs(),
-      dbPath: this.dbPath,
-      dataDir: this.dataDir,
-      endpoints: [...ENDPOINTS],
-      security: {
-        adminPasswordCustomized: Boolean(adminPasswordHash)
-      }
-    };
   }
 
   getDb() {
     return this.db;
   }
 
-  listRequestLogs(limit = this.db.settings.maxRequestLogs) {
-    return this.requestLogs.slice(0, limit);
+  listProviderApiKeyGroups() {
+    return this.db.providerApiKeyGroups.map((group) => this.toProviderApiKeyGroupView(group));
+  }
+
+  private mergeTemporaryAccountTypeGroups() {
+    const merged = new Map<TemporaryAccountProviderType, TemporaryAccountGroup>();
+    let changed = false;
+    for (const group of this.db.temporaryAccountGroups) {
+      const providerType = normalizeTemporaryAccountProviderType(group.providerType || group.name.toLowerCase());
+      const existing = merged.get(providerType);
+      if (!existing) {
+        group.providerType = providerType;
+        group.name = TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType];
+        group.enabled = true;
+        group.accounts = group.accounts.map((account) => ({ ...account, providerType, enabled: true }));
+        merged.set(providerType, group);
+        continue;
+      }
+      const existingIds = new Set(existing.accounts.map((account) => account.id));
+      const existingSecrets = new Set(existing.accounts.map((account) => hashSecret(account.secret)));
+      const incoming = group.accounts
+        .filter((account) => !existingIds.has(account.id) && !existingSecrets.has(hashSecret(account.secret)))
+        .map((account) => ({ ...account, providerType, enabled: true }));
+      existing.accounts.push(...incoming);
+      existing.updatedAt = now();
+      changed = true;
+    }
+    const nextGroups = Array.from(merged.values());
+    if (nextGroups.length !== this.db.temporaryAccountGroups.length) changed = true;
+    this.db.temporaryAccountGroups = nextGroups;
+    return changed;
+  }
+
+  listRequestLogs(limit = this.db.settings.maxRequestLogs, offset = 0) {
+    return this.requestLogs.slice(offset, offset + limit);
+  }
+
+  listNewRequestLogs(since: string, limit = this.db.settings.maxRequestLogs) {
+    return this.requestLogs.filter((log) => log.createdAt > since).slice(0, limit);
+  }
+
+  requestLogCount() {
+    return this.requestLogs.length;
   }
 
   recordRequestLog(input: Omit<RequestLog, "id" | "createdAt">) {
@@ -495,7 +541,7 @@ export class JsonStore {
       ...input
     };
     this.requestLogs.unshift(created);
-    appendFileSync(this.logsPath, `${JSON.stringify(created)}\n`);
+    this.insertRequestLogRow(created);
     if (this.requestLogs.length > this.db.settings.maxRequestLogs) {
       this.requestLogs = this.requestLogs.slice(0, this.db.settings.maxRequestLogs);
       this.rewriteRequestLogFile();
@@ -567,7 +613,8 @@ export class JsonStore {
   importTemporaryAccounts(input: TemporaryAccountImportInput) {
     const site = this.ensureOfficialOpenAiSite();
     const timestamp = now();
-    const source = input.source === "subapi" ? "subapi" : "cpa";
+    const source = input.source === "cpa" ? "cpa" : "subapi";
+    const providerType = normalizeTemporaryAccountProviderType(input.providerType);
     const models = normalizeModelList(input.models);
     const importContents = [input.content, ...(Array.isArray(input.contents) ? input.contents : [])].filter((content) => typeof content === "string" && content.trim());
     const parsedAccounts = importContents.flatMap((content) => parseTemporaryAccountImport(content, models));
@@ -575,6 +622,7 @@ export class JsonStore {
     const seen = new Set<string>(
       this.db.temporaryAccountGroups.flatMap((group) => group.accounts.map((account) => hashSecret(account.secret)))
     );
+    const group = this.ensureTemporaryAccountTypeGroup(providerType, site.id, source, timestamp);
     const accounts: TemporaryAccount[] = [];
     let skipped = 0;
     for (const account of parsedAccounts) {
@@ -587,10 +635,11 @@ export class JsonStore {
       seen.add(hash);
       accounts.push({
         id: `temp-account-${randomUUID()}`,
-        label: account.label || `账号 ${accounts.length + 1}`,
+        label: account.label || `账号 ${group.accounts.length + accounts.length + 1}`,
         prefix: secret.slice(0, 12),
         secret,
-        accountType: account.accountType,
+        accountType: providerType === "gpt" ? account.accountType : undefined,
+        providerType,
         accountId: account.accountId,
         email: account.email,
         refreshToken: account.refreshToken,
@@ -598,33 +647,45 @@ export class JsonStore {
         sessionToken: account.sessionToken,
         enabled: true,
         models: account.models.length > 0 ? account.models : models,
-        availability: "unknown",
+        availability: providerType === "gpt" ? "unknown" : account.quotaStages?.length ? "available" : "unknown",
         quotaStages: account.quotaStages || [],
         importedAt: timestamp
       });
     }
     if (accounts.length === 0) throw new Error("导入内容里没有新的可用账号");
+    group.accounts.unshift(...accounts);
+    group.source = source;
+    group.enabled = true;
+    group.providerType = providerType;
+    group.updatedAt = timestamp;
+    this.syncOpenAiModelsFromTemporaryAccounts();
+    this.persist();
+    return { site, group, imported: accounts.length, skipped };
+  }
+
+  private ensureTemporaryAccountTypeGroup(providerType: TemporaryAccountProviderType, siteId: string, source: TemporaryAccountImportSource, timestamp = now()) {
+    const existing = this.db.temporaryAccountGroups.find((group) => normalizeTemporaryAccountProviderType(group.providerType || group.name.toLowerCase()) === providerType);
+    if (existing) return existing;
     const group: TemporaryAccountGroup = {
-      id: `temp-account-group-${randomUUID()}`,
-      name: input.name?.trim() || `${source.toUpperCase()} 临时账号`,
+      id: `temp-account-group-${providerType}`,
+      name: TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType],
       source,
-      siteId: site.id,
+      providerType,
+      siteId,
       enabled: true,
-      accounts,
+      accounts: [],
       createdAt: timestamp,
       updatedAt: timestamp
     };
     this.db.temporaryAccountGroups.unshift(group);
-    this.syncOpenAiModelsFromTemporaryAccounts();
-    this.persist();
-    return { site, group, imported: accounts.length, skipped };
+    return group;
   }
 
   updateTemporaryAccountGroup(id: string, input: Partial<TemporaryAccountGroup>) {
     const group = this.db.temporaryAccountGroups.find((item) => item.id === id);
     if (!group) throw new Error("临时账号组不存在");
     if (typeof input.name === "string" && input.name.trim()) group.name = input.name.trim();
-    if (typeof input.enabled === "boolean") group.enabled = input.enabled;
+    group.enabled = true;
     group.updatedAt = now();
     this.persist();
     return group;
@@ -657,8 +718,8 @@ export class JsonStore {
 
   resolveTemporaryOpenAiAccounts(model: string) {
     const allEnabledAccounts = this.db.temporaryAccountGroups
-      .filter((group) => group.enabled)
-      .flatMap((group) => group.accounts.filter((account) => account.enabled));
+      .filter((group) => normalizeTemporaryAccountProviderType(group.providerType) === "gpt")
+      .flatMap((group) => group.accounts);
     const candidates = allEnabledAccounts.filter((account) => account.models.length === 0 || account.models.includes(model));
     const pool = candidates.length > 0 ? candidates : allEnabledAccounts;
     const usable = pool.filter(temporaryAccountCanBeUsed);
@@ -674,8 +735,39 @@ export class JsonStore {
 
   temporaryAccountCheckTargets(groupId?: string) {
     return this.db.temporaryAccountGroups
+      .filter((group) => normalizeTemporaryAccountProviderType(group.providerType) === "gpt")
       .filter((group) => !groupId || group.id === groupId)
       .flatMap((group) => group.accounts.map((account) => ({ group, account })));
+  }
+
+  deleteTemporaryAccount(id: string) {
+    for (const group of this.db.temporaryAccountGroups) {
+      const nextAccounts = group.accounts.filter((account) => account.id !== id);
+      if (nextAccounts.length === group.accounts.length) continue;
+      group.accounts = nextAccounts;
+      group.updatedAt = now();
+      this.db.temporaryAccountGroups = this.db.temporaryAccountGroups.filter((item) => item.accounts.length > 0);
+      this.syncOpenAiModelsFromTemporaryAccounts();
+      this.persist();
+      return;
+    }
+  }
+
+  deleteTemporaryAccounts(ids: string[]) {
+    const idSet = new Set(ids);
+    if (idSet.size === 0) return;
+    let changed = false;
+    for (const group of this.db.temporaryAccountGroups) {
+      const nextAccounts = group.accounts.filter((account) => !idSet.has(account.id));
+      if (nextAccounts.length === group.accounts.length) continue;
+      group.accounts = nextAccounts;
+      group.updatedAt = now();
+      changed = true;
+    }
+    if (!changed) return;
+    this.db.temporaryAccountGroups = this.db.temporaryAccountGroups.filter((item) => item.accounts.length > 0);
+    this.syncOpenAiModelsFromTemporaryAccounts();
+    this.persist();
   }
 
   updateTemporaryAccountCheckResult(
@@ -710,7 +802,7 @@ export class JsonStore {
       if (typeof input.accountId === "string" && input.accountId.trim()) account.accountId = input.accountId.trim();
       if (typeof input.email === "string" && input.email.trim()) account.email = input.email.trim();
       group.updatedAt = now();
-      this.persist();
+      this.persistTemporaryAccountCheckResult(group.id, account);
       return account;
     }
     return undefined;
@@ -766,7 +858,15 @@ export class JsonStore {
     this.db.sites = this.db.sites.filter((site) => site.id !== id);
     this.db.providerApiKeyGroups = this.db.providerApiKeyGroups.filter((group) => group.siteId !== id);
     this.db.temporaryAccountGroups = this.db.temporaryAccountGroups.filter((group) => group.siteId !== id);
-    this.db.routes = this.db.routes.filter((route) => route.type !== "switch" || route.siteId !== id);
+    this.db.routes = this.db.routes.map((route) => {
+      if (route.type !== "switch" || route.siteId !== id) return route;
+      return {
+        ...route,
+        siteId: "",
+        addressId: undefined,
+        updatedAt: now()
+      };
+    });
     this.refreshGroupRouteMembers();
     this.persist();
   }
@@ -890,7 +990,7 @@ export class JsonStore {
     const found = this.db.apiKeys.find((key) => key.enabled && key.keyHash === keyHash);
     if (!found) return false;
     found.lastUsedAt = now();
-    this.persist();
+    this.persistApiKeyLastUsedAt(found);
     return true;
   }
 
@@ -1126,22 +1226,62 @@ export class JsonStore {
     };
   }
 
+  private initializeSqlite() {
+    this.sqlite.pragma("journal_mode = WAL");
+    this.sqlite.pragma("foreign_keys = ON");
+    this.sqlite.pragma("busy_timeout = 5000");
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS auth (id INTEGER PRIMARY KEY CHECK (id = 1), admin_password_hash TEXT);
+      CREATE TABLE IF NOT EXISTS sites (id TEXT PRIMARY KEY, name TEXT NOT NULL, site_type TEXT NOT NULL, addresses_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, prefix TEXT NOT NULL, key_hash TEXT NOT NULL, plain_text_key TEXT, enabled INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_used_at TEXT);
+      CREATE TABLE IF NOT EXISTS provider_api_key_groups (id TEXT PRIMARY KEY, site_id TEXT NOT NULL, group_name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS provider_api_keys (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, enabled INTEGER NOT NULL, models_json TEXT NOT NULL, last_checked_at TEXT, FOREIGN KEY (group_id) REFERENCES provider_api_key_groups(id) ON DELETE CASCADE);
+      CREATE INDEX IF NOT EXISTS idx_provider_api_keys_group_id ON provider_api_keys(group_id);
+      CREATE TABLE IF NOT EXISTS temporary_account_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, source TEXT NOT NULL, provider_type TEXT, site_id TEXT NOT NULL, strategy TEXT, enabled INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS temporary_accounts (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, account_type TEXT, provider_type TEXT, account_id TEXT, email TEXT, refresh_token TEXT, id_token TEXT, session_token TEXT, enabled INTEGER NOT NULL, models_json TEXT NOT NULL, availability TEXT, quota_stages_json TEXT NOT NULL, imported_at TEXT NOT NULL, last_quota_checked_at TEXT, last_check_status_code INTEGER, last_check_error TEXT, FOREIGN KEY (group_id) REFERENCES temporary_account_groups(id) ON DELETE CASCADE);
+      CREATE INDEX IF NOT EXISTS idx_temporary_accounts_group_id ON temporary_accounts(group_id);
+      CREATE INDEX IF NOT EXISTS idx_temporary_accounts_enabled ON temporary_accounts(enabled);
+      CREATE INDEX IF NOT EXISTS idx_temporary_accounts_availability ON temporary_accounts(availability);
+      CREATE TABLE IF NOT EXISTS header_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, headers_text TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS routes (id TEXT PRIMARY KEY, type TEXT NOT NULL, data_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS request_logs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, data_json TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at);
+    `);
+    this.ensureSqliteColumn("temporary_account_groups", "provider_type", "TEXT");
+    this.ensureSqliteColumn("temporary_accounts", "provider_type", "TEXT");
+  }
+
+  private ensureSqliteColumn(table: string, column: string, definition: string) {
+    const rows = this.sqlite.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!rows.some((row) => row.name === column)) this.sqlite.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+  }
+
   private load(): AppDatabase {
+    const initialized = this.sqlite.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string } | undefined;
+    if (!initialized) {
+      const legacy = this.loadLegacyDatabase();
+      this.replaceSqliteDatabase(legacy, this.requestLogs);
+      return legacy;
+    }
+    const db = this.loadDatabaseFromSqlite();
+    this.requestLogs = this.loadRequestLogsFromSqlite(db.settings.maxRequestLogs);
+    return db;
+  }
+
+  private loadLegacyDatabase(): AppDatabase {
     if (!existsSync(this.dbPath)) {
       const empty = createEmptyDatabase();
-      this.persistDatabase(empty);
-      this.persistTemporaryAccounts(empty.temporaryAccountGroups);
+      this.requestLogs = this.loadRequestLogs(empty.settings.maxRequestLogs);
       return empty;
     }
     const parsed = JSON.parse(readFileSync(this.dbPath, "utf8")) as Partial<AppDatabase>;
     const settings = normalizeSettings(parsed.settings);
     const legacyRequestLogs = (parsed as Partial<AppDatabase> & { requestLogs?: RequestLog[] }).requestLogs || [];
     this.requestLogs = this.loadRequestLogs(settings.maxRequestLogs, legacyRequestLogs);
-    if (!existsSync(this.logsPath) && legacyRequestLogs.length > 0) {
-      this.rewriteRequestLogFile();
-    }
     const legacyTemporaryAccountGroups = parsed.temporaryAccountGroups || [];
-    const db: AppDatabase = {
+    return {
       sites: (parsed.sites || []).map((site) => ({ ...site, siteType: normalizeSiteType(site.siteType) })),
       apiKeys: parsed.apiKeys || [],
       providerApiKeyGroups: parsed.providerApiKeyGroups || [],
@@ -1151,11 +1291,77 @@ export class JsonStore {
       settings,
       adminPasswordHash: normalizePasswordHash(parsed.adminPasswordHash)
     };
-    if (legacyTemporaryAccountGroups.length > 0) {
-      this.persistDatabase(db);
-      this.persistTemporaryAccounts(db.temporaryAccountGroups);
-    }
-    return db;
+  }
+
+  private loadDatabaseFromSqlite(): AppDatabase {
+    const settingsRows = this.sqlite.prepare("SELECT key, value FROM settings").all() as Array<{ key: keyof AppSettings; value: string }>;
+    const rawSettings = Object.fromEntries(settingsRows.map((row) => [row.key, JSON.parse(row.value)])) as Partial<AppSettings>;
+    const auth = this.sqlite.prepare("SELECT admin_password_hash FROM auth WHERE id = 1").get() as { admin_password_hash?: string } | undefined;
+    const sites: Site[] = (this.sqlite.prepare("SELECT * FROM sites ORDER BY created_at DESC").all() as Array<Record<string, unknown>>).map((row) => ({
+      id: String(row.id),
+      name: String(row.name),
+      siteType: normalizeSiteType(row.site_type),
+      addresses: JSON.parse(String(row.addresses_json)) as SiteAddress[],
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at)
+    }));
+    const apiKeys = (this.sqlite.prepare("SELECT * FROM api_keys ORDER BY created_at DESC").all() as Array<Record<string, unknown>>).map((row) => ({
+      id: String(row.id),
+      name: String(row.name),
+      prefix: String(row.prefix),
+      keyHash: String(row.key_hash),
+      plainTextKey: row.plain_text_key == null ? undefined : String(row.plain_text_key),
+      enabled: Boolean(row.enabled),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      lastUsedAt: row.last_used_at == null ? undefined : String(row.last_used_at)
+    }));
+    const providerApiKeyGroups = (this.sqlite.prepare("SELECT * FROM provider_api_key_groups ORDER BY created_at DESC").all() as Array<Record<string, unknown>>).map((row) => {
+      const apiKeys = (this.sqlite.prepare("SELECT * FROM provider_api_keys WHERE group_id = ? ORDER BY rowid").all(row.id) as Array<Record<string, unknown>>).map((apiKey) => ({
+        id: String(apiKey.id),
+        label: String(apiKey.label),
+        prefix: String(apiKey.prefix),
+        secret: String(apiKey.secret),
+        enabled: Boolean(apiKey.enabled),
+        models: normalizeModelList(JSON.parse(String(apiKey.models_json))),
+        lastCheckedAt: apiKey.last_checked_at == null ? undefined : String(apiKey.last_checked_at)
+      }));
+      return { id: String(row.id), siteId: String(row.site_id), groupName: String(row.group_name), apiKeys, createdAt: String(row.created_at), updatedAt: String(row.updated_at) };
+    });
+    const temporaryAccountGroups = (this.sqlite.prepare("SELECT * FROM temporary_account_groups ORDER BY created_at DESC").all() as Array<Record<string, unknown>>).map((row) => {
+      const accounts = (this.sqlite.prepare("SELECT * FROM temporary_accounts WHERE group_id = ? ORDER BY rowid").all(row.id) as Array<Record<string, unknown>>).map((account) => ({
+        id: String(account.id),
+        label: String(account.label),
+        prefix: String(account.prefix),
+        secret: String(account.secret),
+        accountType: account.account_type == null ? undefined : account.account_type === "openai-api-key" ? "openai-api-key" as const : "codex" as const,
+        providerType: normalizeTemporaryAccountProviderType(account.provider_type),
+        accountId: account.account_id == null ? undefined : String(account.account_id),
+        email: account.email == null ? undefined : String(account.email),
+        refreshToken: account.refresh_token == null ? undefined : String(account.refresh_token),
+        idToken: account.id_token == null ? undefined : String(account.id_token),
+        sessionToken: account.session_token == null ? undefined : String(account.session_token),
+        enabled: Boolean(account.enabled),
+        models: normalizeModelList(JSON.parse(String(account.models_json))),
+        availability: normalizeTemporaryAccountAvailability(account.availability),
+        quotaStages: JSON.parse(String(account.quota_stages_json)) as TemporaryAccountQuotaStage[],
+        importedAt: String(account.imported_at),
+        lastQuotaCheckedAt: account.last_quota_checked_at == null ? undefined : String(account.last_quota_checked_at),
+        lastCheckStatusCode: typeof account.last_check_status_code === "number" ? account.last_check_status_code : undefined,
+        lastCheckError: account.last_check_error == null ? undefined : String(account.last_check_error)
+      }));
+      const providerType = normalizeTemporaryAccountProviderType(row.provider_type || String(row.name).toLowerCase());
+      return { id: String(row.id), name: TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType], source: row.source === "cpa" ? "cpa" as const : "subapi" as const, providerType, siteId: String(row.site_id), strategy: normalizeGroupStrategy(row.strategy), enabled: true, accounts: accounts.map((account) => ({ ...account, providerType, enabled: true })), createdAt: String(row.created_at), updatedAt: String(row.updated_at) };
+    });
+    const headerTemplates = (this.sqlite.prepare("SELECT * FROM header_templates ORDER BY created_at DESC").all() as Array<Record<string, unknown>>).map((row) => ({
+      id: String(row.id),
+      name: String(row.name),
+      headersText: String(row.headers_text),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at)
+    }));
+    const routes = (this.sqlite.prepare("SELECT data_json FROM routes ORDER BY created_at DESC").all() as Array<{ data_json: string }>).map((row) => JSON.parse(row.data_json) as RouteRecord);
+    return { sites, apiKeys, providerApiKeyGroups, temporaryAccountGroups, headerTemplates, routes, settings: normalizeSettings(rawSettings), adminPasswordHash: normalizePasswordHash(auth?.admin_password_hash) };
   }
 
   private loadTemporaryAccountGroups(fallback: TemporaryAccountGroup[] = []) {
@@ -1177,10 +1383,7 @@ export class JsonStore {
 
   private loadRequestLogs(limit: number, fallback: RequestLog[] = []) {
     if (!existsSync(this.logsPath)) return fallback.slice(0, limit);
-    const lines = readFileSync(this.logsPath, "utf8")
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
+    const lines = readFileSync(this.logsPath, "utf8").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const logs: RequestLog[] = [];
     for (const line of lines) {
       try {
@@ -1193,32 +1396,91 @@ export class JsonStore {
     return logs.reverse().slice(0, limit);
   }
 
+  private loadRequestLogsFromSqlite(limit: number) {
+    return (this.sqlite.prepare("SELECT data_json FROM request_logs ORDER BY created_at DESC LIMIT ?").all(limit) as Array<{ data_json: string }>).map((row) => JSON.parse(row.data_json) as RequestLog);
+  }
+
   private rewriteRequestLogFile() {
-    const content = this.requestLogs
-      .slice()
-      .reverse()
-      .map((log) => JSON.stringify(log))
-      .join("\n");
-    writeFileSync(this.logsPath, content ? `${content}\n` : "");
+    this.replaceRequestLogs(this.requestLogs);
   }
 
   private persist() {
-    this.persistDatabase(this.db);
-    this.persistTemporaryAccounts(this.db.temporaryAccountGroups);
+    this.replaceSqliteDatabase(this.db, this.requestLogs);
   }
 
-  private persistDatabase(db: AppDatabase) {
-    const { temporaryAccountGroups, ...database } = db;
-    void temporaryAccountGroups;
-    const tempPath = `${this.dbPath}.tmp`;
-    writeFileSync(tempPath, JSON.stringify(database, null, 2));
-    renameSync(tempPath, this.dbPath);
+  private replaceSqliteDatabase(db: AppDatabase, requestLogs = this.requestLogs) {
+    const replace = this.sqlite.transaction(() => {
+      this.sqlite.prepare("DELETE FROM request_logs").run();
+      this.sqlite.prepare("DELETE FROM routes").run();
+      this.sqlite.prepare("DELETE FROM header_templates").run();
+      this.sqlite.prepare("DELETE FROM temporary_accounts").run();
+      this.sqlite.prepare("DELETE FROM temporary_account_groups").run();
+      this.sqlite.prepare("DELETE FROM provider_api_keys").run();
+      this.sqlite.prepare("DELETE FROM provider_api_key_groups").run();
+      this.sqlite.prepare("DELETE FROM api_keys").run();
+      this.sqlite.prepare("DELETE FROM sites").run();
+      this.sqlite.prepare("DELETE FROM auth").run();
+      this.sqlite.prepare("DELETE FROM settings").run();
+      this.writeDatabaseRows(db, requestLogs);
+      this.sqlite.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '1')").run();
+      this.sqlite.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('migrated_from_json_at', ?)").run(now());
+    });
+    replace();
   }
 
-  private persistTemporaryAccounts(groups: TemporaryAccountGroup[]) {
-    const tempPath = `${this.temporaryAccountsPath}.tmp`;
-    writeFileSync(tempPath, JSON.stringify(groups, null, 2));
-    renameSync(tempPath, this.temporaryAccountsPath);
+  private writeDatabaseRows(db: AppDatabase, requestLogs: RequestLog[]) {
+    const insertSetting = this.sqlite.prepare("INSERT INTO settings (key, value) VALUES (?, ?)");
+    for (const [key, value] of Object.entries(db.settings)) insertSetting.run(key, JSON.stringify(value));
+    this.sqlite.prepare("INSERT INTO auth (id, admin_password_hash) VALUES (1, ?)").run(db.adminPasswordHash || null);
+    const insertSite = this.sqlite.prepare("INSERT INTO sites (id, name, site_type, addresses_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)");
+    for (const site of db.sites) insertSite.run(site.id, site.name, site.siteType, JSON.stringify(site.addresses), site.createdAt, site.updatedAt);
+    const insertApiKey = this.sqlite.prepare("INSERT INTO api_keys (id, name, prefix, key_hash, plain_text_key, enabled, created_at, updated_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const key of db.apiKeys) insertApiKey.run(key.id, key.name, key.prefix, key.keyHash, key.plainTextKey || null, key.enabled ? 1 : 0, key.createdAt, key.updatedAt, key.lastUsedAt || null);
+    const insertProviderGroup = this.sqlite.prepare("INSERT INTO provider_api_key_groups (id, site_id, group_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
+    const insertProviderKey = this.sqlite.prepare("INSERT INTO provider_api_keys (id, group_id, label, prefix, secret, enabled, models_json, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const group of db.providerApiKeyGroups) {
+      insertProviderGroup.run(group.id, group.siteId, group.groupName, group.createdAt, group.updatedAt);
+      for (const apiKey of group.apiKeys) insertProviderKey.run(apiKey.id, group.id, apiKey.label, apiKey.prefix, apiKey.secret, apiKey.enabled ? 1 : 0, JSON.stringify(apiKey.models), apiKey.lastCheckedAt || null);
+    }
+    const insertTemporaryGroup = this.sqlite.prepare("INSERT INTO temporary_account_groups (id, name, source, provider_type, site_id, strategy, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    const insertTemporaryAccount = this.sqlite.prepare("INSERT INTO temporary_accounts (id, group_id, label, prefix, secret, account_type, provider_type, account_id, email, refresh_token, id_token, session_token, enabled, models_json, availability, quota_stages_json, imported_at, last_quota_checked_at, last_check_status_code, last_check_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const group of db.temporaryAccountGroups) {
+      const providerType = normalizeTemporaryAccountProviderType(group.providerType || group.name.toLowerCase());
+      insertTemporaryGroup.run(group.id, TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType], group.source, providerType, group.siteId, group.strategy || null, 1, group.createdAt, group.updatedAt);
+      for (const account of group.accounts) insertTemporaryAccount.run(account.id, group.id, account.label, account.prefix, account.secret, account.accountType || null, account.providerType || providerType, account.accountId || null, account.email || null, account.refreshToken || null, account.idToken || null, account.sessionToken || null, 1, JSON.stringify(account.models), account.availability || "unknown", JSON.stringify(account.quotaStages || []), account.importedAt, account.lastQuotaCheckedAt || null, account.lastCheckStatusCode ?? null, account.lastCheckError || null);
+    }
+    const insertHeader = this.sqlite.prepare("INSERT INTO header_templates (id, name, headers_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
+    for (const template of db.headerTemplates) insertHeader.run(template.id, template.name, template.headersText, template.createdAt, template.updatedAt);
+    const insertRoute = this.sqlite.prepare("INSERT INTO routes (id, type, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
+    for (const route of db.routes) insertRoute.run(route.id, route.type, JSON.stringify(route), route.createdAt, route.updatedAt);
+    const insertLog = this.sqlite.prepare("INSERT INTO request_logs (id, created_at, data_json) VALUES (?, ?, ?)");
+    for (const log of requestLogs.slice().reverse()) insertLog.run(log.id, log.createdAt, JSON.stringify(log));
+  }
+
+  private insertRequestLogRow(log: RequestLog) {
+    this.sqlite.prepare("INSERT OR REPLACE INTO request_logs (id, created_at, data_json) VALUES (?, ?, ?)").run(log.id, log.createdAt, JSON.stringify(log));
+  }
+
+  private replaceRequestLogs(logs: RequestLog[]) {
+    const replace = this.sqlite.transaction(() => {
+      this.sqlite.prepare("DELETE FROM request_logs").run();
+      const insertLog = this.sqlite.prepare("INSERT INTO request_logs (id, created_at, data_json) VALUES (?, ?, ?)");
+      for (const log of logs.slice().reverse()) insertLog.run(log.id, log.createdAt, JSON.stringify(log));
+    });
+    replace();
+  }
+
+  private persistTemporaryAccountCheckResult(groupId: string, account: TemporaryAccount) {
+    this.sqlite.prepare(`
+      UPDATE temporary_accounts
+      SET label = ?, prefix = ?, secret = ?, account_type = ?, provider_type = ?, account_id = ?, email = ?, refresh_token = ?, id_token = ?, session_token = ?, enabled = ?, models_json = ?, availability = ?, quota_stages_json = ?, imported_at = ?, last_quota_checked_at = ?, last_check_status_code = ?, last_check_error = ?
+      WHERE id = ?
+    `).run(account.label, account.prefix, account.secret, account.accountType || null, account.providerType || "gpt", account.accountId || null, account.email || null, account.refreshToken || null, account.idToken || null, account.sessionToken || null, 1, JSON.stringify(account.models), account.availability || "unknown", JSON.stringify(account.quotaStages || []), account.importedAt, account.lastQuotaCheckedAt || null, account.lastCheckStatusCode ?? null, account.lastCheckError || null, account.id);
+    this.sqlite.prepare("UPDATE temporary_account_groups SET updated_at = ? WHERE id = ?").run(now(), groupId);
+  }
+
+  private persistApiKeyLastUsedAt(apiKey: ApiKeyRecord) {
+    this.sqlite.prepare("UPDATE api_keys SET last_used_at = ? WHERE id = ?").run(apiKey.lastUsedAt || null, apiKey.id);
   }
 
   private normalizeProviderApiKeyEntry(input: Partial<ProviderApiKeyEntry>, index: number, existingKeys: ProviderApiKeyEntry[] = []): ProviderApiKeyEntry {

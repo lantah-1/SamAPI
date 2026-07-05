@@ -787,6 +787,8 @@ label {
   gap: 0.18rem;
   overflow: auto;
   overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
   border: 1px solid var(--line-strong);
   border-radius: 8px;
   background: var(--surface-solid);
@@ -882,6 +884,12 @@ label {
   transform: translateY(0);
 }
 
+.action:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+  transform: none;
+}
+
 .action-primary {
   border: 1px solid var(--accent);
   background: linear-gradient(180deg, var(--accent-raised) 0%, var(--accent) 100%);
@@ -967,6 +975,133 @@ label {
   gap: 0.45rem;
 }
 
+.provider-model-group-options {
+  margin-top: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 0.75rem;
+}
+
+.provider-model-group-title {
+  color: var(--muted-strong);
+  font-size: 0.76rem;
+  font-weight: 820;
+}
+
+.provider-model-group-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.55rem;
+}
+
+.provider-model-group-list button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+  border-radius: 999px;
+  background: var(--subtle-fill);
+  padding: 0.35rem 0.6rem;
+  color: var(--ink);
+  font-size: 0.74rem;
+  font-weight: 820;
+  transition: transform 150ms ease, background 150ms ease, border-color 150ms ease;
+}
+
+.provider-model-group-list button:hover {
+  border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+  background: var(--accent-softer);
+  transform: translateY(-1px);
+}
+
+.provider-model-group-list strong {
+  color: var(--accent-strong);
+  font-size: 0.7rem;
+}
+
+.temp-account-surface {
+  display: grid;
+  gap: 1rem;
+  padding: 1rem;
+}
+
+.temp-account-overview {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--summary-card-bg);
+  padding: 1rem;
+}
+
+.temp-account-overview h2,
+.temp-account-empty h2 {
+  color: var(--ink);
+  font-size: 1.1rem;
+  font-weight: 900;
+}
+
+.temp-account-overview p,
+.temp-account-empty p {
+  margin-top: 0.25rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 720;
+}
+
+.temp-account-stats {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--subtle-fill);
+}
+
+.temp-account-stats span {
+  display: grid;
+  min-width: 72px;
+  gap: 0.1rem;
+  padding: 0.55rem 0.7rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 760;
+  text-align: center;
+}
+
+.temp-account-stats span + span {
+  border-left: 1px solid var(--line);
+}
+
+.temp-account-stats strong {
+  color: var(--ink);
+  font-size: 1rem;
+  font-weight: 920;
+  line-height: 1;
+}
+
+.temp-account-empty {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  padding: 1rem;
+}
+
+.temp-account-empty-mark {
+  display: grid;
+  height: 42px;
+  width: 42px;
+  flex: none;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
 .temp-account-strategy {
   width: min(220px, 100%);
   margin-left: auto;
@@ -977,6 +1112,38 @@ label {
   align-items: flex-end;
   justify-content: flex-end;
   gap: 0.7rem;
+}
+
+.temp-account-groups {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.temp-account-group-card {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--record-bg);
+  padding: 0.85rem;
+  box-shadow: var(--shadow-row);
+}
+
+.temp-account-group-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.temp-account-type-badge {
+  flex: none;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+  border-radius: 999px;
+  background: var(--accent-softer);
+  padding: 0.24rem 0.55rem;
+  color: var(--accent-strong);
+  font-size: 0.7rem;
+  font-weight: 860;
 }
 
 .temp-account-list {
@@ -1011,11 +1178,36 @@ label {
 }
 
 .temp-account-row-title {
-  display: flex;
+  display: grid;
   min-width: 0;
-  flex-wrap: wrap;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 0.4rem;
+}
+
+.temp-account-row-title input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+.temp-account-delete {
+  display: grid;
+  height: 30px;
+  width: 30px;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--danger-strong);
+  transition: background 150ms ease, transform 150ms ease, opacity 150ms ease;
+}
+
+.temp-account-delete:hover {
+  background: var(--danger-soft);
+  transform: translateY(-1px);
+}
+
+.temp-account-delete:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+  transform: none;
 }
 
 .temp-account-name {
@@ -1068,14 +1260,86 @@ label {
 }
 
 .temp-account-quota-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem;
-  margin-top: 0.45rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.45rem;
+  margin-top: 0.55rem;
 }
 
 .temp-account-quota {
-  max-width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-solid);
+  padding: 0.48rem;
+  color: var(--muted-strong);
+  font-size: 0.7rem;
+  font-weight: 780;
+  overflow-wrap: anywhere;
+}
+
+.temp-account-quota-available {
+  border-color: rgba(15, 118, 110, 0.24);
+}
+
+.temp-account-quota-unavailable {
+  border-color: rgba(220, 38, 38, 0.24);
+}
+
+.temp-account-quota-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  color: var(--ink);
+  font-size: 0.72rem;
+  font-weight: 860;
+}
+
+.temp-account-quota-head span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.temp-account-quota-head strong {
+  flex: none;
+  font-size: 0.72rem;
+}
+
+.temp-account-quota-track {
+  overflow: hidden;
+  height: 8px;
+  margin-top: 0.38rem;
+  border-radius: 999px;
+  background: var(--surface-muted);
+}
+
+.temp-account-quota-fill {
+  height: 100%;
+  min-width: 3px;
+  border-radius: inherit;
+  background: var(--muted);
+}
+
+.temp-account-quota-available .temp-account-quota-fill {
+  background: #16a34a;
+}
+
+.temp-account-quota-unavailable .temp-account-quota-fill {
+  background: var(--danger);
+}
+
+.temp-account-quota-text {
+  margin-top: 0.35rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+.temp-account-quota-more {
+  align-self: center;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: var(--surface-solid);
@@ -1083,7 +1347,6 @@ label {
   color: var(--muted-strong);
   font-size: 0.7rem;
   font-weight: 780;
-  overflow-wrap: anywhere;
 }
 
 .temp-account-error {
@@ -2041,6 +2304,20 @@ label {
   color: var(--ink);
 }
 
+.logs-pagination {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.78rem;
+  font-weight: 820;
+  color: var(--muted-strong);
+}
+
+.logs-pagination .action {
+  min-height: 34px;
+  padding: 0.42rem 0.65rem;
+}
+
 .log-table {
   display: grid;
   gap: 0.65rem;
@@ -2380,16 +2657,25 @@ label {
 
   .app-shell {
     display: block !important;
+    width: 100vw !important;
     max-width: none !important;
     height: 100svh;
     min-height: 0 !important;
-    padding: 0.75rem 0.75rem calc(86px + env(safe-area-inset-bottom)) !important;
+    padding: 0.5rem 0.4rem calc(82px + env(safe-area-inset-bottom)) !important;
   }
 
   .app-content {
-    gap: 0.75rem;
+    width: 100%;
+    gap: 0.6rem;
     height: 100%;
     min-height: 0;
+  }
+
+  .app-scroll-frame,
+  .app-scroll-content,
+  .panel {
+    width: 100%;
+    max-width: 100%;
   }
 
   .app-scroll {
@@ -2409,9 +2695,9 @@ label {
   .app-nav {
     position: fixed !important;
     z-index: 35;
-    right: 0.75rem;
-    bottom: calc(0.75rem + env(safe-area-inset-bottom));
-    left: 0.75rem;
+    right: 0.4rem;
+    bottom: calc(0.5rem + env(safe-area-inset-bottom));
+    left: 0.4rem;
     display: flex !important;
     width: auto !important;
     min-width: 0;
@@ -2486,12 +2772,12 @@ label {
   }
 
   .app-header {
-    min-height: 64px;
+    min-height: 60px;
     flex: 0 0 auto;
     flex-wrap: nowrap;
     align-items: center !important;
-    gap: 0.75rem;
-    padding: 0.9rem;
+    gap: 0.55rem;
+    padding: 0.75rem;
   }
 
   .app-header-title {
@@ -2629,7 +2915,7 @@ label {
     flex-direction: column;
     min-height: 0;
     align-items: stretch;
-    padding: 0.9rem;
+    padding: 0.75rem;
   }
 
   .route-record {
@@ -2657,7 +2943,12 @@ label {
     width: 100%;
     flex-wrap: wrap;
     align-items: center;
-    justify-content: flex-end;
+    justify-content: stretch;
+  }
+
+  .record-actions .action,
+  .record-actions .toggle-row {
+    flex: 1 1 auto;
   }
 
   .record-actions.route-record-actions {
@@ -2721,6 +3012,71 @@ label {
 
   .group-model-options {
     grid-template-columns: 1fr;
+  }
+
+  .temp-account-surface {
+    gap: 0.75rem;
+    padding: 0.75rem;
+  }
+
+  .temp-account-overview {
+    grid-template-columns: 1fr;
+    gap: 0.75rem;
+    padding: 0.8rem;
+  }
+
+  .temp-account-stats {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .temp-account-stats span {
+    min-width: 0;
+    padding: 0.5rem 0.35rem;
+  }
+
+  .temp-account-toolbar {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.55rem;
+  }
+
+  .temp-account-toolbar .action,
+  .temp-account-strategy {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .temp-account-group-card {
+    padding: 0.72rem;
+  }
+
+  .temp-account-group-head {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+
+  .temp-account-type-badge {
+    width: fit-content;
+  }
+
+  .temp-account-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.55rem;
+    padding: 0.62rem;
+  }
+
+  .temp-account-row-title {
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+  }
+
+  .temp-account-last-check {
+    text-align: left;
+    white-space: normal;
+  }
+
+  .temp-account-quota-list {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .log-summary {

@@ -23,7 +23,7 @@ import {
   X
 } from "lucide-react";
 import { Children, FormEvent, isValidElement, useEffect, useId, useMemo, useRef, useState } from "react";
-import { api, isUnauthorizedError } from "./api";
+import { ApiError, api, isUnauthorizedError } from "./api";
 import type {
   ApiKeyCreated,
   AppSettings,
@@ -35,6 +35,7 @@ import type {
   GroupRouteStrategy,
   HeaderTemplate,
   ProviderApiKeyGroupView,
+  ProviderModelGroupOption,
   RequestLog,
   RouteRecord,
   RouteType,
@@ -46,7 +47,8 @@ import type {
   TemporaryAccountAvailability,
   TemporaryAccountCheckResult,
   TemporaryAccountGroup,
-  TemporaryAccountImportSource
+  TemporaryAccountImportSource,
+  TemporaryAccountProviderType
 } from "../shared/types";
 
 type Section = "routes" | "sites" | "providerKeys" | "temporaryAccounts" | "keys" | "headers" | "logs" | "settings" | "docs";
@@ -88,6 +90,7 @@ interface ProviderKeyGroupDraft {
 
 interface TemporaryAccountImportDraft {
   name: string;
+  providerType: TemporaryAccountProviderType;
   source: TemporaryAccountImportSource;
   modelsText: string;
   content: string;
@@ -150,7 +153,14 @@ const groupStrategyLabels: Record<GroupRouteStrategy, string> = {
 
 const temporaryAccountSourceLabels: Record<TemporaryAccountImportSource, string> = {
   cpa: "CPA",
-  subapi: "SubAPI"
+  subapi: "Sub2API"
+};
+
+const temporaryAccountProviderLabels: Record<TemporaryAccountProviderType, string> = {
+  gpt: "GPT",
+  grok: "Grok",
+  claude: "Claude",
+  gemini: "Gemini"
 };
 
 const temporaryAccountAvailabilityLabels: Record<TemporaryAccountAvailability, string> = {
@@ -205,6 +215,7 @@ const navItems = [
 
 const settingsNavItem = { id: "settings", label: "设置", icon: Settings } satisfies { id: Section; label: string; icon: typeof Route };
 const allNavItems = [...navItems, settingsNavItem];
+const LOGS_PAGE_SIZE = 5;
 
 function groupMemberKey(member: GroupRouteMember) {
   return `${member.siteId}::${member.apiKeyId}::${member.model}`;
@@ -361,6 +372,18 @@ function siteModels(site?: Site) {
   return Array.from(new Set(site.addresses.filter((address) => address.enabled).flatMap((address) => address.models).filter(Boolean))).sort();
 }
 
+function parseModelText(value: string) {
+  return Array.from(new Set(value.split(/[\n,，;；\s]+/).map((model) => model.trim()).filter(Boolean))).sort();
+}
+
+function serializeModelText(models: string[]) {
+  return models.join("\n");
+}
+
+function mergeModelOptions(...modelLists: Array<Array<string | undefined>>) {
+  return Array.from(new Set(modelLists.flat().filter((model): model is string => Boolean(model)))).sort();
+}
+
 function emptySite(): Partial<Site> {
   return {
     name: "",
@@ -413,7 +436,8 @@ function emptyProviderKeyGroup(snapshot?: AppSnapshot): ProviderKeyGroupDraft {
 function emptyTemporaryAccountImport(): TemporaryAccountImportDraft {
   return {
     name: "GPT 临时账号",
-    source: "cpa",
+    providerType: "gpt",
+    source: "subapi",
     modelsText: "",
     content: "",
     contents: [],
@@ -455,6 +479,28 @@ function temporaryAccountQuotaText(stage: TemporaryAccount["quotaStages"][number
     stage.resetAt ? `${formatTime(stage.resetAt)} 重置` : ""
   ].filter(Boolean);
   return `${stage.label}${parts.length > 0 ? `：${parts.join(" / ")}` : ""}`;
+}
+
+function numericQuotaValue(value: TemporaryAccount["quotaStages"][number]["remaining"]) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return undefined;
+  const normalized = Number(value.replace(/,/g, "").replace(/%$/, "").trim());
+  return Number.isFinite(normalized) ? normalized : undefined;
+}
+
+function temporaryAccountQuotaPercent(stage: TemporaryAccount["quotaStages"][number]) {
+  const remaining = numericQuotaValue(stage.remaining);
+  const used = numericQuotaValue(stage.used);
+  const total = numericQuotaValue(stage.total);
+  if (total && total > 0 && remaining != null) return Math.min(100, Math.max(0, (remaining / total) * 100));
+  if (total && total > 0 && used != null) return Math.min(100, Math.max(0, ((total - used) / total) * 100));
+  if (remaining != null) return remaining > 0 ? 100 : 0;
+  return undefined;
+}
+
+function formatQuotaPercent(value?: number) {
+  if (value == null) return "未知";
+  return `${Math.round(value)}%`;
 }
 
 function formatTime(value: string) {
@@ -630,11 +676,7 @@ function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
                 disabled={option.disabled}
                 className={`select-option ${selected ? "select-option-selected" : ""} ${active ? "select-option-active" : ""}`}
                 onMouseEnter={() => setActiveIndex(index)}
-                onPointerDown={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  if (!option.disabled) commitValue(option.value);
-                }}
+                onPointerDown={(event) => event.stopPropagation()}
                 onClick={(event) => {
                   event.stopPropagation();
                   if (!option.disabled) commitValue(option.value);
@@ -794,10 +836,15 @@ export default function App() {
   const [appScrollbarThumb, setAppScrollbarThumb] = useState({ height: 0, scrollable: false, top: 0 });
   const [logsAutoRefresh, setLogsAutoRefresh] = useState(true);
   const [logsRefreshing, setLogsRefreshing] = useState(false);
+  const [logsTotal, setLogsTotal] = useState(0);
+  const [logsPage, setLogsPage] = useState(0);
   const [busy, setBusy] = useState(false);
   const [modelSyncing, setModelSyncing] = useState(false);
   const [modelDiscoveringIndex, setModelDiscoveringIndex] = useState<number | null>(null);
+  const [providerModelGroupOptions, setProviderModelGroupOptions] = useState<Record<number, ProviderModelGroupOption[]>>({});
   const [temporaryAccountChecking, setTemporaryAccountChecking] = useState<string | null>(null);
+  const [temporaryAccountDeleting, setTemporaryAccountDeleting] = useState<string | null>(null);
+  const [selectedTemporaryAccountIds, setSelectedTemporaryAccountIds] = useState<string[]>([]);
   const appScrollRef = useRef<HTMLDivElement | null>(null);
   const appScrollContentRef = useRef<HTMLDivElement | null>(null);
   const toastTimerRef = useRef<number | undefined>(undefined);
@@ -899,11 +946,41 @@ export default function App() {
     return true;
   };
 
-  const load = async (initial = false) => {
-    const next = initial ? await api.initialSnapshot() : await api.snapshot();
-    setTemporaryAccountsLoaded(!initial);
+  const load = async (options: { includeRequestLogs?: boolean; includeTemporaryAccounts?: boolean } = {}) => {
+    const currentSnapshot = snapshot;
+    const [bootstrap, settings, sites, apiKeys, providerApiKeyGroups, headerTemplates, routes, requestLogs, temporaryAccountGroups] =
+      await Promise.all([
+        api.bootstrap(),
+        api.listSettings(),
+        api.listSites(),
+        api.listKeys(),
+        api.listProviderKeyGroups(),
+        api.listHeaders(),
+        api.listRoutes(),
+        options.includeRequestLogs
+          ? api.listLogs(LOGS_PAGE_SIZE, logsPage * LOGS_PAGE_SIZE).then((result) => {
+              setLogsTotal(result.total);
+              return result.items;
+            })
+          : Promise.resolve(currentSnapshot?.requestLogs || []),
+        options.includeTemporaryAccounts ? api.listTemporaryAccountGroups() : Promise.resolve(currentSnapshot?.temporaryAccountGroups || [])
+      ]);
+    const next: AppSnapshot = {
+      ...bootstrap,
+      settings,
+      sites,
+      apiKeys,
+      providerApiKeyGroups,
+      headerTemplates,
+      routes,
+      requestLogs,
+      temporaryAccountGroups
+    };
+    if (options.includeTemporaryAccounts) {
+      setTemporaryAccountsLoaded(true);
+      setTemporaryAccountsError("");
+    }
     setTemporaryAccountsLoading(false);
-    setTemporaryAccountsError("");
     setSnapshot(next);
     setRouteDraft((current) => (current.name ? current : emptyRoute(next)));
     setAuthStatus("signed-in");
@@ -940,7 +1017,7 @@ export default function App() {
         setAuthStatus("signed-out");
         return;
       }
-      await load(true);
+      await load();
     } catch (error) {
       setSnapshot(null);
       setTemporaryAccountsLoaded(false);
@@ -956,7 +1033,7 @@ export default function App() {
     setAuthError("");
     try {
       await api.login(password);
-      await load(true);
+      await load();
       setToast("已进入控制台");
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "登录失败");
@@ -965,12 +1042,45 @@ export default function App() {
     }
   };
 
-  const refreshLogs = async (showSuccess = false) => {
+  const loadLogsPage = async (page = logsPage, showSuccess = false) => {
     setLogsRefreshing(true);
     try {
-      const requestLogs = await api.listLogs();
-      setSnapshot((current) => (current ? { ...current, requestLogs } : current));
+      const offset = page * LOGS_PAGE_SIZE;
+      const result = await api.listLogs(LOGS_PAGE_SIZE, offset);
+      setSnapshot((current) => (current ? { ...current, requestLogs: result.items } : current));
+      setLogsTotal(result.total);
+      setLogsPage(result.total > 0 && offset >= result.total ? Math.max(0, Math.ceil(result.total / LOGS_PAGE_SIZE) - 1) : page);
       if (showSuccess) setToast("日志已刷新");
+    } catch (error) {
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "日志刷新失败");
+    } finally {
+      setLogsRefreshing(false);
+    }
+  };
+
+  const refreshLogs = async (showSuccess = false) => {
+    if (logsPage !== 0) {
+      await loadLogsPage(logsPage, showSuccess);
+      return;
+    }
+    setLogsRefreshing(true);
+    try {
+      const latestCreatedAt = snapshot?.requestLogs[0]?.createdAt;
+      if (!latestCreatedAt) {
+        await loadLogsPage(0, showSuccess);
+        return;
+      }
+      const result = await api.listNewLogs(latestCreatedAt);
+      if (result.items.length > 0) {
+        setSnapshot((current) => {
+          if (!current) return current;
+          const existingIds = new Set(current.requestLogs.map((log) => log.id));
+          const mergedLogs = [...result.items.filter((log) => !existingIds.has(log.id)), ...current.requestLogs].slice(0, LOGS_PAGE_SIZE);
+          return { ...current, requestLogs: mergedLogs };
+        });
+      }
+      setLogsTotal(result.total);
+      if (showSuccess) setToast(result.items.length > 0 ? `日志已刷新，新增 ${result.items.length} 条` : "日志已刷新");
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "日志刷新失败");
     } finally {
@@ -1017,13 +1127,17 @@ export default function App() {
   }, [authStatus, section, temporaryAccountsLoaded]);
 
   useEffect(() => {
+    if (authStatus !== "signed-in" || section !== "logs") return;
+    loadLogsPage(logsPage);
+  }, [authStatus, section, logsPage]);
+
+  useEffect(() => {
     if (authStatus !== "signed-in" || section !== "logs" || !logsAutoRefresh) return;
-    refreshLogs();
     const interval = window.setInterval(() => {
       refreshLogs();
     }, 5000);
     return () => window.clearInterval(interval);
-  }, [authStatus, section, logsAutoRefresh]);
+  }, [authStatus, section, logsAutoRefresh, logsPage, snapshot?.requestLogs[0]?.createdAt]);
 
   const selectedSite = useMemo(
     () => snapshot?.sites.find((site) => site.id === routeDraft.siteId),
@@ -1035,7 +1149,10 @@ export default function App() {
     setBusy(true);
     try {
       await work();
-      await load();
+      await load({
+        includeRequestLogs: section === "logs",
+        includeTemporaryAccounts: temporaryAccountsLoaded
+      });
       setToast(message);
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "操作失败");
@@ -1093,14 +1210,16 @@ export default function App() {
     (async () => {
       const result = await api.importTemporaryAccounts({
         name: temporaryAccountDraft.name,
-        source: temporaryAccountDraft.source,
-        models: temporaryAccountDraft.modelsText.split(/[\n,，;；\s]+/).map((model) => model.trim()).filter(Boolean),
+        providerType: temporaryAccountDraft.providerType,
         content: temporaryAccountDraft.content,
         contents: temporaryAccountDraft.contents
       });
       setTemporaryAccountEditorOpen(false);
       setTemporaryAccountDraft(emptyTemporaryAccountImport());
-      await load();
+      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
+      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
+      setTemporaryAccountsLoaded(true);
+      setTemporaryAccountsLoading(false);
       const checkSummary = result.checkResult ? `；检查结果：${temporaryAccountCheckSummary(result.checkResult)}` : "";
       setToast(`已导入 ${result.imported} 个临时账号${result.skipped ? `，跳过 ${result.skipped} 个重复项` : ""}${checkSummary}`);
     })()
@@ -1110,16 +1229,51 @@ export default function App() {
       .finally(() => setBusy(false));
   };
 
-  const checkTemporaryAccounts = async (groupId?: string) => {
-    setTemporaryAccountChecking(groupId || "all");
+  const checkTemporaryAccounts = async () => {
+    setTemporaryAccountChecking("all");
     try {
-      const result = groupId ? await api.checkTemporaryAccountGroup(groupId) : await api.checkTemporaryAccounts();
-      await load();
-      setToast(`${groupId ? "账号组检查完成" : "临时账号检查完成"}：${temporaryAccountCheckSummary(result)}`);
+      const result = await api.checkTemporaryAccounts();
+      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
+      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
+      setTemporaryAccountsLoaded(true);
+      setTemporaryAccountsLoading(false);
+      setToast(`GPT 账号检查完成：${temporaryAccountCheckSummary(result)}`);
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号检查失败");
     } finally {
       setTemporaryAccountChecking(null);
+    }
+  };
+
+  const deleteTemporaryAccount = async (id: string) => {
+    if (temporaryAccountDeleting) return;
+    setTemporaryAccountDeleting(id);
+    try {
+      await api.deleteTemporaryAccount(id);
+      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
+      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
+      setSelectedTemporaryAccountIds((current) => current.filter((item) => item !== id));
+      setToast("临时账号已删除");
+    } catch (error) {
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号删除失败");
+    } finally {
+      setTemporaryAccountDeleting(null);
+    }
+  };
+
+  const deleteSelectedTemporaryAccounts = async () => {
+    if (temporaryAccountDeleting || selectedTemporaryAccountIds.length === 0) return;
+    setTemporaryAccountDeleting("batch");
+    try {
+      await api.deleteTemporaryAccounts(selectedTemporaryAccountIds);
+      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
+      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
+      setSelectedTemporaryAccountIds([]);
+      setToast("已批量删除临时账号");
+    } catch (error) {
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号批量删除失败");
+    } finally {
+      setTemporaryAccountDeleting(null);
     }
   };
 
@@ -1195,9 +1349,19 @@ export default function App() {
             : item
         )
       }));
+      setProviderModelGroupOptions((current) => ({ ...current, [index]: [] }));
       setToast(`已获取 ${result.models.length} 个模型`);
     } catch (error) {
-      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "模型获取失败");
+      if (!handleUnauthorized(error)) {
+        const payload = error instanceof ApiError ? error.payload : undefined;
+        const modelGroups = payload && typeof payload === "object" && "modelGroups" in payload ? (payload as { modelGroups?: unknown }).modelGroups : undefined;
+        if (Array.isArray(modelGroups) && modelGroups.length > 0) {
+          setProviderModelGroupOptions((current) => ({ ...current, [index]: modelGroups as ProviderModelGroupOption[] }));
+          setToast("未匹配到 Key 名称，请从返回的分组中选择模型");
+        } else {
+          setToast(error instanceof Error ? error.message : "模型获取失败");
+        }
+      }
     } finally {
       await load().catch(() => undefined);
       setModelDiscoveringIndex(null);
@@ -1433,6 +1597,7 @@ export default function App() {
                 busy={busy}
                 modelSyncing={modelSyncing}
                 modelDiscoveringIndex={modelDiscoveringIndex}
+                modelGroupOptions={providerModelGroupOptions}
                 onDraft={setProviderKeyDraft}
                 onSubmit={saveProviderKeyGroup}
                 onClose={() => setProviderKeyEditorOpen(false)}
@@ -1449,16 +1614,19 @@ export default function App() {
                 editorOpen={temporaryAccountEditorOpen}
                 busy={busy}
                 checking={temporaryAccountChecking}
+                deleting={temporaryAccountDeleting}
+                selectedAccountIds={selectedTemporaryAccountIds}
+                onSelectedAccountIds={setSelectedTemporaryAccountIds}
                 onDraft={setTemporaryAccountDraft}
                 onSubmit={importTemporaryAccounts}
                 onClose={() => setTemporaryAccountEditorOpen(false)}
                 onCheck={checkTemporaryAccounts}
-                onUpdate={(id, patch) => mutate(async () => api.updateTemporaryAccountGroup(id, patch), "临时账号组已更新")}
                 loading={temporaryAccountsLoading || !temporaryAccountsLoaded}
                 error={temporaryAccountsError}
                 onRetry={loadTemporaryAccountGroups}
                 onStrategyChange={(strategy) => mutate(async () => api.updateSettings({ temporaryAccountStrategy: strategy }), "临时账号策略已更新")}
-                onDelete={(id) => mutate(async () => api.deleteTemporaryAccountGroup(id), "临时账号组已删除")}
+                onDeleteAccount={deleteTemporaryAccount}
+                onDeleteSelected={deleteSelectedTemporaryAccounts}
               />
             )}
             {section === "keys" && (
@@ -1495,8 +1663,12 @@ export default function App() {
             {section === "logs" && (
               <LogsView
                 snapshot={snapshot}
+                total={logsTotal}
+                page={logsPage}
+                pageSize={LOGS_PAGE_SIZE}
                 autoRefresh={logsAutoRefresh}
                 onAutoRefresh={setLogsAutoRefresh}
+                onPage={setLogsPage}
                 onDelete={(id) => mutate(async () => api.deleteLog(id), "日志已删除")}
                 onClear={() => mutate(async () => api.clearLogs(), "日志已清空")}
               />
@@ -1594,6 +1766,7 @@ function RoutesView(props: {
       enabled: props.draft.enabled ?? true
     });
   };
+  const switchModelOptions = mergeModelOptions([props.draft.model], props.selectedSiteModels);
   const draftMembers = props.draft.members || [];
   const selectedGroupKeys = new Set(draftMembers.map(groupMemberKey));
   const selectedAvailableCount = modelOptions.filter((option) => selectedGroupKeys.has(groupMemberKey(option))).length;
@@ -1652,7 +1825,7 @@ function RoutesView(props: {
               const quick = routeDraft(route);
               const quickSite = props.snapshot.sites.find((item) => item.id === quick.siteId) || site;
               const models = siteModels(quickSite);
-              const modelOptions = Array.from(new Set([quick.model, ...models].filter(Boolean))).sort();
+              const modelOptions = mergeModelOptions([quick.model], models);
               const isOpen = Boolean(expanded[route.id]);
               const hasChanges =
                 quick.siteId !== route.siteId ||
@@ -1723,8 +1896,12 @@ function RoutesView(props: {
                         </label>
                         <label className="route-quick-control">
                           <span className="route-quick-label">快捷切换模型</span>
-                          <SelectInput value={quick.model || ""} onChange={(event) => updateRouteDraft(route, { model: event.target.value })}>
-                            <option value="">选择模型</option>
+                          <SelectInput
+                            value={quick.model || ""}
+                            disabled={modelOptions.length === 0}
+                            onChange={(event) => updateRouteDraft(route, { model: event.target.value })}
+                          >
+                            {modelOptions.length === 0 ? <option value="">暂无可选模型</option> : null}
                             {modelOptions.map((model) => (
                               <option key={model} value={model}>
                                 {model}
@@ -1981,9 +2158,13 @@ function RoutesView(props: {
                     </label>
                     <label>
                       模型
-                      <SelectInput value={props.draft.model || ""} onChange={(event) => props.onDraft({ ...props.draft, model: event.target.value })}>
-                        <option value="">选择模型</option>
-                        {props.selectedSiteModels.map((model) => (
+                      <SelectInput
+                        value={props.draft.model || ""}
+                        disabled={switchModelOptions.length === 0}
+                        onChange={(event) => props.onDraft({ ...props.draft, model: event.target.value })}
+                      >
+                        {switchModelOptions.length === 0 ? <option value="">请先选择供应商</option> : null}
+                        {switchModelOptions.map((model) => (
                           <option key={model} value={model}>
                             {model}
                           </option>
@@ -2290,6 +2471,7 @@ function ProviderKeysView(props: {
   busy: boolean;
   modelSyncing: boolean;
   modelDiscoveringIndex: number | null;
+  modelGroupOptions: Record<number, ProviderModelGroupOption[]>;
   onDraft: (value: ProviderKeyGroupDraft) => void;
   onSubmit: (event: FormEvent) => void;
   onClose: () => void;
@@ -2428,6 +2610,30 @@ function ProviderKeysView(props: {
                       获取模型
                     </ActionButton>
                   </div>
+                  {props.modelGroupOptions[index]?.length > 0 ? (
+                    <div className="provider-model-group-options">
+                      <div className="provider-model-group-title">接口返回了可用分组，选择一个填入模型列表</div>
+                      <div className="provider-model-group-list">
+                        {props.modelGroupOptions[index].map((group) => (
+                          <button key={group.groupName} type="button" onClick={() => updateApiKey(index, { label: group.groupName, models: group.models, lastCheckedAt: new Date().toISOString() })}>
+                            <span>{group.groupName}</span>
+                            <strong>{group.models.length} 个模型</strong>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  <label className="mt-3 block">
+                    模型列表（可手动输入）
+                    <textarea
+                      className="field"
+                      rows={Math.max(3, Math.min(8, apiKey.models.length || 3))}
+                      value={serializeModelText(apiKey.models)}
+                      placeholder="自动获取失败时可手动填写，例如：\ngpt-4.1\ngpt-4.1-mini"
+                      onChange={(event) => updateApiKey(index, { models: parseModelText(event.target.value) })}
+                    />
+                    <span className="field-hint">支持换行、逗号、空格分隔；保存后会同步到该供应商的可选模型。</span>
+                  </label>
                   {apiKey.models.length > 0 ? (
                     <div className="mt-3 flex flex-wrap gap-2">
                       {apiKey.models.slice(0, 24).map((model) => (
@@ -2516,18 +2722,23 @@ function TemporaryAccountsView(props: {
   loading: boolean;
   error: string;
   checking: string | null;
+  deleting: string | null;
+  selectedAccountIds: string[];
+  onSelectedAccountIds: (ids: string[]) => void;
   onDraft: (value: TemporaryAccountImportDraft) => void;
   onSubmit: (event: FormEvent) => void;
   onClose: () => void;
-  onCheck: (id?: string) => void;
-  onUpdate: (id: string, patch: Partial<TemporaryAccountGroup>) => void;
+  onCheck: () => void;
   onRetry: () => void;
   onStrategyChange: (strategy: GroupRouteStrategy) => void;
-  onDelete: (id: string) => void;
+  onDeleteAccount: (id: string) => void;
+  onDeleteSelected: () => void;
 }) {
   const groups = props.snapshot.temporaryAccountGroups || [];
   const openAiSite = props.snapshot.sites.find((site) => site.addresses.some((address) => address.baseUrl.includes("api.openai.com")));
   const totalAccounts = groups.reduce((total, group) => total + group.accounts.length, 0);
+  const totalAvailabilityStats = temporaryAccountAvailabilityStats(groups.flatMap((group) => group.accounts));
+  const selectedAccountIdSet = new Set(props.selectedAccountIds);
   const temporaryAccountStrategy = props.snapshot.settings.temporaryAccountStrategy || "sequential";
   const hasImportContent = props.draft.content.trim() || props.draft.contents.some((content) => content.trim());
   const readImportFiles = async (files?: FileList | null) => {
@@ -2558,43 +2769,60 @@ function TemporaryAccountsView(props: {
           </ActionButton>
         </div>
       ) : groups.length === 0 ? (
-        <div className="center-empty">暂无临时账号，导入 CPA 或 SubAPI 数据后可供 OpenAI 路由使用</div>
+        <section className="temp-account-empty panel">
+          <div className="temp-account-empty-mark"><Upload className="h-5 w-5" /></div>
+          <div>
+            <h2>暂无临时账号</h2>
+            <p>选择 GPT、Grok、Claude 或 Gemini 类型后导入 Sub2API / CPA 数据。</p>
+          </div>
+        </section>
       ) : (
-        <section className="panel p-4">
-          <div className="form-head">
+        <section className="temp-account-surface panel">
+          <div className="temp-account-overview">
             <div>
               <h2>临时账号池</h2>
-              <div className="mt-1 text-xs font-bold text-ink/55">
-                {groups.length} 个账号组 / {totalAccounts} 个账号 / {openAiSite?.name || "OpenAI"}
-              </div>
+              <p>{groups.length} 个类型 / {totalAccounts} 个账号 / {openAiSite?.name || "OpenAI"}</p>
             </div>
-            <div className="temp-account-toolbar">
-              <ActionButton type="button" tone="ghost" disabled={props.checking !== null || totalAccounts === 0} onClick={() => props.onCheck()}>
-                <RefreshCw className={`h-4 w-4 ${props.checking === "all" ? "animate-spin" : ""}`} />
-                检查账号
-              </ActionButton>
-              <label className="temp-account-strategy">
-                <span>全局复用策略</span>
-                <SelectInput value={temporaryAccountStrategy} onChange={(event) => props.onStrategyChange(event.target.value as GroupRouteStrategy)}>
-                  <option value="stable-first">{groupStrategyLabels["stable-first"]}</option>
-                  <option value="sequential">{groupStrategyLabels.sequential}</option>
-                  <option value="random">{groupStrategyLabels.random}</option>
-                </SelectInput>
-              </label>
+            <div className="temp-account-stats" aria-label="临时账号状态统计">
+              <span><strong>{totalAvailabilityStats.available}</strong>可用</span>
+              <span><strong>{totalAvailabilityStats.unavailable}</strong>不可用</span>
+              <span><strong>{totalAvailabilityStats.unknown}</strong>未检查</span>
             </div>
           </div>
-          <div className="site-list">
+          <div className="temp-account-toolbar">
+              <ActionButton type="button" tone="ghost" disabled={props.checking !== null || totalAccounts === 0} onClick={() => props.onCheck()}>
+                <RefreshCw className={`h-4 w-4 ${props.checking === "all" ? "animate-spin" : ""}`} />
+                检查 GPT
+              </ActionButton>
+              <ActionButton type="button" tone="danger" disabled={props.deleting !== null || props.selectedAccountIds.length === 0} onClick={props.onDeleteSelected}>
+                <Trash2 className="h-4 w-4" />
+                删除选中{props.selectedAccountIds.length > 0 ? ` ${props.selectedAccountIds.length}` : ""}
+              </ActionButton>
+            <label className="temp-account-strategy">
+              <span>全局复用策略</span>
+              <SelectInput value={temporaryAccountStrategy} onChange={(event) => props.onStrategyChange(event.target.value as GroupRouteStrategy)}>
+                <option value="stable-first">{groupStrategyLabels["stable-first"]}</option>
+                <option value="sequential">{groupStrategyLabels.sequential}</option>
+                <option value="random">{groupStrategyLabels.random}</option>
+              </SelectInput>
+            </label>
+          </div>
+          <div className="temp-account-groups">
             {groups.map((group) => {
-              const enabledAccounts = group.accounts.filter((account) => account.enabled);
               const availabilityStats = temporaryAccountAvailabilityStats(group.accounts);
               const models = Array.from(new Set(group.accounts.flatMap((account) => account.models))).sort();
               return (
-                <article key={group.id} className="record">
-                  <div className="min-w-0">
-                    <div className="record-title">{group.name}</div>
-                    <div className="record-meta">
-                      {temporaryAccountSourceLabels[group.source]} / {enabledAccounts.length} 个启用账号 / {availabilityStats.available} 可用 / {availabilityStats.unavailable} 不可用 / {availabilityStats.unknown} 未检查
+                <article key={group.id} className="temp-account-group-card">
+                  <div className="temp-account-group-head">
+                    <div>
+                      <div className="record-title">{temporaryAccountProviderLabels[group.providerType || "gpt"]}</div>
+                      <div className="record-meta">
+                        {group.accounts.length} 个账号 / {availabilityStats.available} 可用 / {availabilityStats.unavailable} 不可用 / {availabilityStats.unknown} 未检查
+                      </div>
                     </div>
+                    <span className="temp-account-type-badge">{temporaryAccountProviderLabels[group.providerType || "gpt"]}</span>
+                  </div>
+                  <div className="min-w-0">
                     <div className="temp-account-list">
                       {group.accounts.map((account) => {
                         const availability = account.availability || "unknown";
@@ -2602,11 +2830,25 @@ function TemporaryAccountsView(props: {
                           <div key={account.id} className={`temp-account-row temp-account-row-${availability}`}>
                             <div className="temp-account-row-main">
                               <div className="temp-account-row-title">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedAccountIdSet.has(account.id)}
+                                  onChange={(event) =>
+                                    props.onSelectedAccountIds(
+                                      event.target.checked
+                                        ? [...props.selectedAccountIds, account.id]
+                                        : props.selectedAccountIds.filter((id) => id !== account.id)
+                                    )
+                                  }
+                                  aria-label={`选择 ${account.label}`}
+                                />
                                 <span className={`account-status account-status-${availability}`}>
                                   {temporaryAccountAvailabilityLabels[availability]}
                                 </span>
-                                {!account.enabled ? <span className="account-status account-status-muted">停用</span> : null}
                                 <span className="temp-account-name">{account.label}</span>
+                                <button className="temp-account-delete" type="button" disabled={props.deleting !== null} onClick={() => props.onDeleteAccount(account.id)} title="删除账号">
+                                  {props.deleting === account.id ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                                </button>
                               </div>
                               <div className="temp-account-secret">
                                 {temporaryAccountTypeLabel(account)} / {account.prefix}...
@@ -2616,12 +2858,22 @@ function TemporaryAccountsView(props: {
                               </div>
                               {account.quotaStages.length > 0 ? (
                                 <div className="temp-account-quota-list">
-                                  {account.quotaStages.slice(0, 5).map((stage, index) => (
-                                    <span key={`${account.id}-${stage.label}-${index}`} className="temp-account-quota">
-                                      {temporaryAccountQuotaText(stage)}
-                                    </span>
-                                  ))}
-                                  {account.quotaStages.length > 5 ? <span className="temp-account-quota">+{account.quotaStages.length - 5} 项</span> : null}
+                                  {account.quotaStages.slice(0, 5).map((stage, index) => {
+                                    const percent = temporaryAccountQuotaPercent(stage);
+                                    return (
+                                      <div key={`${account.id}-${stage.label}-${index}`} className={`temp-account-quota temp-account-quota-${availability}`} title={temporaryAccountQuotaText(stage)}>
+                                        <div className="temp-account-quota-head">
+                                          <span>{stage.label}</span>
+                                          <strong>{formatQuotaPercent(percent)}</strong>
+                                        </div>
+                                        <div className="temp-account-quota-track" aria-label={temporaryAccountQuotaText(stage)}>
+                                          <div className="temp-account-quota-fill" style={{ width: `${percent ?? 0}%` }} />
+                                        </div>
+                                        <div className="temp-account-quota-text">{temporaryAccountQuotaText(stage)}</div>
+                                      </div>
+                                    );
+                                  })}
+                                  {account.quotaStages.length > 5 ? <span className="temp-account-quota-more">+{account.quotaStages.length - 5} 项</span> : null}
                                 </div>
                               ) : null}
                               {account.lastCheckError ? <div className="temp-account-error">{account.lastCheckError}</div> : null}
@@ -2644,19 +2896,6 @@ function TemporaryAccountsView(props: {
                       </div>
                     ) : null}
                   </div>
-                  <div className="record-actions">
-                    <ActionButton type="button" tone="ghost" disabled={props.checking !== null} onClick={() => props.onCheck(group.id)}>
-                      <RefreshCw className={`h-4 w-4 ${props.checking === group.id ? "animate-spin" : ""}`} />
-                      检查
-                    </ActionButton>
-                    <label className="toggle-row">
-                      <input type="checkbox" checked={group.enabled} onChange={(event) => props.onUpdate(group.id, { enabled: event.target.checked })} />
-                      启用
-                    </label>
-                    <ActionButton tone="danger" onClick={() => props.onDelete(group.id)} title="删除">
-                      <Trash2 className="h-4 w-4" />
-                    </ActionButton>
-                  </div>
                 </article>
               );
             })}
@@ -2678,23 +2917,18 @@ function TemporaryAccountsView(props: {
             </div>
             <div className="form-grid">
               <label>
-                账号组名称
-                <TextInput value={props.draft.name} onChange={(event) => props.onDraft({ ...props.draft, name: event.target.value })} />
-              </label>
-              <label>
-                导入类型
-                <SelectInput value={props.draft.source} onChange={(event) => props.onDraft({ ...props.draft, source: event.target.value as TemporaryAccountImportSource })}>
-                  <option value="cpa">{temporaryAccountSourceLabels.cpa}</option>
-                  <option value="subapi">{temporaryAccountSourceLabels.subapi}</option>
+                账号类型
+                <SelectInput value={props.draft.providerType} onChange={(event) => props.onDraft({ ...props.draft, providerType: event.target.value as TemporaryAccountProviderType, name: `${temporaryAccountProviderLabels[event.target.value as TemporaryAccountProviderType]} 临时账号` })}>
+                  <option value="gpt">{temporaryAccountProviderLabels.gpt}</option>
+                  <option value="grok">{temporaryAccountProviderLabels.grok}</option>
+                  <option value="claude">{temporaryAccountProviderLabels.claude}</option>
+                  <option value="gemini">{temporaryAccountProviderLabels.gemini}</option>
                 </SelectInput>
               </label>
               <label>
-                模型范围
-                <TextInput
-                  value={props.draft.modelsText}
-                  placeholder="留空表示全部模型，例如 gpt-5.5"
-                  onChange={(event) => props.onDraft({ ...props.draft, modelsText: event.target.value })}
-                />
+                数据格式
+                <TextInput value="自动识别 CPA / Sub2API / JSONL / 纯 token" disabled />
+                <span className="field-hint">无需手动选择，导入时会自动解析支持的账号格式。</span>
               </label>
               <label className="form-span-2">
                 导入文件
@@ -2758,14 +2992,14 @@ function KeysView(props: {
                 <article key={key.id} className="record">
                   <div className="min-w-0">
                     <div className="record-title">{key.name}</div>
-                    <div className="record-meta break-all">{fullKey || `${key.prefix}...`}</div>
+                    <div className="record-meta break-all">{fullKey || `${key.prefix}...（完整密钥仅生成时显示）`}</div>
                   </div>
                   <div className="record-actions">
                     <label className="toggle-row">
                       <input type="checkbox" checked={key.enabled} onChange={(event) => props.onToggle(key.id, event.target.checked)} />
                       启用
                     </label>
-                    <ActionButton tone="ghost" onClick={() => props.onCopy(fullKey || key.prefix)} title="复制密钥">
+                    <ActionButton tone="ghost" disabled={!fullKey} onClick={() => props.onCopy(fullKey)} title={fullKey ? "复制密钥" : "完整密钥仅生成时显示，无法从前缀还原"}>
                       <Copy className="h-4 w-4" />
                     </ActionButton>
                     <ActionButton tone="danger" onClick={() => props.onDelete(key.id)} title="删除">
@@ -2962,8 +3196,12 @@ function HeadersView(props: {
 
 function LogsView(props: {
   snapshot: AppSnapshot;
+  total: number;
+  page: number;
+  pageSize: number;
   autoRefresh: boolean;
   onAutoRefresh: (enabled: boolean) => void;
+  onPage: (page: number) => void;
   onDelete: (id: string) => void;
   onClear: () => void;
 }) {
@@ -2971,12 +3209,15 @@ function LogsView(props: {
   const logs = props.snapshot.requestLogs;
   const successCount = logs.filter((log) => log.status === "success").length;
   const failedCount = logs.length - successCount;
+  const totalPages = Math.max(1, Math.ceil(props.total / props.pageSize));
+  const pageStart = props.total === 0 ? 0 : props.page * props.pageSize + 1;
+  const pageEnd = Math.min(props.total, props.page * props.pageSize + logs.length);
   const header = (
     <div className="form-head">
       <div>
         <h2>请求日志</h2>
         <div className="mt-1 text-xs font-bold text-ink/55">
-          {logs.length} 条 / 成功 {successCount} / 失败 {failedCount} / 5 秒刷新
+          第 {props.page + 1} / {totalPages} 页，{pageStart}-{pageEnd} / 共 {props.total} 条 / 本页成功 {successCount} / 失败 {failedCount} / 5 秒刷新
         </div>
       </div>
       <div className="flex flex-wrap items-center justify-end gap-2">
@@ -2984,7 +3225,16 @@ function LogsView(props: {
           <input type="checkbox" checked={props.autoRefresh} onChange={(event) => props.onAutoRefresh(event.target.checked)} />
           自动刷新
         </label>
-        {logs.length > 0 ? (
+        <div className="logs-pagination">
+          <ActionButton type="button" tone="ghost" disabled={props.page <= 0} onClick={() => props.onPage(Math.max(0, props.page - 1))}>
+            上一页
+          </ActionButton>
+          <span>{props.page + 1} / {totalPages}</span>
+          <ActionButton type="button" tone="ghost" disabled={props.page >= totalPages - 1} onClick={() => props.onPage(Math.min(totalPages - 1, props.page + 1))}>
+            下一页
+          </ActionButton>
+        </div>
+        {props.total > 0 ? (
           <ActionButton tone="danger" onClick={props.onClear}>
             <Trash2 className="h-4 w-4" />
             清空

@@ -10,6 +10,8 @@ export type AppThemeId = "fresh" | "salt" | "citrus" | "rose" | "midnight";
 
 export type TemporaryAccountImportSource = "cpa" | "subapi";
 
+export type TemporaryAccountProviderType = "gpt" | "grok" | "claude" | "gemini";
+
 export type TemporaryAccountAvailability = "unknown" | "available" | "unavailable";
 
 export interface SiteAddress {
@@ -105,12 +107,27 @@ export interface ProviderModelSyncResult {
   results: ProviderModelSyncItemResult[];
 }
 
+export interface ProviderModelGroupOption {
+  groupName: string;
+  models: string[];
+}
+
+export interface ProviderModelDiscoverResult {
+  siteId: string;
+  siteName: string;
+  addressId: string;
+  addressLabel: string;
+  models: string[];
+  modelGroups?: ProviderModelGroupOption[];
+}
+
 export interface TemporaryAccount {
   id: string;
   label: string;
   prefix: string;
   secret: string;
   accountType?: "codex" | "openai-api-key";
+  providerType?: TemporaryAccountProviderType;
   accountId?: string;
   email?: string;
   refreshToken?: string;
@@ -139,6 +156,7 @@ export interface TemporaryAccountGroup {
   id: string;
   name: string;
   source: TemporaryAccountImportSource;
+  providerType?: TemporaryAccountProviderType;
   siteId: string;
   strategy?: GroupRouteStrategy;
   enabled: boolean;
@@ -149,7 +167,8 @@ export interface TemporaryAccountGroup {
 
 export interface TemporaryAccountImportInput {
   name?: string;
-  source: TemporaryAccountImportSource;
+  source?: TemporaryAccountImportSource;
+  providerType?: TemporaryAccountProviderType;
   content: string;
   contents?: string[];
   models?: string[];
@@ -292,6 +311,13 @@ export interface RequestLog {
   summary?: string;
 }
 
+export interface RequestLogPage {
+  items: RequestLog[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface AppSettings {
   maxRequestLogs: number;
   themeId: AppThemeId;
@@ -318,6 +344,15 @@ export interface AppDatabase {
 export interface AppSnapshot extends Omit<AppDatabase, "providerApiKeyGroups" | "adminPasswordHash"> {
   providerApiKeyGroups: ProviderApiKeyGroupView[];
   requestLogs: RequestLog[];
+  dbPath: string;
+  dataDir: string;
+  endpoints: EndpointKind[];
+  security: {
+    adminPasswordCustomized: boolean;
+  };
+}
+
+export interface AppBootstrap {
   dbPath: string;
   dataDir: string;
   endpoints: EndpointKind[];

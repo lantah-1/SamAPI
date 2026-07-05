@@ -41,7 +41,6 @@ const store = new JsonStore();
 const ADMIN_PASSWORD = process.env.SAMAPI_ADMIN_PASSWORD || "samapi-admin";
 const ADMIN_PASSWORD_IS_DEFAULT = !process.env.SAMAPI_ADMIN_PASSWORD;
 const ADMIN_SESSION_COOKIE = "samapi_admin";
-const ADMIN_SESSION_SECRET = process.env.SAMAPI_ADMIN_SESSION_SECRET || randomBytes(32).toString("base64url");
 const ADMIN_COOKIE_SECURE = process.env.SAMAPI_ADMIN_COOKIE_SECURE === "true";
 const routeRuntimeState = new Map<string, { stableCandidateKey?: string }>();
 const DEFAULT_CORS_HEADERS = [
@@ -246,8 +245,12 @@ function parseCookies(request: http.IncomingMessage) {
   return cookies;
 }
 
+function adminSessionSecret() {
+  return process.env.SAMAPI_ADMIN_SESSION_SECRET || store.getAdminPasswordHash() || hashText(ADMIN_PASSWORD).toString("hex");
+}
+
 function signAdminSession(payload: string) {
-  return createHmac("sha256", ADMIN_SESSION_SECRET).update(payload).digest("base64url");
+  return createHmac("sha256", adminSessionSecret()).update(payload).digest("base64url");
 }
 
 function adminSessionTtlMs() {
@@ -1283,6 +1286,56 @@ const CODEX_ORIGINATOR = "codex-tui";
 const CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_MODELS_URL = "https://api.openai.com/v1/models";
+const TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS = positiveIntegerEnv("SAMAPI_TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS", 15_000);
+const TEMPORARY_ACCOUNT_CHECK_CONCURRENCY = positiveIntegerEnv("SAMAPI_TEMPORARY_ACCOUNT_CHECK_CONCURRENCY", 6);
+
+function positiveIntegerEnv(name: string, fallback: number) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+async function fetchTemporaryAccountCheckText(input: Parameters<typeof fetch>[0], init: RequestInit = {}) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(input, {
+      ...init,
+      signal: controller.signal
+    });
+    return {
+      response,
+      text: await response.text()
+    };
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(`账号检查请求超时（${Math.round(TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS / 1000)} 秒）`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper: (item: T, index: number) => Promise<R>) {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await mapper(items[index], index);
+      }
+    })
+  );
+  return results;
+}
 
 interface CodexRateLimitWindowRecord {
   used_percent?: unknown;
@@ -1328,7 +1381,7 @@ async function refreshCodexTemporaryAccountToken(account: TemporaryAccount) {
     refresh_token: account.refreshToken.trim(),
     scope: "openid profile email"
   });
-  const response = await fetch(CODEX_OAUTH_TOKEN_URL, {
+  const { response, text } = await fetchTemporaryAccountCheckText(CODEX_OAUTH_TOKEN_URL, {
     method: "POST",
     headers: {
       Accept: "application/json",
@@ -1336,7 +1389,6 @@ async function refreshCodexTemporaryAccountToken(account: TemporaryAccount) {
     },
     body
   });
-  const text = await response.text();
   if (!response.ok) throw new Error(`刷新 Codex token 失败：${response.status} ${extractUpstreamError(text)}`);
   const payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
   const accessToken = typeof payload.access_token === "string" ? payload.access_token.trim() : "";
@@ -1458,13 +1510,9 @@ function codexUsageCheckResult(payload: unknown) {
 }
 
 async function fetchCodexUsage(account: TemporaryAccount, accessToken = account.secret) {
-  const response = await fetch(CODEX_USAGE_URL, {
+  return fetchTemporaryAccountCheckText(CODEX_USAGE_URL, {
     headers: codexQuotaHeaders(account, accessToken)
   });
-  return {
-    response,
-    text: await response.text()
-  };
 }
 
 async function checkCodexTemporaryAccount(account: TemporaryAccount, checkedAt: string) {
@@ -1557,13 +1605,12 @@ async function checkCodexTemporaryAccount(account: TemporaryAccount, checkedAt: 
 }
 
 async function checkOpenAiApiKeyTemporaryAccount(account: TemporaryAccount, checkedAt: string) {
-  const response = await fetch(OPENAI_MODELS_URL, {
+  const { response, text } = await fetchTemporaryAccountCheckText(OPENAI_MODELS_URL, {
     headers: {
       Authorization: `Bearer ${account.secret}`,
       Accept: "application/json"
     }
   });
-  const text = await response.text();
   if (!response.ok) {
     const errorMessage = extractUpstreamError(text) || `HTTP ${response.status}`;
     return {
@@ -1647,10 +1694,9 @@ async function checkTemporaryAccount(groupId: string, account: TemporaryAccount)
 async function checkTemporaryAccounts(groupId?: string): Promise<TemporaryAccountCheckResult> {
   const targets = store.temporaryAccountCheckTargets(groupId);
   if (groupId && targets.length === 0) throw new Error("临时账号组不存在");
-  const results: TemporaryAccountCheckItemResult[] = [];
-  for (const { group, account } of targets) {
-    results.push(await checkTemporaryAccount(group.id, account));
-  }
+  const results = await mapWithConcurrency(targets, TEMPORARY_ACCOUNT_CHECK_CONCURRENCY, ({ group, account }) =>
+    checkTemporaryAccount(group.id, account)
+  );
   return {
     total: results.length,
     available: results.filter((item) => item.availability === "available").length,
@@ -2059,25 +2105,48 @@ function parseModelList(payload: unknown) {
   ).sort();
 }
 
-function parseNewApiPriceModels(payload: unknown, apiKeyName: string) {
-  const source =
-    payload && typeof payload === "object" && "data" in payload
-      ? (payload as { data?: unknown }).data
-      : payload;
+function newApiPriceSource(payload: unknown) {
+  return payload && typeof payload === "object" && "data" in payload
+    ? (payload as { data?: unknown }).data
+    : payload;
+}
+
+function parseNewApiPriceGroups(payload: unknown) {
+  const source = newApiPriceSource(payload);
   if (!Array.isArray(source)) return [];
-  return Array.from(
-    new Set(
-      source
-        .map((item) => {
-          if (!item || typeof item !== "object") return "";
-          const groups = "enable_groups" in item ? (item as { enable_groups?: unknown }).enable_groups : [];
-          if (!Array.isArray(groups) || !groups.some((group) => group === apiKeyName)) return "";
-          const modelName = "model_name" in item ? (item as { model_name?: unknown }).model_name : undefined;
-          return typeof modelName === "string" ? modelName.trim() : "";
-        })
-        .filter(Boolean)
-    )
-  ).sort();
+  const groups = new Map<string, Set<string>>();
+  for (const item of source) {
+    if (!item || typeof item !== "object") continue;
+    const modelName = "model_name" in item ? (item as { model_name?: unknown }).model_name : undefined;
+    const normalizedModel = typeof modelName === "string" ? modelName.trim() : "";
+    if (!normalizedModel) continue;
+    const enableGroups = "enable_groups" in item ? (item as { enable_groups?: unknown }).enable_groups : [];
+    if (!Array.isArray(enableGroups)) continue;
+    for (const group of enableGroups) {
+      const groupName = typeof group === "string" ? group.trim() : "";
+      if (!groupName) continue;
+      const models = groups.get(groupName) || new Set<string>();
+      models.add(normalizedModel);
+      groups.set(groupName, models);
+    }
+  }
+  return Array.from(groups.entries())
+    .map(([groupName, models]) => ({ groupName, models: Array.from(models).sort() }))
+    .sort((left, right) => left.groupName.localeCompare(right.groupName));
+}
+
+function parseNewApiPriceModels(payload: unknown, apiKeyName: string) {
+  return parseNewApiPriceGroups(payload).find((group) => group.groupName === apiKeyName)?.models || [];
+}
+
+class ModelDiscoveryOptionsError extends Error {
+  readonly modelGroups: Array<{ groupName: string; models: string[] }>;
+
+  constructor(message: string, modelGroups: Array<{ groupName: string; models: string[] }>) {
+    super(message);
+    this.name = "ModelDiscoveryOptionsError";
+    this.modelGroups = modelGroups;
+  }
 }
 
 function recordModelDiscoveryLog(input: {
@@ -2332,9 +2401,10 @@ async function discoverProviderModels(siteId: string, apiKey: string, apiKeyName
           continue;
         }
         const models = parseModelList(payload);
+        const modelGroups = targetEntry.discoveryType === "newapi-pricing" ? parseNewApiPriceGroups(payload) : [];
         const resolvedModels =
           targetEntry.discoveryType === "newapi-pricing"
-            ? parseNewApiPriceModels(payload, apiKeyNameValue)
+            ? modelGroups.find((group) => group.groupName === apiKeyNameValue)?.models || []
             : models;
         if (resolvedModels.length === 0) {
           const errorMessage =
@@ -2359,6 +2429,9 @@ async function discoverProviderModels(siteId: string, apiKey: string, apiKeyName
             errorMessage,
             usesApiKey: targetEntry.usesApiKey
           });
+          if (targetEntry.discoveryType === "newapi-pricing" && modelGroups.length > 0) {
+            throw new ModelDiscoveryOptionsError(errorMessage, modelGroups);
+          }
           continue;
         }
         recordModelDiscoveryLog({
@@ -2531,17 +2604,20 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
 
     if (!requireAdminSession(request, response, url)) return;
 
-    if (method === "GET" && url.pathname === "/api/snapshot") {
-      sendJson(response, 200, store.snapshot());
-      return;
-    }
-
-    if (method === "GET" && url.pathname === "/api/snapshot/initial") {
-      sendJson(response, 200, store.snapshot({ includeRequestLogs: false, includeTemporaryAccounts: false }));
+    if (method === "GET" && url.pathname === "/api/bootstrap") {
+      sendJson(response, 200, {
+        dbPath: store.sqlitePath,
+        dataDir: store.dataDir,
+        endpoints: ["messages", "chat/completions", "responses"],
+        security: {
+          adminPasswordCustomized: Boolean(store.getDb().adminPasswordHash)
+        }
+      });
       return;
     }
 
     if (parts[1] === "settings") {
+      if (method === "GET") return sendJson(response, 200, store.getDb().settings);
       if (method === "PATCH") return sendJson(response, 200, store.updateSettings(await readJson(request)));
     }
 
@@ -2555,7 +2631,20 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
     }
 
     if (parts[1] === "logs") {
-      if (method === "GET") return sendJson(response, 200, store.listRequestLogs());
+      if (method === "GET") {
+        const requestedLimit = Number(url.searchParams.get("limit") || "");
+        const requestedOffset = Number(url.searchParams.get("offset") || "");
+        const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(100, Math.floor(requestedLimit)) : 5;
+        const offset = Number.isFinite(requestedOffset) && requestedOffset > 0 ? Math.floor(requestedOffset) : 0;
+        const since = url.searchParams.get("since") || "";
+        const items = since ? store.listNewRequestLogs(since, limit) : store.listRequestLogs(limit, offset);
+        return sendJson(response, 200, {
+          items,
+          total: store.requestLogCount(),
+          limit,
+          offset: since ? 0 : offset
+        });
+      }
       if (method === "DELETE" && parts[2] === "clear") {
         store.clearRequestLogs();
         return sendJson(response, 200, { ok: true });
@@ -2599,7 +2688,7 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
         );
       }
       if (method === "POST" && parts[2] === "sync-models") return sendJson(response, 200, await syncAllProviderModels(request));
-      if (method === "GET") return sendJson(response, 200, store.snapshot({ includeRequestLogs: false, includeTemporaryAccounts: false }).providerApiKeyGroups);
+      if (method === "GET") return sendJson(response, 200, store.listProviderApiKeyGroups());
       if (method === "POST") return sendJson(response, 201, store.upsertProviderApiKeyGroup(await readJson(request)));
       if (method === "DELETE") {
         store.deleteProviderApiKeyGroup(routeParam(parts, 2));
@@ -2611,12 +2700,20 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
       if (method === "GET") return sendJson(response, 200, store.getDb().temporaryAccountGroups);
       if (method === "POST" && parts[2] === "import") {
         const imported = store.importTemporaryAccounts(await readJson(request));
-        const checkResult = await checkTemporaryAccounts(imported.group.id);
+        const checkResult = imported.group.providerType === "gpt" ? await checkTemporaryAccounts(imported.group.id) : undefined;
         const updatedGroup = store.getDb().temporaryAccountGroups.find((group) => group.id === imported.group.id) || imported.group;
         return sendJson(response, 201, { ...imported, group: updatedGroup, checkResult });
       }
       if (method === "POST" && parts[2] === "check") return sendJson(response, 200, await checkTemporaryAccounts());
-      if (method === "POST" && parts[3] === "check") return sendJson(response, 200, await checkTemporaryAccounts(routeParam(parts, 2)));
+      if (method === "DELETE" && parts[2] === "batch") {
+        const body = await readJson(request);
+        store.deleteTemporaryAccounts(Array.isArray(body.ids) ? body.ids.map(String) : []);
+        return sendJson(response, 200, { ok: true });
+      }
+      if (method === "DELETE" && parts[2] === "accounts") {
+        store.deleteTemporaryAccount(routeParam(parts, 3));
+        return sendJson(response, 200, { ok: true });
+      }
       if (method === "PATCH") return sendJson(response, 200, store.updateTemporaryAccountGroup(routeParam(parts, 2), await readJson(request)));
       if (method === "DELETE") {
         store.deleteTemporaryAccountGroup(routeParam(parts, 2));
@@ -2646,6 +2743,10 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
 
     notFound(response);
   } catch (error) {
+    if (error instanceof ModelDiscoveryOptionsError) {
+      sendJson(response, 400, { error: error.message, modelGroups: error.modelGroups });
+      return;
+    }
     sendJson(response, 400, { error: error instanceof Error ? error.message : "Bad request" });
   }
 }
