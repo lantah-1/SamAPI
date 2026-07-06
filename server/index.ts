@@ -1052,6 +1052,13 @@ function applyStreamingFlag(body: unknown, stream: boolean) {
   return isRecord(body) ? { ...body, stream } : body;
 }
 
+function sanitizeOpenAiCompatibleResponsesBody(body: unknown, routeEndpoint: RouteEndpointKind) {
+  if (routeEndpoint !== "responses" || !isRecord(body)) return body;
+  const sanitized = { ...body };
+  delete sanitized.metadata;
+  return sanitized;
+}
+
 function maskedStringHeaders(headers: Record<string, string>) {
   const masked: Record<string, string> = {};
   for (const [key, value] of Object.entries(headers)) {
@@ -1286,6 +1293,8 @@ const CODEX_ORIGINATOR = "codex-tui";
 const CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_MODELS_URL = "https://api.openai.com/v1/models";
+const CHATGPT_MODELS_URL = "https://chatgpt.com/backend-api/models";
+const CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL = "ChatGPT 官方";
 const TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS = positiveIntegerEnv("SAMAPI_TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS", 15_000);
 const TEMPORARY_ACCOUNT_CHECK_CONCURRENCY = positiveIntegerEnv("SAMAPI_TEMPORARY_ACCOUNT_CHECK_CONCURRENCY", 6);
 
@@ -1691,12 +1700,7 @@ async function checkTemporaryAccount(groupId: string, account: TemporaryAccount)
   }
 }
 
-async function checkTemporaryAccounts(groupId?: string): Promise<TemporaryAccountCheckResult> {
-  const targets = store.temporaryAccountCheckTargets(groupId);
-  if (groupId && targets.length === 0) throw new Error("临时账号组不存在");
-  const results = await mapWithConcurrency(targets, TEMPORARY_ACCOUNT_CHECK_CONCURRENCY, ({ group, account }) =>
-    checkTemporaryAccount(group.id, account)
-  );
+function temporaryAccountCheckResult(results: TemporaryAccountCheckItemResult[]): TemporaryAccountCheckResult {
   return {
     total: results.length,
     available: results.filter((item) => item.availability === "available").length,
@@ -1704,6 +1708,29 @@ async function checkTemporaryAccounts(groupId?: string): Promise<TemporaryAccoun
     unknown: results.filter((item) => item.availability === "unknown").length,
     results
   };
+}
+
+async function checkTemporaryAccounts(groupId?: string): Promise<TemporaryAccountCheckResult> {
+  const targets = store.temporaryAccountCheckTargets(groupId);
+  if (groupId && targets.length === 0) throw new Error("临时账号组不存在");
+  const results = await mapWithConcurrency(targets, TEMPORARY_ACCOUNT_CHECK_CONCURRENCY, ({ group, account }) =>
+    checkTemporaryAccount(group.id, account)
+  );
+  return temporaryAccountCheckResult(results);
+}
+
+async function checkTemporaryAccountIds(accountIds: string[]): Promise<TemporaryAccountCheckResult> {
+  const targets = accountIds.map((accountId) => store.temporaryAccountCheckTarget(accountId));
+  if (targets.some((target) => !target)) throw new Error("临时账号不存在或不支持刷新");
+  const validTargets = targets.filter((target): target is NonNullable<typeof target> => Boolean(target));
+  const results = await mapWithConcurrency(validTargets, TEMPORARY_ACCOUNT_CHECK_CONCURRENCY, ({ group, account }) =>
+    checkTemporaryAccount(group.id, account)
+  );
+  return temporaryAccountCheckResult(results);
+}
+
+async function checkSingleTemporaryAccount(accountId: string): Promise<TemporaryAccountCheckResult> {
+  return checkTemporaryAccountIds([accountId]);
 }
 
 function shouldMarkTemporaryAccountUnavailable(statusCode: number, errorMessage = "") {
@@ -1966,7 +1993,9 @@ function resolveProxyExecution(routeNameOrId: string) {
     const site = db.sites.find((item) => item.id === route.siteId);
     const addresses = site ? enabledSiteAddresses(site) : [];
     if (!site || addresses.length === 0) throw new Error("路由绑定的供应商地址不可用");
-    const temporaryAccounts = store.isOfficialOpenAiSite(site.id) ? store.resolveTemporaryOpenAiAccounts(route.model) : [];
+    const officialProviderApiKey = store.resolveProviderApiKey(site.id, route.model);
+    const useChatGptOfficial = officialProviderApiKey?.kind === "chatgpt-official";
+    const temporaryAccounts = useChatGptOfficial || store.isOfficialOpenAiSite(site.id) ? store.resolveTemporaryOpenAiAccounts(route.model) : [];
     if (temporaryAccounts.length > 0) {
       const candidates: ProxyExecutionCandidate[] = temporaryAccounts.map((temporaryAccount, index) => {
         const temporaryAccountIsCodex = temporaryAccount.accountType === "codex" || Boolean(temporaryAccount.accountId);
@@ -1991,7 +2020,7 @@ function resolveProxyExecution(routeNameOrId: string) {
         site,
         addresses,
         model: route.model,
-        providerApiKey: store.resolveProviderApiKey(site.id, route.model),
+        providerApiKey: officialProviderApiKey,
         headerTemplate: routeHeaderTemplate(route),
         index: 0
       }
@@ -2026,6 +2055,22 @@ function resolveProxyExecution(routeNameOrId: string) {
     const group = db.providerApiKeyGroups.find((item) => item.siteId === member.siteId && item.apiKeys.some((apiKey) => apiKey.id === member.apiKeyId));
     const apiKey = group?.apiKeys.find((item) => item.id === member.apiKeyId);
     if (!apiKey?.enabled || !apiKey.models.includes(member.model)) continue;
+    if (apiKey.kind === "chatgpt-official") {
+      for (const temporaryAccount of store.resolveTemporaryOpenAiAccounts(member.model)) {
+        const temporaryAccountIsCodex = temporaryAccount.accountType === "codex" || Boolean(temporaryAccount.accountId);
+        candidates.push({
+          site,
+          addresses,
+          model: member.model,
+          providerApiKey: temporaryAccountIsCodex ? undefined : temporaryAccount,
+          temporaryAccount: temporaryAccountIsCodex ? temporaryAccount : undefined,
+          temporaryApiKeyAccount: temporaryAccountIsCodex ? undefined : temporaryAccount,
+          headerTemplate,
+          index: candidates.length
+        });
+      }
+      continue;
+    }
     candidates.push({
       site,
       addresses,
@@ -2088,7 +2133,9 @@ function parseModelList(payload: unknown) {
       ? (payload as { data?: unknown }).data
       : payload && typeof payload === "object" && "models" in payload
         ? (payload as { models?: unknown }).models
-        : payload;
+        : payload && typeof payload === "object" && "items" in payload
+          ? (payload as { items?: unknown }).items
+          : payload;
   if (!Array.isArray(source)) return [];
   return Array.from(
     new Set(
@@ -2096,6 +2143,7 @@ function parseModelList(payload: unknown) {
         .map((item) => {
           if (typeof item === "string") return item;
           if (item && typeof item === "object" && "id" in item) return String((item as { id?: unknown }).id || "");
+          if (item && typeof item === "object" && "slug" in item) return String((item as { slug?: unknown }).slug || "");
           if (item && typeof item === "object" && "name" in item) return String((item as { name?: unknown }).name || "");
           return "";
         })
@@ -2210,10 +2258,110 @@ function recordModelDiscoveryLog(input: {
   });
 }
 
-async function discoverProviderModels(siteId: string, apiKey: string, apiKeyName: string, request: http.IncomingMessage) {
+async function discoverChatGptOfficialModels(siteId: string, site: Site, request: http.IncomingMessage, discoveryStartedAt: number) {
+  const account = store.resolveTemporaryOpenAiAccounts("")[0];
+  if (!account) {
+    recordModelDiscoveryLog({
+      request,
+      siteId,
+      site,
+      apiKeyValue: "",
+      apiKeyName: CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL,
+      discoveryType: "chatgpt-official-models",
+      status: "failed",
+      statusCode: 400,
+      startedAt: discoveryStartedAt,
+      errorMessage: "请先在临时账号页导入 GPT 官方账号"
+    });
+    throw new Error("请先在临时账号页导入 GPT 官方账号");
+  }
+
+  let accessToken = account.secret;
+  let tokenPatch: Awaited<ReturnType<typeof refreshCodexTemporaryAccountToken>> | undefined;
+  const fetchModels = () => fetchTemporaryAccountCheckText(CHATGPT_MODELS_URL, {
+    headers: codexQuotaHeaders(account, accessToken)
+  });
+  let attempt = await fetchModels();
+  if ([401, 403].includes(attempt.response.status) && account.refreshToken) {
+    tokenPatch = await refreshCodexTemporaryAccountToken(account);
+    if (tokenPatch?.secret) {
+      accessToken = tokenPatch.secret;
+      attempt = await fetchModels();
+    }
+  }
+  if (tokenPatch) store.updateTemporaryAccountCheckResult(account.id, tokenPatch);
+
+  const contentType = attempt.response.headers.get("content-type") || "";
+  if (!attempt.response.ok) {
+    const errorMessage = extractUpstreamError(attempt.text) || `HTTP ${attempt.response.status}`;
+    recordModelDiscoveryLog({
+      request,
+      siteId,
+      site,
+      target: CHATGPT_MODELS_URL,
+      apiKeyValue: "",
+      apiKeyName: CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL,
+      discoveryType: "chatgpt-official-models",
+      status: "failed",
+      statusCode: attempt.response.status,
+      startedAt: discoveryStartedAt,
+      contentType,
+      responseText: attempt.text,
+      errorMessage,
+      usesApiKey: false
+    });
+    throw new Error(`ChatGPT 官方模型同步失败：${errorMessage}`);
+  }
+
+  let payload: unknown = {};
+  try {
+    payload = attempt.text ? JSON.parse(attempt.text) : {};
+  } catch {
+    const errorMessage = "返回内容不是合法 JSON";
+    recordModelDiscoveryLog({
+      request,
+      siteId,
+      site,
+      target: CHATGPT_MODELS_URL,
+      apiKeyValue: "",
+      apiKeyName: CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL,
+      discoveryType: "chatgpt-official-models",
+      status: "failed",
+      statusCode: attempt.response.status,
+      startedAt: discoveryStartedAt,
+      contentType,
+      responseText: attempt.text,
+      errorMessage,
+      usesApiKey: false
+    });
+    throw new Error(errorMessage);
+  }
+  const models = parseModelList(payload);
+  if (models.length === 0) throw new Error("ChatGPT 官方模型同步失败：未解析到模型列表");
+  recordModelDiscoveryLog({
+    request,
+    siteId,
+    site,
+    target: CHATGPT_MODELS_URL,
+    apiKeyValue: "",
+    apiKeyName: CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL,
+    discoveryType: "chatgpt-official-models",
+    status: "success",
+    statusCode: attempt.response.status,
+    startedAt: discoveryStartedAt,
+    contentType,
+    responseText: attempt.text,
+    models,
+    usesApiKey: false
+  });
+  return { siteId, siteName: site.name, addressId: site.addresses[0]?.id || "", addressLabel: site.addresses[0]?.label || "官方 API", models };
+}
+
+async function discoverProviderModels(siteId: string, apiKey: string, apiKeyName: string, request: http.IncomingMessage, kind = "api-key") {
   const discoveryStartedAt = Date.now();
   const apiKeyValue = apiKey.trim();
   const apiKeyNameValue = apiKeyName.trim();
+  const isChatGptOfficial = !apiKeyValue && (kind === "chatgpt-official" || store.isOfficialOpenAiSite(siteId));
   if (!siteId) {
     recordModelDiscoveryLog({
       request,
@@ -2229,7 +2377,7 @@ async function discoverProviderModels(siteId: string, apiKey: string, apiKeyName
   }
   const maskedApiKey = maskSecret(apiKeyValue);
   const site = store.getDb().sites.find((item) => item.id === siteId);
-  if (!apiKeyValue) {
+  if (!apiKeyValue && !isChatGptOfficial) {
     recordModelDiscoveryLog({
       request,
       siteId,
@@ -2256,6 +2404,8 @@ async function discoverProviderModels(siteId: string, apiKey: string, apiKeyName
     });
     throw new Error("供应商不存在");
   }
+  if (isChatGptOfficial) return discoverChatGptOfficialModels(siteId, site, request, discoveryStartedAt);
+
   const discoveryType = site.siteType === "newapi" ? "newapi-pricing" : "openai-models";
   if (site.siteType === "newapi" && !apiKeyNameValue) {
     recordModelDiscoveryLog({
@@ -2489,14 +2639,15 @@ async function syncAllProviderModels(request: http.IncomingMessage): Promise<Pro
         siteId: group.siteId,
         siteName: site?.name || group.groupName,
         apiKeyLabel: apiKey.label,
-        secret: apiKey.secret
+        secret: apiKey.secret,
+        kind: apiKey.kind || "api-key"
       }));
   });
   const results: ProviderModelSyncResult["results"] = [];
 
   for (const target of targets) {
     try {
-      const discovered = await discoverProviderModels(target.siteId, target.secret, target.apiKeyLabel, request);
+      const discovered = await discoverProviderModels(target.siteId, target.secret, target.apiKeyLabel, request, target.kind);
       const checkedAt = new Date().toISOString();
       store.updateProviderApiKeyModels(target.groupId, target.apiKeyId, discovered.models, checkedAt);
       results.push({
@@ -2684,7 +2835,7 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
         return sendJson(
           response,
           200,
-          await discoverProviderModels(String(body.siteId || ""), String(body.apiKey || ""), String(body.apiKeyName || ""), request)
+          await discoverProviderModels(String(body.siteId || ""), String(body.apiKey || ""), String(body.apiKeyName || ""), request, String(body.kind || "api-key"))
         );
       }
       if (method === "POST" && parts[2] === "sync-models") return sendJson(response, 200, await syncAllProviderModels(request));
@@ -2700,7 +2851,7 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
       if (method === "GET") return sendJson(response, 200, store.getDb().temporaryAccountGroups);
       if (method === "POST" && parts[2] === "import") {
         const imported = store.importTemporaryAccounts(await readJson(request));
-        const checkResult = imported.group.providerType === "gpt" ? await checkTemporaryAccounts(imported.group.id) : undefined;
+        const checkResult = imported.group.providerType === "gpt" ? await checkTemporaryAccountIds(imported.accountIds) : undefined;
         const updatedGroup = store.getDb().temporaryAccountGroups.find((group) => group.id === imported.group.id) || imported.group;
         return sendJson(response, 201, { ...imported, group: updatedGroup, checkResult });
       }
@@ -2710,9 +2861,14 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
         store.deleteTemporaryAccounts(Array.isArray(body.ids) ? body.ids.map(String) : []);
         return sendJson(response, 200, { ok: true });
       }
-      if (method === "DELETE" && parts[2] === "accounts") {
-        store.deleteTemporaryAccount(routeParam(parts, 3));
-        return sendJson(response, 200, { ok: true });
+      if (parts[2] === "accounts") {
+        const accountId = routeParam(parts, 3);
+        if (method === "POST" && parts[4] === "check") return sendJson(response, 200, await checkSingleTemporaryAccount(accountId));
+        if (method === "PATCH") return sendJson(response, 200, store.updateTemporaryAccount(accountId, await readJson(request)));
+        if (method === "DELETE") {
+          store.deleteTemporaryAccount(accountId);
+          return sendJson(response, 200, { ok: true });
+        }
       }
       if (method === "PATCH") return sendJson(response, 200, store.updateTemporaryAccountGroup(routeParam(parts, 2), await readJson(request)));
       if (method === "DELETE") {
@@ -2922,10 +3078,11 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
             }
         : {
             "upstream-authorization": "Header 模版已提供"
-          };
+      };
       const converted = convertedRouteRequestBody(body, candidate.model, route.endpoint, proxyInfo.kind);
       const responseConverter = converted.converter;
-      const forwardedBody = downstreamStream ? applyStreamingFlag(converted.body, true) : converted.body;
+      const sanitizedBody = sanitizeOpenAiCompatibleResponsesBody(converted.body, route.endpoint);
+      const forwardedBody = downstreamStream ? applyStreamingFlag(sanitizedBody, true) : sanitizedBody;
       const upstreamRequestHeaders = {
         ...maskedStringHeaders(headers),
         ...upstreamAuthLog

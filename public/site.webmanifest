@@ -1,0 +1,17 @@
+{
+  "name": "SamAPI Console",
+  "short_name": "SamAPI",
+  "description": "本地模型路由控制台，用于统一管理模型供应商、API Key、Header 模版和代理路由。",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -114,10 +114,10 @@ export const api = {
     }),
   listProviderKeyGroups: () => request<ProviderApiKeyGroupView[]>("/api/provider-key-groups"),
   deleteProviderKeyGroup: (id: string) => request<{ ok: true }>(`/api/provider-key-groups/${id}`, { method: "DELETE" }),
-  discoverProviderModels: (siteId: string, apiKey: string, apiKeyName: string) =>
+  discoverProviderModels: (siteId: string, apiKey: string, apiKeyName: string, kind?: string) =>
     request<ProviderModelDiscoverResult>("/api/provider-key-groups/discover-models", {
       method: "POST",
-      body: JSON.stringify({ siteId, apiKey, apiKeyName })
+      body: JSON.stringify({ siteId, apiKey, apiKeyName, kind })
     }),
   syncProviderModels: () => request<ProviderModelSyncResult>("/api/provider-key-groups/sync-models", { method: "POST" }),
   listTemporaryAccountGroups: () => request<TemporaryAccountGroup[]>("/api/temporary-accounts"),
@@ -127,6 +127,12 @@ export const api = {
       body: JSON.stringify(input)
     }),
   checkTemporaryAccounts: () => request<TemporaryAccountCheckResult>("/api/temporary-accounts/check", { method: "POST" }),
+  checkTemporaryAccount: (id: string) => request<TemporaryAccountCheckResult>(`/api/temporary-accounts/accounts/${id}/check`, { method: "POST" }),
+  updateTemporaryAccount: (id: string, body: Partial<TemporaryAccountGroup["accounts"][number]>) =>
+    request<TemporaryAccountGroup["accounts"][number]>(`/api/temporary-accounts/accounts/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body)
+    }),
   deleteTemporaryAccount: (id: string) => request<{ ok: true }>(`/api/temporary-accounts/accounts/${id}`, { method: "DELETE" }),
   deleteTemporaryAccounts: (ids: string[]) =>
     request<{ ok: true }>("/api/temporary-accounts/batch", {

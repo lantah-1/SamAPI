@@ -35,6 +35,7 @@ import type {
   GroupRouteStrategy,
   HeaderTemplate,
   ProviderApiKeyGroupView,
+  ProviderApiKeyKind,
   ProviderModelGroupOption,
   RequestLog,
   RouteRecord,
@@ -76,6 +77,7 @@ interface ProviderApiKeyDraft {
   id?: string;
   label: string;
   secret: string;
+  kind?: ProviderApiKeyKind;
   enabled: boolean;
   models: string[];
   lastCheckedAt?: string;
@@ -201,6 +203,38 @@ const themeOptions = [
     swatches: ["#0b1220", "#22d3ee", "#134e4a"]
   }
 ] satisfies Array<{ id: AppThemeId; name: string; description: string; swatches: string[] }>;
+
+function samApiIconSvg(accent: string, accentRaised: string, accentForeground: string) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="SamAPI">
+  <defs>
+    <linearGradient id="bg" x1="32" y1="6" x2="32" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="${accentRaised}"/>
+      <stop offset="1" stop-color="${accent}"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+  <path d="M32 10.5 48 17v13.5c0 10.2-6.9 19.7-16 23-9.1-3.3-16-12.8-16-23V17l16-6.5Z" fill="none" stroke="${accentForeground}" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="m24.5 32.5 5.2 5.2 10.8-11.4" fill="none" stroke="${accentForeground}" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+}
+
+function updateSiteChromeFromTheme() {
+  const styles = getComputedStyle(document.documentElement);
+  const accent = styles.getPropertyValue("--accent").trim() || "#0f766e";
+  const accentRaised = styles.getPropertyValue("--accent-raised").trim() || accent;
+  const accentForeground = styles.getPropertyValue("--accent-foreground").trim() || "#ffffff";
+  const faviconHref = `data:image/svg+xml,${encodeURIComponent(samApiIconSvg(accent, accentRaised, accentForeground))}`;
+  const iconLink = document.querySelector<HTMLLinkElement>('link[rel="icon"]') || document.createElement("link");
+  iconLink.rel = "icon";
+  iconLink.type = "image/svg+xml";
+  iconLink.href = faviconHref;
+  if (!iconLink.parentNode) document.head.appendChild(iconLink);
+
+  const themeColorMeta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]') || document.createElement("meta");
+  themeColorMeta.name = "theme-color";
+  themeColorMeta.content = accent;
+  if (!themeColorMeta.parentNode) document.head.appendChild(themeColorMeta);
+}
 
 const navItems = [
   { id: "routes", label: "路由管理", icon: Route },
@@ -424,12 +458,23 @@ function emptyHeader(): HeaderTemplateDraft {
   };
 }
 
+function isOfficialOpenAiSite(site?: Site) {
+  return Boolean(site?.addresses.some((address) => address.baseUrl.includes("api.openai.com")));
+}
+
+function emptyProviderApiKey(site?: Site, index = 0): ProviderApiKeyDraft {
+  if (isOfficialOpenAiSite(site)) {
+    return { label: "ChatGPT 官方", secret: "", kind: "chatgpt-official", enabled: true, models: [] };
+  }
+  return { label: `Key ${index + 1}`, secret: "", kind: "api-key", enabled: true, models: [] };
+}
+
 function emptyProviderKeyGroup(snapshot?: AppSnapshot): ProviderKeyGroupDraft {
   const site = snapshot?.sites[0];
   return {
     siteId: site?.id || "",
     groupName: site?.name || "",
-    apiKeys: [{ label: "Key 1", secret: "", enabled: true, models: [] }]
+    apiKeys: [emptyProviderApiKey(site)]
   };
 }
 
@@ -843,6 +888,7 @@ export default function App() {
   const [modelDiscoveringIndex, setModelDiscoveringIndex] = useState<number | null>(null);
   const [providerModelGroupOptions, setProviderModelGroupOptions] = useState<Record<number, ProviderModelGroupOption[]>>({});
   const [temporaryAccountChecking, setTemporaryAccountChecking] = useState<string | null>(null);
+  const [temporaryAccountUpdating, setTemporaryAccountUpdating] = useState<string | null>(null);
   const [temporaryAccountDeleting, setTemporaryAccountDeleting] = useState<string | null>(null);
   const [selectedTemporaryAccountIds, setSelectedTemporaryAccountIds] = useState<string[]>([]);
   const appScrollRef = useRef<HTMLDivElement | null>(null);
@@ -1096,6 +1142,7 @@ export default function App() {
     const themeId = snapshot?.settings.themeId || "fresh";
     document.documentElement.dataset.theme = themeId;
     document.documentElement.style.colorScheme = themeId === "midnight" ? "dark" : "light";
+    updateSiteChromeFromTheme();
   }, [snapshot?.settings.themeId]);
 
   useEffect(() => {
@@ -1245,6 +1292,40 @@ export default function App() {
     }
   };
 
+  const checkTemporaryAccount = async (id: string) => {
+    if (temporaryAccountChecking) return;
+    setTemporaryAccountChecking(id);
+    try {
+      const result = await api.checkTemporaryAccount(id);
+      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
+      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
+      setTemporaryAccountsLoaded(true);
+      setTemporaryAccountsLoading(false);
+      setToast(`GPT 账号刷新完成：${temporaryAccountCheckSummary(result)}`);
+    } catch (error) {
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号刷新失败");
+    } finally {
+      setTemporaryAccountChecking(null);
+    }
+  };
+
+  const updateTemporaryAccount = async (id: string, patch: Partial<TemporaryAccount>) => {
+    if (temporaryAccountUpdating) return;
+    setTemporaryAccountUpdating(id);
+    try {
+      await api.updateTemporaryAccount(id, patch);
+      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
+      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
+      setTemporaryAccountsLoaded(true);
+      setTemporaryAccountsLoading(false);
+      setToast("临时账号已更新");
+    } catch (error) {
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号更新失败");
+    } finally {
+      setTemporaryAccountUpdating(null);
+    }
+  };
+
   const deleteTemporaryAccount = async (id: string) => {
     if (temporaryAccountDeleting) return;
     setTemporaryAccountDeleting(id);
@@ -1328,6 +1409,7 @@ export default function App() {
         id: apiKey.id,
         label: apiKey.label,
         secret: apiKey.secret,
+        kind: apiKey.kind || "api-key",
         enabled: apiKey.enabled,
         models: apiKey.models,
         lastCheckedAt: apiKey.lastCheckedAt
@@ -1340,7 +1422,7 @@ export default function App() {
     const apiKey = providerKeyDraft.apiKeys[index];
     setModelDiscoveringIndex(index);
     try {
-      const result = await api.discoverProviderModels(providerKeyDraft.siteId, apiKey?.secret || "", apiKey?.label || "");
+      const result = await api.discoverProviderModels(providerKeyDraft.siteId, apiKey?.secret || "", apiKey?.label || "", apiKey?.kind);
       setProviderKeyDraft((current) => ({
         ...current,
         apiKeys: current.apiKeys.map((item, itemIndex) =>
@@ -1614,6 +1696,7 @@ export default function App() {
                 editorOpen={temporaryAccountEditorOpen}
                 busy={busy}
                 checking={temporaryAccountChecking}
+                updating={temporaryAccountUpdating}
                 deleting={temporaryAccountDeleting}
                 selectedAccountIds={selectedTemporaryAccountIds}
                 onSelectedAccountIds={setSelectedTemporaryAccountIds}
@@ -1625,6 +1708,8 @@ export default function App() {
                 error={temporaryAccountsError}
                 onRetry={loadTemporaryAccountGroups}
                 onStrategyChange={(strategy) => mutate(async () => api.updateSettings({ temporaryAccountStrategy: strategy }), "临时账号策略已更新")}
+                onCheckAccount={checkTemporaryAccount}
+                onUpdateAccount={updateTemporaryAccount}
                 onDeleteAccount={deleteTemporaryAccount}
                 onDeleteSelected={deleteSelectedTemporaryAccounts}
               />
@@ -2482,6 +2567,7 @@ function ProviderKeysView(props: {
 }) {
   const groups = props.snapshot.providerApiKeyGroups;
   const selectedSite = props.snapshot.sites.find((site) => site.id === props.draft.siteId);
+  const selectedSiteIsOfficialOpenAi = isOfficialOpenAiSite(selectedSite);
   const updateApiKey = (index: number, patch: Partial<ProviderApiKeyDraft>) => {
     props.onDraft({
       ...props.draft,
@@ -2493,7 +2579,7 @@ function ProviderKeysView(props: {
       ...props.draft,
       apiKeys: [
         ...props.draft.apiKeys,
-        { label: `Key ${props.draft.apiKeys.length + 1}`, secret: "", enabled: true, models: [] }
+        emptyProviderApiKey(selectedSite, props.draft.apiKeys.length)
       ]
     });
   };
@@ -2553,7 +2639,7 @@ function ProviderKeysView(props: {
                 value={props.draft.siteId}
                 onChange={(event) => {
                   const site = props.snapshot.sites.find((item) => item.id === event.target.value);
-                  props.onDraft({ ...props.draft, siteId: event.target.value, groupName: site?.name || "" });
+                  props.onDraft({ ...props.draft, siteId: event.target.value, groupName: site?.name || "", apiKeys: [emptyProviderApiKey(site)] });
                 }}
               >
                 <option value="">选择供应商</option>
@@ -2566,7 +2652,10 @@ function ProviderKeysView(props: {
             </label>
 
             <div className="mt-4 space-y-3">
-              {props.draft.apiKeys.map((apiKey, index) => (
+              {props.draft.apiKeys.map((apiKey, index) => {
+                const isOfficialKey = apiKey.kind === "chatgpt-official" || selectedSiteIsOfficialOpenAi;
+                const useApiKeyInput = selectedSiteIsOfficialOpenAi && apiKey.secret.trim().length > 0;
+                return (
                 <div key={apiKey.id || index} className="address-block">
                   <div className="address-block-head">
                     <div className="text-xs font-black text-ink/55">API Key {index + 1}</div>
@@ -2590,8 +2679,8 @@ function ProviderKeysView(props: {
                       <TextInput
                         type="password"
                         value={apiKey.secret}
-                        placeholder="sk-..."
-                        onChange={(event) => updateApiKey(index, { secret: event.target.value })}
+                        placeholder={selectedSiteIsOfficialOpenAi ? "不填则使用 ChatGPT 官方账号池；填写 sk-... 则走 OpenAI API" : "sk-..."}
+                        onChange={(event) => updateApiKey(index, { secret: event.target.value, kind: event.target.value.trim() ? "api-key" : apiKey.kind })}
                       />
                     </label>
                   </div>
@@ -2607,7 +2696,7 @@ function ProviderKeysView(props: {
                       onClick={() => props.onDiscoverModels(index)}
                     >
                       <RefreshCw className={`h-4 w-4 ${props.modelDiscoveringIndex === index ? "animate-spin" : ""}`} />
-                      获取模型
+                      {useApiKeyInput ? "获取 OpenAI 模型" : isOfficialKey ? "同步 ChatGPT 模型" : "获取模型"}
                     </ActionButton>
                   </div>
                   {props.modelGroupOptions[index]?.length > 0 ? (
@@ -2632,7 +2721,7 @@ function ProviderKeysView(props: {
                       placeholder="自动获取失败时可手动填写，例如：\ngpt-4.1\ngpt-4.1-mini"
                       onChange={(event) => updateApiKey(index, { models: parseModelText(event.target.value) })}
                     />
-                    <span className="field-hint">支持换行、逗号、空格分隔；保存后会同步到该供应商的可选模型。</span>
+                    <span className="field-hint">{isOfficialKey ? "从已导入的 GPT 官方临时账号同步后，模型会同步到 OpenAI 供应商供路由选择。" : "支持换行、逗号、空格分隔；保存后会同步到该供应商的可选模型。"}</span>
                   </label>
                   {apiKey.models.length > 0 ? (
                     <div className="mt-3 flex flex-wrap gap-2">
@@ -2645,7 +2734,8 @@ function ProviderKeysView(props: {
                     </div>
                   ) : null}
                 </div>
-              ))}
+                );
+              })}
             </div>
 
             <div className="mt-4 flex flex-wrap justify-between gap-2">
@@ -2722,6 +2812,7 @@ function TemporaryAccountsView(props: {
   loading: boolean;
   error: string;
   checking: string | null;
+  updating: string | null;
   deleting: string | null;
   selectedAccountIds: string[];
   onSelectedAccountIds: (ids: string[]) => void;
@@ -2731,6 +2822,8 @@ function TemporaryAccountsView(props: {
   onCheck: () => void;
   onRetry: () => void;
   onStrategyChange: (strategy: GroupRouteStrategy) => void;
+  onCheckAccount: (id: string) => void;
+  onUpdateAccount: (id: string, patch: Partial<TemporaryAccount>) => void;
   onDeleteAccount: (id: string) => void;
   onDeleteSelected: () => void;
 }) {
@@ -2846,9 +2939,29 @@ function TemporaryAccountsView(props: {
                                   {temporaryAccountAvailabilityLabels[availability]}
                                 </span>
                                 <span className="temp-account-name">{account.label}</span>
-                                <button className="temp-account-delete" type="button" disabled={props.deleting !== null} onClick={() => props.onDeleteAccount(account.id)} title="删除账号">
-                                  {props.deleting === account.id ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-                                </button>
+                                <div className="temp-account-row-actions">
+                                  <button
+                                    className="temp-account-icon-button"
+                                    type="button"
+                                    disabled={props.checking !== null || props.deleting !== null}
+                                    onClick={() => props.onCheckAccount(account.id)}
+                                    title="刷新账号"
+                                  >
+                                    <RefreshCw className={`h-4 w-4 ${props.checking === account.id ? "animate-spin" : ""}`} />
+                                  </button>
+                                  <label className="temp-account-enable" title={account.enabled ? "停用账号" : "启用账号"}>
+                                    <input
+                                      type="checkbox"
+                                      checked={account.enabled}
+                                      disabled={props.updating !== null || props.deleting !== null}
+                                      onChange={(event) => props.onUpdateAccount(account.id, { enabled: event.target.checked })}
+                                    />
+                                    启用
+                                  </label>
+                                  <button className="temp-account-delete" type="button" disabled={props.deleting !== null} onClick={() => props.onDeleteAccount(account.id)} title="删除账号">
+                                    {props.deleting === account.id ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                                  </button>
+                                </div>
                               </div>
                               <div className="temp-account-secret">
                                 {temporaryAccountTypeLabel(account)} / {account.prefix}...
@@ -2950,8 +3063,8 @@ function TemporaryAccountsView(props: {
                 取消
               </ActionButton>
               <ActionButton type="submit" disabled={props.busy || !hasImportContent}>
-                <Upload className="h-4 w-4" />
-                导入账号
+                {props.busy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                {props.busy ? "正在导入..." : "导入账号"}
               </ActionButton>
             </div>
           </form>

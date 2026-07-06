@@ -1189,14 +1189,33 @@ label {
   accent-color: var(--accent);
 }
 
+.temp-account-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.28rem;
+}
+
+.temp-account-icon-button,
 .temp-account-delete {
   display: grid;
   height: 30px;
   width: 30px;
   place-items: center;
   border-radius: 8px;
-  color: var(--danger-strong);
   transition: background 150ms ease, transform 150ms ease, opacity 150ms ease;
+}
+
+.temp-account-icon-button {
+  color: var(--accent-strong);
+}
+
+.temp-account-icon-button:hover {
+  background: var(--accent-softer);
+  transform: translateY(-1px);
+}
+
+.temp-account-delete {
+  color: var(--danger-strong);
 }
 
 .temp-account-delete:hover {
@@ -1204,7 +1223,26 @@ label {
   transform: translateY(-1px);
 }
 
-.temp-account-delete:disabled {
+.temp-account-enable {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.24rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.28rem 0.48rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 840;
+  white-space: nowrap;
+}
+
+.temp-account-enable input {
+  accent-color: var(--accent);
+}
+
+.temp-account-icon-button:disabled,
+.temp-account-delete:disabled,
+.temp-account-enable:has(input:disabled) {
   cursor: not-allowed;
   opacity: 0.5;
   transform: none;
@@ -3067,7 +3105,12 @@ label {
   }
 
   .temp-account-row-title {
-    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    grid-template-columns: auto auto minmax(0, 1fr);
+  }
+
+  .temp-account-row-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
   }
 
   .temp-account-last-check {

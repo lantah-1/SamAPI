@@ -47,11 +47,14 @@ export interface ApiKeyCreated extends ApiKeyRecord {
   plainTextKey: string;
 }
 
+export type ProviderApiKeyKind = "api-key" | "chatgpt-official";
+
 export interface ProviderApiKeyEntry {
   id: string;
   label: string;
   prefix: string;
   secret: string;
+  kind?: ProviderApiKeyKind;
   enabled: boolean;
   models: string[];
   lastCheckedAt?: string;
@@ -63,6 +66,7 @@ export interface ProviderApiKeyEntryInput {
   id?: string;
   label?: string;
   secret?: string;
+  kind?: ProviderApiKeyKind;
   enabled?: boolean;
   models?: string[];
   lastCheckedAt?: string;
@@ -179,6 +183,7 @@ export interface TemporaryAccountImportResult {
   group: TemporaryAccountGroup;
   imported: number;
   skipped: number;
+  accountIds?: string[];
   checkResult?: TemporaryAccountCheckResult;
 }
 

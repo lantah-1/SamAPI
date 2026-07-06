@@ -32,7 +32,8 @@ import type {
 const ENDPOINTS = ["messages", "chat/completions", "responses"] as const;
 const THEME_IDS: AppThemeId[] = ["fresh", "salt", "citrus", "rose", "midnight"];
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
-const OPENAI_DEFAULT_MODELS = ["gpt-5.5"];
+const CHATGPT_OFFICIAL_PROVIDER_KEY_ID = "provider-key-chatgpt-official";
+const CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL = "ChatGPT 官方";
 const TEMPORARY_ACCOUNT_PROVIDER_LABELS: Record<TemporaryAccountProviderType, string> = {
   gpt: "GPT",
   grok: "Grok",
@@ -479,9 +480,9 @@ export class JsonStore {
     this.sqlite = new DatabaseConstructor(this.sqlitePath);
     this.initializeSqlite();
     this.db = this.load();
-    this.ensureOfficialOpenAiSite();
+    this.ensureOfficialChatGptProviderKeyGroup();
     const mergedTemporaryAccounts = this.mergeTemporaryAccountTypeGroups();
-    if (this.syncOpenAiModelsFromTemporaryAccounts() || mergedTemporaryAccounts) this.persist();
+    if (mergedTemporaryAccounts) this.persist();
     this.refreshGroupRouteMembers();
   }
 
@@ -582,7 +583,7 @@ export class JsonStore {
           label: "官方 API",
           baseUrl: OPENAI_BASE_URL,
           enabled: true,
-          models: [...OPENAI_DEFAULT_MODELS]
+          models: []
         }
       ],
       createdAt: timestamp,
@@ -608,6 +609,27 @@ export class JsonStore {
 
   isOfficialOpenAiSite(siteId: string) {
     return this.officialOpenAiSite()?.id === siteId;
+  }
+
+  ensureOfficialChatGptProviderKeyGroup() {
+    const site = this.ensureOfficialOpenAiSite();
+    const existing = this.db.providerApiKeyGroups.find((group) =>
+      group.siteId === site.id && group.apiKeys.some((apiKey) => apiKey.kind === "chatgpt-official")
+    );
+    if (existing) return this.toProviderApiKeyGroupView(existing);
+    const timestamp = now();
+    const group: ProviderApiKeyGroup = {
+      id: `provider-key-group-chatgpt-official`,
+      siteId: site.id,
+      groupName: "OpenAI",
+      apiKeys: [this.normalizeProviderApiKeyEntry({ kind: "chatgpt-official", label: CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL, enabled: true }, 0)],
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    this.db.providerApiKeyGroups.unshift(group);
+    this.syncSiteModelsFromProviderKeys(site.id);
+    this.persist();
+    return this.toProviderApiKeyGroupView(group);
   }
 
   importTemporaryAccounts(input: TemporaryAccountImportInput) {
@@ -658,9 +680,8 @@ export class JsonStore {
     group.enabled = true;
     group.providerType = providerType;
     group.updatedAt = timestamp;
-    this.syncOpenAiModelsFromTemporaryAccounts();
     this.persist();
-    return { site, group, imported: accounts.length, skipped };
+    return { site, group, imported: accounts.length, skipped, accountIds: accounts.map((account) => account.id) };
   }
 
   private ensureTemporaryAccountTypeGroup(providerType: TemporaryAccountProviderType, siteId: string, source: TemporaryAccountImportSource, timestamp = now()) {
@@ -693,7 +714,6 @@ export class JsonStore {
 
   deleteTemporaryAccountGroup(id: string) {
     this.db.temporaryAccountGroups = this.db.temporaryAccountGroups.filter((group) => group.id !== id);
-    this.syncOpenAiModelsFromTemporaryAccounts();
     this.persist();
   }
 
@@ -740,6 +760,27 @@ export class JsonStore {
       .flatMap((group) => group.accounts.map((account) => ({ group, account })));
   }
 
+  temporaryAccountCheckTarget(accountId: string) {
+    for (const group of this.db.temporaryAccountGroups) {
+      if (normalizeTemporaryAccountProviderType(group.providerType) !== "gpt") continue;
+      const account = group.accounts.find((item) => item.id === accountId);
+      if (account) return { group, account };
+    }
+    return undefined;
+  }
+
+  updateTemporaryAccount(id: string, input: Partial<TemporaryAccount>) {
+    for (const group of this.db.temporaryAccountGroups) {
+      const account = group.accounts.find((item) => item.id === id);
+      if (!account) continue;
+      if (typeof input.enabled === "boolean") account.enabled = input.enabled;
+      group.updatedAt = now();
+      this.persist();
+      return account;
+    }
+    throw new Error("临时账号不存在");
+  }
+
   deleteTemporaryAccount(id: string) {
     for (const group of this.db.temporaryAccountGroups) {
       const nextAccounts = group.accounts.filter((account) => account.id !== id);
@@ -747,7 +788,6 @@ export class JsonStore {
       group.accounts = nextAccounts;
       group.updatedAt = now();
       this.db.temporaryAccountGroups = this.db.temporaryAccountGroups.filter((item) => item.accounts.length > 0);
-      this.syncOpenAiModelsFromTemporaryAccounts();
       this.persist();
       return;
     }
@@ -766,7 +806,6 @@ export class JsonStore {
     }
     if (!changed) return;
     this.db.temporaryAccountGroups = this.db.temporaryAccountGroups.filter((item) => item.accounts.length > 0);
-    this.syncOpenAiModelsFromTemporaryAccounts();
     this.persist();
   }
 
@@ -1237,7 +1276,7 @@ export class JsonStore {
       CREATE TABLE IF NOT EXISTS sites (id TEXT PRIMARY KEY, name TEXT NOT NULL, site_type TEXT NOT NULL, addresses_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, prefix TEXT NOT NULL, key_hash TEXT NOT NULL, plain_text_key TEXT, enabled INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_used_at TEXT);
       CREATE TABLE IF NOT EXISTS provider_api_key_groups (id TEXT PRIMARY KEY, site_id TEXT NOT NULL, group_name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS provider_api_keys (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, enabled INTEGER NOT NULL, models_json TEXT NOT NULL, last_checked_at TEXT, FOREIGN KEY (group_id) REFERENCES provider_api_key_groups(id) ON DELETE CASCADE);
+      CREATE TABLE IF NOT EXISTS provider_api_keys (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'api-key', enabled INTEGER NOT NULL, models_json TEXT NOT NULL, last_checked_at TEXT, FOREIGN KEY (group_id) REFERENCES provider_api_key_groups(id) ON DELETE CASCADE);
       CREATE INDEX IF NOT EXISTS idx_provider_api_keys_group_id ON provider_api_keys(group_id);
       CREATE TABLE IF NOT EXISTS temporary_account_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, source TEXT NOT NULL, provider_type TEXT, site_id TEXT NOT NULL, strategy TEXT, enabled INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS temporary_accounts (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, account_type TEXT, provider_type TEXT, account_id TEXT, email TEXT, refresh_token TEXT, id_token TEXT, session_token TEXT, enabled INTEGER NOT NULL, models_json TEXT NOT NULL, availability TEXT, quota_stages_json TEXT NOT NULL, imported_at TEXT NOT NULL, last_quota_checked_at TEXT, last_check_status_code INTEGER, last_check_error TEXT, FOREIGN KEY (group_id) REFERENCES temporary_account_groups(id) ON DELETE CASCADE);
@@ -1251,6 +1290,7 @@ export class JsonStore {
     `);
     this.ensureSqliteColumn("temporary_account_groups", "provider_type", "TEXT");
     this.ensureSqliteColumn("temporary_accounts", "provider_type", "TEXT");
+    this.ensureSqliteColumn("provider_api_keys", "kind", "TEXT NOT NULL DEFAULT 'api-key'");
   }
 
   private ensureSqliteColumn(table: string, column: string, definition: string) {
@@ -1322,6 +1362,7 @@ export class JsonStore {
         label: String(apiKey.label),
         prefix: String(apiKey.prefix),
         secret: String(apiKey.secret),
+        kind: apiKey.kind === "chatgpt-official" ? "chatgpt-official" as const : "api-key" as const,
         enabled: Boolean(apiKey.enabled),
         models: normalizeModelList(JSON.parse(String(apiKey.models_json))),
         lastCheckedAt: apiKey.last_checked_at == null ? undefined : String(apiKey.last_checked_at)
@@ -1437,10 +1478,10 @@ export class JsonStore {
     const insertApiKey = this.sqlite.prepare("INSERT INTO api_keys (id, name, prefix, key_hash, plain_text_key, enabled, created_at, updated_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
     for (const key of db.apiKeys) insertApiKey.run(key.id, key.name, key.prefix, key.keyHash, key.plainTextKey || null, key.enabled ? 1 : 0, key.createdAt, key.updatedAt, key.lastUsedAt || null);
     const insertProviderGroup = this.sqlite.prepare("INSERT INTO provider_api_key_groups (id, site_id, group_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
-    const insertProviderKey = this.sqlite.prepare("INSERT INTO provider_api_keys (id, group_id, label, prefix, secret, enabled, models_json, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+    const insertProviderKey = this.sqlite.prepare("INSERT INTO provider_api_keys (id, group_id, label, prefix, secret, kind, enabled, models_json, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
     for (const group of db.providerApiKeyGroups) {
       insertProviderGroup.run(group.id, group.siteId, group.groupName, group.createdAt, group.updatedAt);
-      for (const apiKey of group.apiKeys) insertProviderKey.run(apiKey.id, group.id, apiKey.label, apiKey.prefix, apiKey.secret, apiKey.enabled ? 1 : 0, JSON.stringify(apiKey.models), apiKey.lastCheckedAt || null);
+      for (const apiKey of group.apiKeys) insertProviderKey.run(apiKey.id, group.id, apiKey.label, apiKey.prefix, apiKey.secret, apiKey.kind || "api-key", apiKey.enabled ? 1 : 0, JSON.stringify(apiKey.models), apiKey.lastCheckedAt || null);
     }
     const insertTemporaryGroup = this.sqlite.prepare("INSERT INTO temporary_account_groups (id, name, source, provider_type, site_id, strategy, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
     const insertTemporaryAccount = this.sqlite.prepare("INSERT INTO temporary_accounts (id, group_id, label, prefix, secret, account_type, provider_type, account_id, email, refresh_token, id_token, session_token, enabled, models_json, availability, quota_stages_json, imported_at, last_quota_checked_at, last_check_status_code, last_check_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
@@ -1485,16 +1526,19 @@ export class JsonStore {
 
   private normalizeProviderApiKeyEntry(input: Partial<ProviderApiKeyEntry>, index: number, existingKeys: ProviderApiKeyEntry[] = []): ProviderApiKeyEntry {
     const existing = input.id ? existingKeys.find((key) => key.id === input.id) : undefined;
-    const secret = input.secret?.trim() || existing?.secret;
-    if (!secret) throw new Error(`第 ${index + 1} 个 API Key 不能为空`);
+    const kind = input.kind === "chatgpt-official" ? "chatgpt-official" : existing?.kind || "api-key";
+    const resolvedSecret = kind === "chatgpt-official" ? "" : input.secret?.trim() || existing?.secret;
+    if (kind !== "chatgpt-official" && !resolvedSecret) throw new Error(`第 ${index + 1} 个 API Key 不能为空`);
+    const secret = resolvedSecret || "";
     const models = Array.isArray(input.models)
       ? Array.from(new Set(input.models.map((model) => String(model).trim()).filter(Boolean))).sort()
       : [];
     return {
-      id: input.id || `provider-key-${randomUUID()}`,
-      label: input.label?.trim() || `Key ${index + 1}`,
-      prefix: secret.slice(0, 10),
+      id: input.id || (kind === "chatgpt-official" ? CHATGPT_OFFICIAL_PROVIDER_KEY_ID : `provider-key-${randomUUID()}`),
+      label: input.label?.trim() || (kind === "chatgpt-official" ? CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL : `Key ${index + 1}`),
+      prefix: kind === "chatgpt-official" ? "chatgpt" : secret.slice(0, 10),
       secret,
+      kind,
       enabled: input.enabled ?? true,
       models,
       lastCheckedAt: input.lastCheckedAt
@@ -1508,23 +1552,6 @@ export class JsonStore {
       groupName: group.groupName || site?.name || "API Key 分组",
       apiKeys: group.apiKeys.map((apiKey) => ({ ...apiKey }))
     };
-  }
-
-  private syncOpenAiModelsFromTemporaryAccounts() {
-    const site = this.officialOpenAiSite();
-    if (!site) return false;
-    const importedModels = this.db.temporaryAccountGroups
-      .filter((group) => group.siteId === site.id)
-      .flatMap((group) => group.accounts.flatMap((account) => account.models));
-    const models = Array.from(new Set([...OPENAI_DEFAULT_MODELS, ...importedModels].filter(Boolean))).sort();
-    let changed = false;
-    site.addresses = site.addresses.map((address) => {
-      if (JSON.stringify(address.models) === JSON.stringify(models)) return address;
-      changed = true;
-      return { ...address, models };
-    });
-    if (changed) site.updatedAt = now();
-    return changed;
   }
 
   private syncSiteModelsFromProviderKeys(siteId: string) {
