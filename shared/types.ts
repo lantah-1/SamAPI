@@ -6,6 +6,13 @@ export type SiteType = "newapi" | "unknown";
 
 export type GroupRouteStrategy = "stable-first" | "sequential" | "random";
 
+export type RouteProxyMode = "direct" | "system" | "custom";
+
+export interface RouteProxyConfig {
+  mode: RouteProxyMode;
+  url?: string;
+}
+
 export type AppThemeId = "fresh" | "salt" | "citrus" | "rose" | "midnight";
 
 export type TemporaryAccountImportSource = "cpa" | "subapi";
@@ -38,6 +45,7 @@ export interface ApiKeyRecord {
   keyHash: string;
   plainTextKey?: string;
   enabled: boolean;
+  models: string[];
   createdAt: string;
   updatedAt: string;
   lastUsedAt?: string;
@@ -207,6 +215,11 @@ export interface TemporaryAccountCheckResult {
   results: TemporaryAccountCheckItemResult[];
 }
 
+export interface TemporaryAccountCheckOptions {
+  providerType?: TemporaryAccountProviderType;
+  proxy?: RouteProxyConfig;
+}
+
 export interface HeaderTemplate {
   id: string;
   name: string;
@@ -224,6 +237,7 @@ export interface SwitchRoute {
   model: string;
   endpoint: EndpointKind;
   headerTemplateId?: string;
+  proxy?: RouteProxyConfig;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -245,6 +259,7 @@ export interface GroupRoute {
   members: GroupRouteMember[];
   endpoint: EndpointKind;
   headerTemplateId?: string;
+  proxy?: RouteProxyConfig;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -252,7 +267,7 @@ export interface GroupRoute {
 
 export type RouteRecord = SwitchRoute | GroupRoute;
 
-export type RequestLogStatus = "success" | "failed";
+export type RequestLogStatus = "pending" | "success" | "failed";
 
 export interface RequestLogDownstream {
   model?: string;
@@ -268,6 +283,13 @@ export interface RequestLogRouteTarget {
   endpoint?: string;
   providerName?: string;
   userAgent?: string;
+}
+
+export interface RequestLogProxy {
+  mode: RouteProxyMode;
+  url?: string;
+  source?: "route" | "system" | "env";
+  retried?: boolean;
 }
 
 export interface RequestLogUpstreamAttempt {
@@ -313,11 +335,33 @@ export interface RequestLog {
   downstream?: RequestLogDownstream;
   routeTarget?: RequestLogRouteTarget;
   upstreamAttempts?: RequestLogUpstreamAttempt[];
+  proxy?: RequestLogProxy;
+  summary?: string;
+}
+
+export interface RequestLogSummary {
+  id: string;
+  createdAt: string;
+  status: RequestLogStatus;
+  statusCode: number;
+  durationMs: number;
+  downstream: RequestLogDownstream;
+  routeName: string;
+  routeId?: string;
+  routeTarget: RequestLogRouteTarget;
+  providerName: string;
+  providerId?: string;
+  model: string;
+  headerTemplateId?: string;
+  headerTemplateName?: string;
+  upstreamUrl?: string;
+  proxy?: RequestLogProxy;
+  errorMessage?: string;
   summary?: string;
 }
 
 export interface RequestLogPage {
-  items: RequestLog[];
+  items: RequestLogSummary[];
   total: number;
   limit: number;
   offset: number;
@@ -348,7 +392,7 @@ export interface AppDatabase {
 
 export interface AppSnapshot extends Omit<AppDatabase, "providerApiKeyGroups" | "adminPasswordHash"> {
   providerApiKeyGroups: ProviderApiKeyGroupView[];
-  requestLogs: RequestLog[];
+  requestLogs: RequestLogSummary[];
   dbPath: string;
   dataDir: string;
   endpoints: EndpointKind[];

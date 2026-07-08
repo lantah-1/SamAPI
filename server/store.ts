@@ -16,6 +16,8 @@ import type {
   ProviderApiKeyGroup,
   ProviderApiKeyGroupInput,
   RequestLog,
+  RequestLogSummary,
+  RouteProxyConfig,
   RouteRecord,
   Site,
   SiteAddress,
@@ -32,6 +34,8 @@ import type {
 const ENDPOINTS = ["messages", "chat/completions", "responses"] as const;
 const THEME_IDS: AppThemeId[] = ["fresh", "salt", "citrus", "rose", "midnight"];
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
+const GROK_BASE_URL = "https://api.x.ai/v1";
+const GROK_DEFAULT_MODELS = ["grok-4", "grok-3", "grok-3-mini", "grok-2-1212", "grok-2-vision-1212"];
 const CHATGPT_OFFICIAL_PROVIDER_KEY_ID = "provider-key-chatgpt-official";
 const CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL = "ChatGPT 官方";
 const TEMPORARY_ACCOUNT_PROVIDER_LABELS: Record<TemporaryAccountProviderType, string> = {
@@ -101,6 +105,23 @@ function normalizeMatchRule(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function normalizeRouteProxy(input: unknown): RouteProxyConfig | undefined {
+  if (!isRecord(input)) return undefined;
+  const mode = input.mode === "system" || input.mode === "custom" ? input.mode : "direct";
+  if (mode === "custom") {
+    const url = typeof input.url === "string" ? input.url.trim() : "";
+    if (!url) throw new Error("自定义代理地址不能为空");
+    try {
+      const parsed = new URL(url);
+      if (!parsed.protocol || !parsed.hostname) throw new Error("invalid proxy url");
+    } catch {
+      throw new Error("自定义代理地址必须是合法 URL，例如 http://127.0.0.1:7890");
+    }
+    return { mode, url };
+  }
+  return mode === "system" ? { mode } : undefined;
+}
+
 function normalizeGroupStrategy(value: unknown): GroupRouteStrategy {
   if (value === "sequential") return "sequential";
   if (value === "random") return "random";
@@ -157,11 +178,70 @@ function extractTemporarySecret(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   if (!trimmed) return undefined;
+  const keyValueMatch = trimmed.match(/^([\w\u4e00-\u9fff ._-]{1,80})\s*[:：=]\s*(.+)$/);
+  if (keyValueMatch?.[1] && keyValueMatch[2]) {
+    const normalizedKey = keyValueMatch[1]
+      .trim()
+      .toLowerCase()
+      .replace(/[\s.\-]+/g, "_");
+    const isAuxiliaryToken = normalizedKey.includes("refresh") || normalizedKey === "id_token" || normalizedKey.includes("session");
+    const isPrimarySecret = (
+      normalizedKey.includes("access") ||
+      normalizedKey.includes("authorization") ||
+      normalizedKey.includes("bearer") ||
+      normalizedKey.includes("api_key") ||
+      normalizedKey === "apikey" ||
+      normalizedKey === "key" ||
+      normalizedKey === "sk" ||
+      normalizedKey === "sso" ||
+      normalizedKey === "sso_token" ||
+      normalizedKey === "token" ||
+      normalizedKey === "令牌" ||
+      normalizedKey === "访问令牌"
+    );
+    if (isPrimarySecret && !isAuxiliaryToken) {
+      const secret = extractTemporarySecret(keyValueMatch[2]);
+      if (secret) return secret;
+    }
+  }
   const bearerMatch = trimmed.match(/Bearer\s+([A-Za-z0-9._\-]+(?:-[A-Za-z0-9._\-]+)*)/i);
   if (bearerMatch?.[1]) return bearerMatch[1];
+  const ssoMatch = trimmed.match(/(?:^|[;\s])sso=([^;\s]+)/i);
+  if (ssoMatch?.[1]) return ssoMatch[1].trim();
   const skMatch = trimmed.match(/\b(sk-[A-Za-z0-9][A-Za-z0-9._\-]{8,}|sk-proj-[A-Za-z0-9._\-]{8,})\b/);
   if (skMatch?.[1]) return skMatch[1];
   if (/^[A-Za-z0-9._\-]{20,}$/.test(trimmed)) return trimmed;
+  const fields = temporaryAccountLineFields(trimmed);
+  if (fields.length > 1) {
+    for (const field of fields) {
+      const secret = extractTemporarySecret(field);
+      if (secret) return secret;
+    }
+  }
+  return undefined;
+}
+
+function temporaryAccountLineFields(line: string) {
+  return line
+    .split(/[|,\t]+|;{2,}|-{4,}/)
+    .map((field) => field.trim())
+    .filter(Boolean);
+}
+
+function emailFromTemporaryLine(line: string) {
+  return temporaryAccountLineFields(line)
+    .map((field) => field.trim())
+    .find((field) => /^[^\s@|,]+@[^\s@|,]+\.[^\s@|,]+$/.test(field));
+}
+
+function browserCookieStateFromText(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const keyValueMatch = trimmed.match(/^(?:cookie|cookies|cf_clearance|浏览器cookie|浏览器态)\s*[:：=]\s*(.+)$/i);
+  const cookieText = keyValueMatch?.[1]?.trim() || trimmed;
+  if (/^(cf_clearance|__cf_bm|_cfuvid)\s*=/i.test(cookieText) || /;\s*(cf_clearance|__cf_bm|_cfuvid)\s*=/i.test(cookieText)) return cookieText;
+  if (/^[A-Za-z0-9._\-]{20,}$/.test(cookieText) && /cf_clearance/i.test(trimmed)) return `cf_clearance=${cookieText}`;
   return undefined;
 }
 
@@ -170,7 +250,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function temporaryAccountLabel(record: Record<string, unknown>, fallback: string) {
-  for (const key of ["label", "name", "email", "username", "account", "remark", "备注"]) {
+  for (const key of ["label", "name", "email", "username", "account", "remark", "备注", "pool"]) {
     const value = record[key];
     if (typeof value === "string" && value.trim()) return value.trim();
   }
@@ -192,6 +272,19 @@ function firstStringField(records: Record<string, unknown>[], keys: string[]) {
   return undefined;
 }
 
+function firstBrowserCookieState(records: Record<string, unknown>[]) {
+  for (const record of records) {
+    for (const key of ["session_token", "sessionToken", "cf_clearance", "cookie", "cookies", "browser_cookie", "browserCookie", "浏览器cookie", "浏览器态"]) {
+      const value = record[key];
+      const cookieState = key === "cf_clearance" && typeof value === "string" && value.trim()
+        ? `cf_clearance=${value.trim()}`
+        : browserCookieStateFromText(value);
+      if (cookieState) return cookieState;
+    }
+  }
+  return undefined;
+}
+
 function firstTemporarySecret(records: Record<string, unknown>[], keys: string[]) {
   for (const record of records) {
     for (const key of keys) {
@@ -202,12 +295,35 @@ function firstTemporarySecret(records: Record<string, unknown>[], keys: string[]
   return undefined;
 }
 
+function jwtPayload(token?: string) {
+  const parts = token?.split(".") || [];
+  if (parts.length !== 3 || !parts[1]) return undefined;
+  try {
+    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+function codexAccountIdFromIdToken(idToken?: string) {
+  const payload = jwtPayload(idToken);
+  const auth = isRecord(payload?.["https://api.openai.com/auth"]) ? payload?.["https://api.openai.com/auth"] : undefined;
+  const accountId = isRecord(auth) ? auth.chatgpt_account_id || auth.account_id || auth.user_id : undefined;
+  return typeof accountId === "string" && accountId.trim() ? accountId.trim() : undefined;
+}
+
+function emailFromIdToken(idToken?: string) {
+  const email = jwtPayload(idToken)?.email;
+  return typeof email === "string" && email.trim() ? email.trim() : undefined;
+}
+
 function temporaryAccountLabelFromRecords(records: Record<string, unknown>[], fallback: string) {
   for (const record of records) {
     const label = temporaryAccountLabel(record, "");
     if (label) return label;
   }
-  return fallback;
+  const idToken = firstStringField(records, ["id_token", "idToken"]);
+  return emailFromIdToken(idToken) || fallback;
 }
 
 function temporaryAccountType(record: Record<string, unknown>, secret: string, accountId?: string): TemporaryAccount["accountType"] {
@@ -323,6 +439,19 @@ function modelsFromRecord(record: Record<string, unknown>) {
   return normalizeModelList(record.models || record.model || record["模型"]);
 }
 
+type TemporaryAccountImportCandidate = {
+  label: string;
+  secret: string;
+  accountType?: TemporaryAccount["accountType"];
+  accountId?: string;
+  email?: string;
+  refreshToken?: string;
+  idToken?: string;
+  sessionToken?: string;
+  models: string[];
+  quotaStages: TemporaryAccountQuotaStage[];
+};
+
 function temporaryAccountFromRecord(
   record: Record<string, unknown>,
   models: string[],
@@ -330,7 +459,9 @@ function temporaryAccountFromRecord(
 ) {
   const credentials = isRecord(record.credentials) ? record.credentials : {};
   const extra = isRecord(record.extra) ? record.extra : {};
-  const records = [record, credentials, extra];
+  const tokens = isRecord(record.tokens) ? record.tokens : {};
+  const auth = isRecord(record.auth) ? record.auth : {};
+  const records = [record, credentials, extra, tokens, auth];
   const recordModels = records.flatMap((item) => modelsFromRecord(item));
   const mergedModels = recordModels.length > 0 ? recordModels : models;
   const secret = firstTemporarySecret(records, [
@@ -338,25 +469,31 @@ function temporaryAccountFromRecord(
     "apiKey",
     "key",
     "token",
+    "sso",
+    "sso_token",
+    "ssoToken",
     "access_token",
     "accessToken",
     "secret",
     "authorization",
     "Authorization",
+    "cookie",
+    "cookies",
     "sk"
   ]);
   if (!secret) return undefined;
 
-  const accountId = firstStringField(records, ["account_id", "chatgpt_account_id", "chatgptAccountId"]);
+  const idToken = firstStringField(records, ["id_token", "idToken"]);
+  const accountId = firstStringField(records, ["account_id", "chatgpt_account_id", "chatgptAccountId", "accountId"]) || codexAccountIdFromIdToken(idToken);
   return {
     label: temporaryAccountLabelFromRecords(records, fallbackLabel),
     secret,
     accountType: temporaryAccountType(record, secret, accountId),
     accountId,
-    email: firstStringField(records, ["email", "mail", "username"]),
+    email: firstStringField(records, ["email", "mail", "username"]) || emailFromIdToken(idToken),
     refreshToken: firstStringField(records, ["refresh_token", "refreshToken"]),
-    idToken: firstStringField(records, ["id_token", "idToken"]),
-    sessionToken: firstStringField(records, ["session_token", "sessionToken"]),
+    idToken,
+    sessionToken: firstBrowserCookieState(records) || firstStringField(records, ["session_token", "sessionToken"]),
     models: mergedModels,
     quotaStages: mergeQuotaStages(records)
   };
@@ -365,18 +502,7 @@ function temporaryAccountFromRecord(
 function collectTemporaryAccounts(
   value: unknown,
   models: string[],
-  output: Array<{
-    label: string;
-    secret: string;
-    accountType?: TemporaryAccount["accountType"];
-    accountId?: string;
-    email?: string;
-    refreshToken?: string;
-    idToken?: string;
-    sessionToken?: string;
-    models: string[];
-    quotaStages: TemporaryAccountQuotaStage[];
-  }>
+  output: TemporaryAccountImportCandidate[]
 ) {
   if (Array.isArray(value)) {
     for (const item of value) collectTemporaryAccounts(item, models, output);
@@ -391,7 +517,7 @@ function collectTemporaryAccounts(
     }
     const containerModels = modelsFromRecord(record);
     const nestedModels = containerModels.length > 0 ? containerModels : models;
-    for (const nestedKey of ["accounts", "data", "items", "list", "keys", "tokens", "subscriptions", "result"]) {
+    for (const nestedKey of ["accounts", "data", "items", "list", "keys", "tokens", "subscriptions", "result", "basic", "super", "heavy"]) {
       if (nestedKey in record) collectTemporaryAccounts(record[nestedKey], nestedModels, output);
     }
     return;
@@ -400,19 +526,113 @@ function collectTemporaryAccounts(
   if (secret) output.push({ label: `账号 ${output.length + 1}`, secret, accountType: secret.startsWith("sk-") ? "openai-api-key" : "codex", models, quotaStages: [] });
 }
 
+function normalizeLooseTemporaryAccountKey(key: string) {
+  const normalized = key
+    .trim()
+    .toLowerCase()
+    .replace(/[\s.\-]+/g, "_");
+  if (["access_token", "accesstoken", "access", "authorization", "bearer", "token", "令牌", "访问令牌"].includes(normalized)) return "access_token";
+  if (["refresh_token", "refreshtoken", "refresh", "刷新令牌"].includes(normalized)) return "refresh_token";
+  if (["id_token", "idtoken"].includes(normalized)) return "id_token";
+  if (["account_id", "accountid", "chatgpt_account_id", "chatgptaccountid", "账号id", "账户id"].includes(normalized)) return "account_id";
+  if (["email", "mail", "username", "user", "邮箱", "账号", "账户"].includes(normalized)) return "email";
+  if (["label", "name", "remark", "备注", "名称"].includes(normalized)) return "label";
+  if (["session_token", "sessiontoken", "session", "cf_clearance", "cookie", "cookies", "browser_cookie", "browsercookie", "浏览器cookie", "浏览器态"].includes(normalized)) return "session_token";
+  if (["api_key", "apikey", "key", "sk"].includes(normalized)) return "api_key";
+  if (["type", "account_type", "类型"].includes(normalized)) return "type";
+  if (["models", "model", "模型"].includes(normalized)) return "models";
+  if (["sso", "sso_token", "ssotoken"].includes(normalized)) return "sso";
+  return undefined;
+}
+
+function parseLooseTemporaryAccountKeyValue(line: string) {
+  const match = line.match(/^(.{1,80}?)[\s]*[:：=][\s]*(.+)$/);
+  if (!match?.[1] || !match[2]?.trim()) return undefined;
+  const key = normalizeLooseTemporaryAccountKey(match[1]);
+  if (!key) return undefined;
+  return { key, value: match[2].trim() };
+}
+
+function isLooseTemporaryAccountSeparator(line: string) {
+  return !line || /^[-=_*#]{3,}$/.test(line);
+}
+
+function collectLooseTemporaryAccountBlocks(content: string, models: string[], output: TemporaryAccountImportCandidate[]) {
+  let record: Record<string, unknown> = {};
+  const flush = () => {
+    if (Object.keys(record).length === 0) return;
+    collectTemporaryAccounts(record, models, output);
+    record = {};
+  };
+  const setField = (key: string, value: string) => {
+    if (!value.trim()) return;
+    if (record[key] == null) record[key] = value.trim();
+  };
+
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (isLooseTemporaryAccountSeparator(line)) {
+      flush();
+      continue;
+    }
+
+    const fields = temporaryAccountLineFields(line);
+    const keyValues = fields.map(parseLooseTemporaryAccountKeyValue).filter((item): item is NonNullable<typeof item> => Boolean(item));
+    if (keyValues.length > 0) {
+      for (const item of keyValues) setField(item.key, item.value);
+      continue;
+    }
+
+    const titleMatch = line.match(/^(账号|账户|account)\s*(?:#?\d+)?\s*[#：:\-]?\s*(.+)?$/i);
+    if (titleMatch && !extractTemporarySecret(line)) {
+      flush();
+      if (titleMatch[2]?.trim()) setField("label", titleMatch[2].trim());
+      continue;
+    }
+
+    const secret = extractTemporarySecret(line);
+    if (secret) {
+      setField(secret.startsWith("sk-") ? "api_key" : "access_token", secret);
+      const cookieState = browserCookieStateFromText(line);
+      if (cookieState) setField("session_token", cookieState);
+      const email = emailFromTemporaryLine(line);
+      if (email) setField("email", email);
+      continue;
+    }
+
+    const cookieState = browserCookieStateFromText(line);
+    if (cookieState) {
+      setField("session_token", cookieState);
+      continue;
+    }
+
+    const email = emailFromTemporaryLine(line);
+    if (email) setField("email", email);
+  }
+
+  flush();
+}
+
+function mergeTemporaryAccountImportCandidate(
+  existing: TemporaryAccountImportCandidate,
+  incoming: TemporaryAccountImportCandidate
+): TemporaryAccountImportCandidate {
+  return {
+    ...existing,
+    label: existing.label || incoming.label,
+    accountType: existing.accountType || incoming.accountType,
+    accountId: existing.accountId || incoming.accountId,
+    email: existing.email || incoming.email,
+    refreshToken: existing.refreshToken || incoming.refreshToken,
+    idToken: existing.idToken || incoming.idToken,
+    sessionToken: existing.sessionToken || incoming.sessionToken,
+    models: existing.models.length > 0 ? existing.models : incoming.models,
+    quotaStages: existing.quotaStages.length > 0 ? existing.quotaStages : incoming.quotaStages
+  };
+}
+
 function parseTemporaryAccountImport(content: string, models: string[]) {
-  const output: Array<{
-    label: string;
-    secret: string;
-    accountType?: TemporaryAccount["accountType"];
-    accountId?: string;
-    email?: string;
-    refreshToken?: string;
-    idToken?: string;
-    sessionToken?: string;
-    models: string[];
-    quotaStages: TemporaryAccountQuotaStage[];
-  }> = [];
+  const output: TemporaryAccountImportCandidate[] = [];
   const trimmed = content.trim();
   if (!trimmed) return output;
 
@@ -433,16 +653,20 @@ function parseTemporaryAccountImport(content: string, models: string[]) {
     }
     const secret = extractTemporarySecret(line);
     if (!secret) continue;
+    const email = emailFromTemporaryLine(line);
     const label = line
       .replace(secret, "")
       .replace(/[,\t|:;]+/g, " ")
       .trim();
-    output.push({ label: label || `账号 ${output.length + 1}`, secret, accountType: secret.startsWith("sk-") ? "openai-api-key" : "codex", models, quotaStages: [] });
+    output.push({ label: email || label || `账号 ${output.length + 1}`, secret, accountType: secret.startsWith("sk-") ? "openai-api-key" : "codex", email, sessionToken: browserCookieStateFromText(line), models, quotaStages: [] });
   }
+
+  collectLooseTemporaryAccountBlocks(trimmed, models, output);
 
   const unique = new Map<string, (typeof output)[number]>();
   for (const account of output) {
-    if (!unique.has(account.secret)) unique.set(account.secret, account);
+    const existing = unique.get(account.secret);
+    unique.set(account.secret, existing ? mergeTemporaryAccountImportCandidate(existing, account) : account);
   }
   return Array.from(unique.values());
 }
@@ -481,6 +705,7 @@ export class JsonStore {
     this.initializeSqlite();
     this.db = this.load();
     this.ensureOfficialChatGptProviderKeyGroup();
+    this.ensureOfficialGrokSite();
     const mergedTemporaryAccounts = this.mergeTemporaryAccountTypeGroups();
     if (mergedTemporaryAccounts) this.persist();
     this.refreshGroupRouteMembers();
@@ -523,12 +748,53 @@ export class JsonStore {
     return changed;
   }
 
+  private requestLogSummary(log: RequestLog): RequestLogSummary {
+    const route = this.db.routes.find((item) => item.id === log.routeId || item.name === log.routeName);
+    const headerTemplateId = route && (route.type === "switch" || route.type === "group") ? route.headerTemplateId : undefined;
+    const headerTemplate = headerTemplateId ? this.db.headerTemplates.find((item) => item.id === headerTemplateId) : undefined;
+    return {
+      id: log.id,
+      createdAt: log.createdAt,
+      status: log.status,
+      statusCode: log.statusCode,
+      durationMs: log.durationMs,
+      downstream: log.downstream || {
+        model: log.routeName,
+        endpoint: log.path,
+        userAgent: log.userAgent,
+        path: log.path,
+        method: log.method
+      },
+      routeName: log.routeName,
+      routeId: log.routeId,
+      routeTarget: log.routeTarget || {
+        routeName: log.routeName,
+        model: log.model,
+        endpoint: log.endpoint,
+        providerName: log.providerName
+      },
+      providerName: log.providerName,
+      providerId: log.providerId,
+      model: log.model,
+      headerTemplateId,
+      headerTemplateName: headerTemplate?.name,
+      upstreamUrl: log.upstreamUrl,
+      errorMessage: log.errorMessage,
+      proxy: log.proxy,
+      summary: log.summary
+    };
+  }
+
   listRequestLogs(limit = this.db.settings.maxRequestLogs, offset = 0) {
-    return this.requestLogs.slice(offset, offset + limit);
+    return this.requestLogs.slice(offset, offset + limit).map((log) => this.requestLogSummary(log));
   }
 
   listNewRequestLogs(since: string, limit = this.db.settings.maxRequestLogs) {
-    return this.requestLogs.filter((log) => log.createdAt > since).slice(0, limit);
+    return this.requestLogs.filter((log) => log.createdAt > since).slice(0, limit).map((log) => this.requestLogSummary(log));
+  }
+
+  getRequestLog(id: string) {
+    return this.requestLogs.find((log) => log.id === id);
   }
 
   requestLogCount() {
@@ -611,6 +877,44 @@ export class JsonStore {
     return this.officialOpenAiSite()?.id === siteId;
   }
 
+  ensureOfficialGrokSite() {
+    const existing = this.officialGrokSite();
+    if (existing) return existing;
+    const timestamp = now();
+    const created: Site = {
+      id: `site-${randomUUID()}`,
+      name: "Grok",
+      siteType: "unknown",
+      addresses: [
+        {
+          id: `addr-${randomUUID()}`,
+          label: "xAI 官方 API",
+          baseUrl: GROK_BASE_URL,
+          enabled: true,
+          models: GROK_DEFAULT_MODELS
+        }
+      ],
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    this.db.sites.unshift(created);
+    this.persist();
+    return created;
+  }
+
+  officialGrokSite() {
+    return this.db.sites.find((site) =>
+      site.addresses.some((address) => {
+        try {
+          const parsed = new URL(address.baseUrl);
+          return parsed.hostname.toLowerCase() === "api.x.ai";
+        } catch {
+          return false;
+        }
+      })
+    );
+  }
+
   ensureOfficialChatGptProviderKeyGroup() {
     const site = this.ensureOfficialOpenAiSite();
     const existing = this.db.providerApiKeyGroups.find((group) =>
@@ -633,10 +937,10 @@ export class JsonStore {
   }
 
   importTemporaryAccounts(input: TemporaryAccountImportInput) {
-    const site = this.ensureOfficialOpenAiSite();
     const timestamp = now();
     const source = input.source === "cpa" ? "cpa" : "subapi";
     const providerType = normalizeTemporaryAccountProviderType(input.providerType);
+    const site = providerType === "grok" ? this.ensureOfficialGrokSite() : this.ensureOfficialOpenAiSite();
     const models = normalizeModelList(input.models);
     const importContents = [input.content, ...(Array.isArray(input.contents) ? input.contents : [])].filter((content) => typeof content === "string" && content.trim());
     const parsedAccounts = importContents.flatMap((content) => parseTemporaryAccountImport(content, models));
@@ -736,9 +1040,9 @@ export class JsonStore {
     return pool;
   }
 
-  resolveTemporaryOpenAiAccounts(model: string) {
+  resolveTemporaryProviderAccounts(providerType: TemporaryAccountProviderType, model: string) {
     const allEnabledAccounts = this.db.temporaryAccountGroups
-      .filter((group) => normalizeTemporaryAccountProviderType(group.providerType) === "gpt")
+      .filter((group) => normalizeTemporaryAccountProviderType(group.providerType) === providerType)
       .flatMap((group) => group.accounts);
     const candidates = allEnabledAccounts.filter((account) => account.models.length === 0 || account.models.includes(model));
     const pool = candidates.length > 0 ? candidates : allEnabledAccounts;
@@ -749,20 +1053,24 @@ export class JsonStore {
     return [...this.orderedTemporaryAccountPool(available), ...this.orderedTemporaryAccountPool(unchecked)];
   }
 
+  resolveTemporaryOpenAiAccounts(model: string) {
+    return this.resolveTemporaryProviderAccounts("gpt", model);
+  }
+
   resolveTemporaryOpenAiAccount(model: string) {
     return this.resolveTemporaryOpenAiAccounts(model)[0];
   }
 
-  temporaryAccountCheckTargets(groupId?: string) {
+  temporaryAccountCheckTargets(groupId?: string, providerType: TemporaryAccountProviderType = "gpt") {
     return this.db.temporaryAccountGroups
-      .filter((group) => normalizeTemporaryAccountProviderType(group.providerType) === "gpt")
+      .filter((group) => normalizeTemporaryAccountProviderType(group.providerType) === providerType)
       .filter((group) => !groupId || group.id === groupId)
       .flatMap((group) => group.accounts.map((account) => ({ group, account })));
   }
 
-  temporaryAccountCheckTarget(accountId: string) {
+  temporaryAccountCheckTarget(accountId: string, providerType?: TemporaryAccountProviderType) {
     for (const group of this.db.temporaryAccountGroups) {
-      if (normalizeTemporaryAccountProviderType(group.providerType) !== "gpt") continue;
+      if (providerType && normalizeTemporaryAccountProviderType(group.providerType) !== providerType) continue;
       const account = group.accounts.find((item) => item.id === accountId);
       if (account) return { group, account };
     }
@@ -910,7 +1218,7 @@ export class JsonStore {
     this.persist();
   }
 
-  createApiKey(name: string): ApiKeyCreated {
+  createApiKey(name: string, models: string[] = []): ApiKeyCreated {
     if (!name.trim()) throw new Error("密钥名称不能为空");
     const timestamp = now();
     const plainTextKey = `sk-samapi-${randomBytes(24).toString("base64url")}`;
@@ -920,6 +1228,7 @@ export class JsonStore {
       prefix: plainTextKey.slice(0, 18),
       keyHash: hashSecret(plainTextKey),
       enabled: true,
+      models: normalizeModelList(models),
       createdAt: timestamp,
       updatedAt: timestamp,
       plainTextKey
@@ -934,7 +1243,9 @@ export class JsonStore {
     if (!current) throw new Error("密钥不存在");
     if (typeof input.name === "string") current.name = input.name.trim();
     if (typeof input.enabled === "boolean") current.enabled = input.enabled;
+    if (Array.isArray(input.models)) current.models = normalizeModelList(input.models);
     current.updatedAt = now();
+    this.persistApiKey(current);
     this.persist();
     return current;
   }
@@ -1030,7 +1341,7 @@ export class JsonStore {
     if (!found) return false;
     found.lastUsedAt = now();
     this.persistApiKeyLastUsedAt(found);
-    return true;
+    return found;
   }
 
   upsertHeaderTemplate(input: Partial<HeaderTemplate>) {
@@ -1097,6 +1408,7 @@ export class JsonStore {
       model: input.model.trim(),
       endpoint: input.endpoint || "messages",
       headerTemplateId: input.headerTemplateId || undefined,
+      proxy: normalizeRouteProxy(input.proxy),
       enabled: input.enabled ?? true,
       updatedAt: timestamp
     };
@@ -1137,10 +1449,9 @@ export class JsonStore {
     const matchRule = normalizeMatchRule(input.matchRule ?? currentGroup?.matchRule ?? input.modelGroupId ?? input.name);
     const members = this.normalizeGroupRouteMembers(
       input.members ?? currentGroup?.members ?? [],
-      matchRule,
       input.modelGroupId ?? currentGroup?.modelGroupId
     );
-    if (members.length === 0) throw new Error("请至少选择一个组内模型，或填写能匹配到模型的规则");
+    if (members.length === 0) throw new Error("请至少选择一个组内模型");
 
     const routeShape = {
       name: input.name.trim(),
@@ -1151,6 +1462,7 @@ export class JsonStore {
       members,
       endpoint: input.endpoint || "messages",
       headerTemplateId: input.headerTemplateId || undefined,
+      proxy: normalizeRouteProxy(input.proxy),
       enabled: input.enabled ?? true,
       updatedAt: timestamp
     };
@@ -1201,7 +1513,7 @@ export class JsonStore {
     return { route, site, addresses, headerTemplate };
   }
 
-  private normalizeGroupRouteMembers(inputMembers: Array<Partial<GroupRouteMember>> = [], matchRule = "", legacyModelGroupId?: string) {
+  private normalizeGroupRouteMembers(inputMembers: Array<Partial<GroupRouteMember>> = [], legacyModelGroupId?: string) {
     const members = new Map<string, GroupRouteMember>();
     const addMember = (input: Partial<GroupRouteMember>) => {
       const siteId = input.siteId?.trim();
@@ -1228,7 +1540,6 @@ export class JsonStore {
       }
     };
 
-    addMatchingModels(matchRule);
     if (members.size === 0 && legacyModelGroupId) addMatchingModels(legacyModelGroupId);
     return Array.from(members.values());
   }
@@ -1237,7 +1548,7 @@ export class JsonStore {
     this.db.routes = this.db.routes.map((route) => {
       if (route.type !== "group") return route;
       const matchRule = normalizeMatchRule(route.matchRule || route.modelGroupId || route.name);
-      const members = this.normalizeGroupRouteMembers(route.members || [], matchRule, route.modelGroupId);
+      const members = this.normalizeGroupRouteMembers(route.members || [], route.modelGroupId);
       const oldKeys = (route.members || []).map(groupMemberKey).sort().join("\n");
       const newKeys = members.map(groupMemberKey).sort().join("\n");
       if (matchRule === route.matchRule && oldKeys === newKeys) return route;
@@ -1274,7 +1585,7 @@ export class JsonStore {
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS auth (id INTEGER PRIMARY KEY CHECK (id = 1), admin_password_hash TEXT);
       CREATE TABLE IF NOT EXISTS sites (id TEXT PRIMARY KEY, name TEXT NOT NULL, site_type TEXT NOT NULL, addresses_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, prefix TEXT NOT NULL, key_hash TEXT NOT NULL, plain_text_key TEXT, enabled INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_used_at TEXT);
+      CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, prefix TEXT NOT NULL, key_hash TEXT NOT NULL, plain_text_key TEXT, enabled INTEGER NOT NULL, models_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_used_at TEXT);
       CREATE TABLE IF NOT EXISTS provider_api_key_groups (id TEXT PRIMARY KEY, site_id TEXT NOT NULL, group_name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS provider_api_keys (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'api-key', enabled INTEGER NOT NULL, models_json TEXT NOT NULL, last_checked_at TEXT, FOREIGN KEY (group_id) REFERENCES provider_api_key_groups(id) ON DELETE CASCADE);
       CREATE INDEX IF NOT EXISTS idx_provider_api_keys_group_id ON provider_api_keys(group_id);
@@ -1291,6 +1602,7 @@ export class JsonStore {
     this.ensureSqliteColumn("temporary_account_groups", "provider_type", "TEXT");
     this.ensureSqliteColumn("temporary_accounts", "provider_type", "TEXT");
     this.ensureSqliteColumn("provider_api_keys", "kind", "TEXT NOT NULL DEFAULT 'api-key'");
+    this.ensureSqliteColumn("api_keys", "models_json", "TEXT NOT NULL DEFAULT '[]'");
   }
 
   private ensureSqliteColumn(table: string, column: string, definition: string) {
@@ -1323,7 +1635,7 @@ export class JsonStore {
     const legacyTemporaryAccountGroups = parsed.temporaryAccountGroups || [];
     return {
       sites: (parsed.sites || []).map((site) => ({ ...site, siteType: normalizeSiteType(site.siteType) })),
-      apiKeys: parsed.apiKeys || [],
+      apiKeys: (parsed.apiKeys || []).map((key) => ({ ...key, models: normalizeModelList(key.models) })),
       providerApiKeyGroups: parsed.providerApiKeyGroups || [],
       temporaryAccountGroups: this.loadTemporaryAccountGroups(legacyTemporaryAccountGroups),
       headerTemplates: parsed.headerTemplates || [],
@@ -1352,6 +1664,7 @@ export class JsonStore {
       keyHash: String(row.key_hash),
       plainTextKey: row.plain_text_key == null ? undefined : String(row.plain_text_key),
       enabled: Boolean(row.enabled),
+      models: normalizeModelList(JSON.parse(String(row.models_json || "[]"))),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
       lastUsedAt: row.last_used_at == null ? undefined : String(row.last_used_at)
@@ -1475,8 +1788,8 @@ export class JsonStore {
     this.sqlite.prepare("INSERT INTO auth (id, admin_password_hash) VALUES (1, ?)").run(db.adminPasswordHash || null);
     const insertSite = this.sqlite.prepare("INSERT INTO sites (id, name, site_type, addresses_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)");
     for (const site of db.sites) insertSite.run(site.id, site.name, site.siteType, JSON.stringify(site.addresses), site.createdAt, site.updatedAt);
-    const insertApiKey = this.sqlite.prepare("INSERT INTO api_keys (id, name, prefix, key_hash, plain_text_key, enabled, created_at, updated_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const key of db.apiKeys) insertApiKey.run(key.id, key.name, key.prefix, key.keyHash, key.plainTextKey || null, key.enabled ? 1 : 0, key.createdAt, key.updatedAt, key.lastUsedAt || null);
+    const insertApiKey = this.sqlite.prepare("INSERT INTO api_keys (id, name, prefix, key_hash, plain_text_key, enabled, models_json, created_at, updated_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const key of db.apiKeys) insertApiKey.run(key.id, key.name, key.prefix, key.keyHash, key.plainTextKey || null, key.enabled ? 1 : 0, JSON.stringify(key.models || []), key.createdAt, key.updatedAt, key.lastUsedAt || null);
     const insertProviderGroup = this.sqlite.prepare("INSERT INTO provider_api_key_groups (id, site_id, group_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
     const insertProviderKey = this.sqlite.prepare("INSERT INTO provider_api_keys (id, group_id, label, prefix, secret, kind, enabled, models_json, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
     for (const group of db.providerApiKeyGroups) {
@@ -1522,6 +1835,11 @@ export class JsonStore {
 
   private persistApiKeyLastUsedAt(apiKey: ApiKeyRecord) {
     this.sqlite.prepare("UPDATE api_keys SET last_used_at = ? WHERE id = ?").run(apiKey.lastUsedAt || null, apiKey.id);
+  }
+
+  private persistApiKey(apiKey: ApiKeyRecord) {
+    this.sqlite.prepare("UPDATE api_keys SET name = ?, enabled = ?, models_json = ?, updated_at = ?, last_used_at = ? WHERE id = ?")
+      .run(apiKey.name, apiKey.enabled ? 1 : 0, JSON.stringify(apiKey.models || []), apiKey.updatedAt, apiKey.lastUsedAt || null, apiKey.id);
   }
 
   private normalizeProviderApiKeyEntry(input: Partial<ProviderApiKeyEntry>, index: number, existingKeys: ProviderApiKeyEntry[] = []): ProviderApiKeyEntry {

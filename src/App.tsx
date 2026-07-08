@@ -10,6 +10,7 @@ import {
   LockKeyhole,
   LogIn,
   Map,
+  Pencil,
   Plus,
   RefreshCw,
   Route,
@@ -38,6 +39,8 @@ import type {
   ProviderApiKeyKind,
   ProviderModelGroupOption,
   RequestLog,
+  RequestLogSummary,
+  RouteProxyConfig,
   RouteRecord,
   RouteType,
   Site,
@@ -68,6 +71,7 @@ interface RouteDraft {
   strategy?: GroupRouteStrategy;
   endpoint?: EndpointKind;
   headerTemplateId?: string;
+  proxy?: RouteProxyConfig;
   enabled?: boolean;
   createdAt?: string;
   updatedAt?: string;
@@ -151,6 +155,12 @@ const groupStrategyLabels: Record<GroupRouteStrategy, string> = {
   "stable-first": "稳定优先",
   sequential: "顺序执行",
   random: "随机调用"
+};
+
+const routeProxyModeLabels: Record<RouteProxyConfig["mode"], string> = {
+  direct: "直连",
+  system: "系统代理",
+  custom: "自定义代理"
 };
 
 const temporaryAccountSourceLabels: Record<TemporaryAccountImportSource, string> = {
@@ -237,19 +247,19 @@ function updateSiteChromeFromTheme() {
 }
 
 const navItems = [
-  { id: "routes", label: "路由管理", icon: Route },
-  { id: "sites", label: "站点管理", icon: Server },
-  { id: "providerKeys", label: "API Key 管理", icon: KeyRound },
+  { id: "routes", label: "模型路由", icon: Route },
+  { id: "sites", label: "上游站点", icon: Server },
+  { id: "providerKeys", label: "上游密钥", icon: KeyRound },
   { id: "temporaryAccounts", label: "临时账号", icon: Upload },
   { id: "keys", label: "客户端密钥", icon: ShieldCheck },
-  { id: "headers", label: "Header 模版", icon: Braces },
-  { id: "logs", label: "日志管理", icon: Activity },
-  { id: "docs", label: "接入", icon: Map }
+  { id: "headers", label: "请求头模板", icon: Braces },
+  { id: "logs", label: "请求日志", icon: Activity },
+  { id: "docs", label: "接入指南", icon: Map }
 ] satisfies Array<{ id: Section; label: string; icon: typeof Route }>;
 
-const settingsNavItem = { id: "settings", label: "设置", icon: Settings } satisfies { id: Section; label: string; icon: typeof Route };
+const settingsNavItem = { id: "settings", label: "系统设置", icon: Settings } satisfies { id: Section; label: string; icon: typeof Route };
 const allNavItems = [...navItems, settingsNavItem];
-const LOGS_PAGE_SIZE = 5;
+const LOGS_PAGE_SIZE = 3;
 
 function groupMemberKey(member: GroupRouteMember) {
   return `${member.siteId}::${member.apiKeyId}::${member.model}`;
@@ -385,6 +395,7 @@ function emptyRoute(snapshot?: AppSnapshot, type: RouteType = "switch"): RouteDr
       strategy: "stable-first",
       endpoint: "messages",
       headerTemplateId: snapshot?.headerTemplates[0]?.id,
+      proxy: { mode: "direct" },
       enabled: true
     };
   }
@@ -416,6 +427,21 @@ function serializeModelText(models: string[]) {
 
 function mergeModelOptions(...modelLists: Array<Array<string | undefined>>) {
   return Array.from(new Set(modelLists.flat().filter((model): model is string => Boolean(model)))).sort();
+}
+
+function normalizedRouteProxy(proxy?: RouteProxyConfig): RouteProxyConfig {
+  if (proxy?.mode === "system") return { mode: "system" };
+  if (proxy?.mode === "custom") return { mode: "custom", url: proxy.url || "" };
+  return { mode: "direct" };
+}
+
+function routeProxyConfigsEqual(left?: RouteProxyConfig, right?: RouteProxyConfig) {
+  const normalizedLeft = normalizedRouteProxy(left);
+  const normalizedRight = normalizedRouteProxy(right);
+  return (
+    normalizedLeft.mode === normalizedRight.mode &&
+    (normalizedLeft.mode !== "custom" || normalizedLeft.url === normalizedRight.url)
+  );
 }
 
 function emptySite(): Partial<Site> {
@@ -874,6 +900,8 @@ export default function App() {
   const [headerDraft, setHeaderDraft] = useState<HeaderTemplateDraft>(emptyHeader());
   const [headerEditorOpen, setHeaderEditorOpen] = useState(false);
   const [keyName, setKeyName] = useState("client-app");
+  const [keyModelsText, setKeyModelsText] = useState("");
+  const [editingKeyId, setEditingKeyId] = useState<string | null>(null);
   const [keyEditorOpen, setKeyEditorOpen] = useState(false);
   const [createdKey, setCreatedKey] = useState<ApiKeyCreated | null>(null);
   const [toast, setToast] = useState<string>("");
@@ -881,13 +909,19 @@ export default function App() {
   const [appScrollbarThumb, setAppScrollbarThumb] = useState({ height: 0, scrollable: false, top: 0 });
   const [logsAutoRefresh, setLogsAutoRefresh] = useState(true);
   const [logsRefreshing, setLogsRefreshing] = useState(false);
+  const [logsLoadingMore, setLogsLoadingMore] = useState(false);
   const [logsTotal, setLogsTotal] = useState(0);
-  const [logsPage, setLogsPage] = useState(0);
+  const [selectedLogId, setSelectedLogId] = useState<string | null>(null);
+  const [selectedLogDetail, setSelectedLogDetail] = useState<RequestLog | null>(null);
+  const [selectedLogLoading, setSelectedLogLoading] = useState(false);
+  const [selectedLogError, setSelectedLogError] = useState("");
   const [busy, setBusy] = useState(false);
   const [modelSyncing, setModelSyncing] = useState(false);
   const [modelDiscoveringIndex, setModelDiscoveringIndex] = useState<number | null>(null);
   const [providerModelGroupOptions, setProviderModelGroupOptions] = useState<Record<number, ProviderModelGroupOption[]>>({});
   const [temporaryAccountChecking, setTemporaryAccountChecking] = useState<string | null>(null);
+  const [temporaryAccountCheckProviderType, setTemporaryAccountCheckProviderType] = useState<Extract<TemporaryAccountProviderType, "gpt" | "grok">>("gpt");
+  const [temporaryAccountCheckProxyMode, setTemporaryAccountCheckProxyMode] = useState<RouteProxyConfig["mode"]>("system");
   const [temporaryAccountUpdating, setTemporaryAccountUpdating] = useState<string | null>(null);
   const [temporaryAccountDeleting, setTemporaryAccountDeleting] = useState<string | null>(null);
   const [selectedTemporaryAccountIds, setSelectedTemporaryAccountIds] = useState<string[]>([]);
@@ -897,6 +931,13 @@ export default function App() {
   const toastStartedAtRef = useRef(0);
   const toastRemainingMsRef = useRef(0);
   const appScrollbarTimerRef = useRef<number | undefined>(undefined);
+  const appScrollbarDragRef = useRef<{
+    maxScrollTop: number;
+    maxThumbTop: number;
+    pointerId: number;
+    startScrollTop: number;
+    startY: number;
+  } | null>(null);
 
   const clearToastTimer = () => {
     if (toastTimerRef.current === undefined) return;
@@ -941,6 +982,7 @@ export default function App() {
   const showAppScrollbar = () => {
     setAppScrollbarVisible(true);
     clearAppScrollbarTimer();
+    if (appScrollbarDragRef.current) return;
     appScrollbarTimerRef.current = window.setTimeout(() => {
       setAppScrollbarVisible(false);
       appScrollbarTimerRef.current = undefined;
@@ -948,6 +990,7 @@ export default function App() {
   };
 
   const hideAppScrollbar = () => {
+    if (appScrollbarDragRef.current) return;
     clearAppScrollbarTimer();
     setAppScrollbarVisible(false);
   };
@@ -981,6 +1024,52 @@ export default function App() {
     showAppScrollbar();
   };
 
+  const startAppScrollbarDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const element = appScrollRef.current;
+    if (!element || !appScrollbarThumb.scrollable) return;
+    const maxScrollTop = Math.max(1, element.scrollHeight - element.clientHeight);
+    const trackHeight = Math.max(0, element.clientHeight - 16);
+    const maxThumbTop = Math.max(1, trackHeight - appScrollbarThumb.height);
+    appScrollbarDragRef.current = {
+      maxScrollTop,
+      maxThumbTop,
+      pointerId: event.pointerId,
+      startScrollTop: element.scrollTop,
+      startY: event.clientY
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+    event.stopPropagation();
+    setAppScrollbarVisible(true);
+    clearAppScrollbarTimer();
+  };
+
+  const moveAppScrollbarDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = appScrollbarDragRef.current;
+    const element = appScrollRef.current;
+    if (!drag || drag.pointerId !== event.pointerId || !element) return;
+    const deltaY = event.clientY - drag.startY;
+    const nextScrollTop = Math.min(
+      drag.maxScrollTop,
+      Math.max(0, drag.startScrollTop + (deltaY / drag.maxThumbTop) * drag.maxScrollTop)
+    );
+    element.scrollTop = nextScrollTop;
+    updateAppScrollbar();
+    event.preventDefault();
+  };
+
+  const stopAppScrollbarDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = appScrollbarDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    appScrollbarDragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    updateAppScrollbar();
+    showAppScrollbar();
+  };
+
   const handleUnauthorized = (error: unknown) => {
     if (!isUnauthorizedError(error)) return false;
     setSnapshot(null);
@@ -1004,7 +1093,7 @@ export default function App() {
         api.listHeaders(),
         api.listRoutes(),
         options.includeRequestLogs
-          ? api.listLogs(LOGS_PAGE_SIZE, logsPage * LOGS_PAGE_SIZE).then((result) => {
+          ? api.listLogs(LOGS_PAGE_SIZE, 0).then((result) => {
               setLogsTotal(result.total);
               return result.items;
             })
@@ -1088,14 +1177,12 @@ export default function App() {
     }
   };
 
-  const loadLogsPage = async (page = logsPage, showSuccess = false) => {
+  const loadInitialLogs = async (showSuccess = false) => {
     setLogsRefreshing(true);
     try {
-      const offset = page * LOGS_PAGE_SIZE;
-      const result = await api.listLogs(LOGS_PAGE_SIZE, offset);
+      const result = await api.listLogs(LOGS_PAGE_SIZE, 0);
       setSnapshot((current) => (current ? { ...current, requestLogs: result.items } : current));
       setLogsTotal(result.total);
-      setLogsPage(result.total > 0 && offset >= result.total ? Math.max(0, Math.ceil(result.total / LOGS_PAGE_SIZE) - 1) : page);
       if (showSuccess) setToast("日志已刷新");
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "日志刷新失败");
@@ -1104,16 +1191,34 @@ export default function App() {
     }
   };
 
-  const refreshLogs = async (showSuccess = false) => {
-    if (logsPage !== 0) {
-      await loadLogsPage(logsPage, showSuccess);
-      return;
+  const loadMoreLogs = async () => {
+    const offset = snapshot?.requestLogs.length || 0;
+    if (logsLoadingMore || offset >= logsTotal) return;
+    setLogsLoadingMore(true);
+    try {
+      const result = await api.listLogs(LOGS_PAGE_SIZE, offset);
+      setSnapshot((current) => {
+        if (!current) return current;
+        const existingIds = new Set(current.requestLogs.map((log) => log.id));
+        return { ...current, requestLogs: [...current.requestLogs, ...result.items.filter((log) => !existingIds.has(log.id))] };
+      });
+      setLogsTotal(result.total);
+    } catch (error) {
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "日志加载失败");
+    } finally {
+      setLogsLoadingMore(false);
     }
+  };
+
+  const refreshLogs = async (showSuccess = false) => {
     setLogsRefreshing(true);
     try {
       const latestCreatedAt = snapshot?.requestLogs[0]?.createdAt;
       if (!latestCreatedAt) {
-        await loadLogsPage(0, showSuccess);
+        const result = await api.listLogs(LOGS_PAGE_SIZE, 0);
+        setSnapshot((current) => (current ? { ...current, requestLogs: result.items } : current));
+        setLogsTotal(result.total);
+        if (showSuccess) setToast("日志已刷新");
         return;
       }
       const result = await api.listNewLogs(latestCreatedAt);
@@ -1121,8 +1226,7 @@ export default function App() {
         setSnapshot((current) => {
           if (!current) return current;
           const existingIds = new Set(current.requestLogs.map((log) => log.id));
-          const mergedLogs = [...result.items.filter((log) => !existingIds.has(log.id)), ...current.requestLogs].slice(0, LOGS_PAGE_SIZE);
-          return { ...current, requestLogs: mergedLogs };
+          return { ...current, requestLogs: [...result.items.filter((log) => !existingIds.has(log.id)), ...current.requestLogs] };
         });
       }
       setLogsTotal(result.total);
@@ -1132,6 +1236,45 @@ export default function App() {
     } finally {
       setLogsRefreshing(false);
     }
+  };
+
+  const openLogDetail = async (id: string) => {
+    setSelectedLogId(id);
+    setSelectedLogDetail(null);
+    setSelectedLogError("");
+    setSelectedLogLoading(true);
+    try {
+      setSelectedLogDetail(await api.getLog(id));
+    } catch (error) {
+      if (!handleUnauthorized(error)) setSelectedLogError(error instanceof Error ? error.message : "日志详情加载失败");
+    } finally {
+      setSelectedLogLoading(false);
+    }
+  };
+
+  const closeLogDetail = () => {
+    setSelectedLogId(null);
+    setSelectedLogDetail(null);
+    setSelectedLogError("");
+    setSelectedLogLoading(false);
+  };
+
+  const deleteLog = async (id: string) => {
+    await mutate(async () => {
+      await api.deleteLog(id);
+      setSnapshot((current) => (current ? { ...current, requestLogs: current.requestLogs.filter((log) => log.id !== id) } : current));
+      setLogsTotal((current) => Math.max(0, current - 1));
+      if (selectedLogId === id) closeLogDetail();
+    }, "日志已删除");
+  };
+
+  const clearLogs = async () => {
+    await mutate(async () => {
+      await api.clearLogs();
+      setSnapshot((current) => (current ? { ...current, requestLogs: [] } : current));
+      setLogsTotal(0);
+      closeLogDetail();
+    }, "日志已清空");
   };
 
   useEffect(() => {
@@ -1175,8 +1318,8 @@ export default function App() {
 
   useEffect(() => {
     if (authStatus !== "signed-in" || section !== "logs") return;
-    loadLogsPage(logsPage);
-  }, [authStatus, section, logsPage]);
+    loadInitialLogs();
+  }, [authStatus, section]);
 
   useEffect(() => {
     if (authStatus !== "signed-in" || section !== "logs" || !logsAutoRefresh) return;
@@ -1184,7 +1327,7 @@ export default function App() {
       refreshLogs();
     }, 5000);
     return () => window.clearInterval(interval);
-  }, [authStatus, section, logsAutoRefresh, logsPage, snapshot?.requestLogs[0]?.createdAt]);
+  }, [authStatus, section, logsAutoRefresh, snapshot?.requestLogs[0]?.createdAt]);
 
   const selectedSite = useMemo(
     () => snapshot?.sites.find((site) => site.id === routeDraft.siteId),
@@ -1279,12 +1422,12 @@ export default function App() {
   const checkTemporaryAccounts = async () => {
     setTemporaryAccountChecking("all");
     try {
-      const result = await api.checkTemporaryAccounts();
+      const result = await api.checkTemporaryAccounts({ providerType: temporaryAccountCheckProviderType, proxy: { mode: temporaryAccountCheckProxyMode } });
       const temporaryAccountGroups = await api.listTemporaryAccountGroups();
       setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
       setTemporaryAccountsLoaded(true);
       setTemporaryAccountsLoading(false);
-      setToast(`GPT 账号检查完成：${temporaryAccountCheckSummary(result)}`);
+      setToast(`${temporaryAccountProviderLabels[temporaryAccountCheckProviderType]} 账号检查完成：${temporaryAccountCheckSummary(result)}`);
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号检查失败");
     } finally {
@@ -1296,7 +1439,7 @@ export default function App() {
     if (temporaryAccountChecking) return;
     setTemporaryAccountChecking(id);
     try {
-      const result = await api.checkTemporaryAccount(id);
+      const result = await api.checkTemporaryAccount(id, { proxy: { mode: temporaryAccountCheckProxyMode } });
       const temporaryAccountGroups = await api.listTemporaryAccountGroups();
       setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
       setTemporaryAccountsLoaded(true);
@@ -1343,10 +1486,16 @@ export default function App() {
   };
 
   const deleteSelectedTemporaryAccounts = async () => {
-    if (temporaryAccountDeleting || selectedTemporaryAccountIds.length === 0) return;
+    const currentTypeAccountIds = new Set(
+      (snapshot?.temporaryAccountGroups || [])
+        .filter((group) => (group.providerType || "gpt") === temporaryAccountCheckProviderType)
+        .flatMap((group) => group.accounts.map((account) => account.id))
+    );
+    const idsToDelete = selectedTemporaryAccountIds.filter((id) => currentTypeAccountIds.has(id));
+    if (temporaryAccountDeleting || idsToDelete.length === 0) return;
     setTemporaryAccountDeleting("batch");
     try {
-      await api.deleteTemporaryAccounts(selectedTemporaryAccountIds);
+      await api.deleteTemporaryAccounts(idsToDelete);
       const temporaryAccountGroups = await api.listTemporaryAccountGroups();
       setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
       setSelectedTemporaryAccountIds([]);
@@ -1369,6 +1518,8 @@ export default function App() {
       setHeaderEditorOpen(false);
     }, "Header 模版已保存");
   };
+
+  const apiKeyModelOptions = useMemo(() => (snapshot?.routes || []).filter((route) => route.enabled).map((route) => route.name).sort(), [snapshot?.routes]);
 
   const openNewRoute = () => {
     setRouteDraft(emptyRoute(snapshot || undefined));
@@ -1478,12 +1629,23 @@ export default function App() {
 
   const openNewKey = () => {
     setKeyName("client-app");
+    setKeyModelsText("");
+    setEditingKeyId(null);
+    setCreatedKey(null);
+    setKeyEditorOpen(true);
+  };
+
+  const openEditKey = (key: AppSnapshot["apiKeys"][number]) => {
+    setKeyName(key.name);
+    setKeyModelsText(serializeModelText(key.models || []));
+    setEditingKeyId(key.id);
     setCreatedKey(null);
     setKeyEditorOpen(true);
   };
 
   const closeKeyEditor = () => {
     setKeyEditorOpen(false);
+    setEditingKeyId(null);
     setCreatedKey(null);
   };
 
@@ -1696,6 +1858,13 @@ export default function App() {
                 editorOpen={temporaryAccountEditorOpen}
                 busy={busy}
                 checking={temporaryAccountChecking}
+                checkProviderType={temporaryAccountCheckProviderType}
+                onCheckProviderTypeChange={(providerType) => {
+                  setTemporaryAccountCheckProviderType(providerType);
+                  setSelectedTemporaryAccountIds([]);
+                }}
+                checkProxyMode={temporaryAccountCheckProxyMode}
+                onCheckProxyModeChange={setTemporaryAccountCheckProxyMode}
                 updating={temporaryAccountUpdating}
                 deleting={temporaryAccountDeleting}
                 selectedAccountIds={selectedTemporaryAccountIds}
@@ -1718,16 +1887,27 @@ export default function App() {
               <KeysView
                 snapshot={snapshot}
                 keyName={keyName}
+                keyModelsText={keyModelsText}
+                modelOptions={apiKeyModelOptions}
                 editorOpen={keyEditorOpen}
+                editingKeyId={editingKeyId}
                 createdKey={createdKey}
                 onKeyName={setKeyName}
-                onCreate={() =>
+                onKeyModelsText={setKeyModelsText}
+                onSubmit={() =>
                   mutate(async () => {
-                    const key = await api.createKey(keyName);
-                    setCreatedKey(key);
-                  }, "密钥已生成")
+                    const models = parseModelText(keyModelsText);
+                    if (editingKeyId) {
+                      await api.updateKey(editingKeyId, { name: keyName, models });
+                      setKeyEditorOpen(false);
+                    } else {
+                      const key = await api.createKey(keyName, models);
+                      setCreatedKey(key);
+                    }
+                  }, editingKeyId ? "密钥已更新" : "密钥已生成")
                 }
                 onClose={closeKeyEditor}
+                onEdit={openEditKey}
                 onToggle={(id, enabled) => mutate(async () => api.updateKey(id, { enabled }), "密钥已更新")}
                 onDelete={(id) => mutate(async () => api.deleteKey(id), "密钥已删除")}
                 onCopy={copyText}
@@ -1749,13 +1929,17 @@ export default function App() {
               <LogsView
                 snapshot={snapshot}
                 total={logsTotal}
-                page={logsPage}
                 pageSize={LOGS_PAGE_SIZE}
                 autoRefresh={logsAutoRefresh}
+                refreshing={logsRefreshing}
+                loadingMore={logsLoadingMore}
+                selectedLogId={selectedLogId}
                 onAutoRefresh={setLogsAutoRefresh}
-                onPage={setLogsPage}
-                onDelete={(id) => mutate(async () => api.deleteLog(id), "日志已删除")}
-                onClear={() => mutate(async () => api.clearLogs(), "日志已清空")}
+                onLoadMore={loadMoreLogs}
+                onOpenLog={openLogDetail}
+                onCloseLog={closeLogDetail}
+                onDelete={deleteLog}
+                onClear={clearLogs}
               />
             )}
             {section === "settings" && (
@@ -1774,9 +1958,22 @@ export default function App() {
             {section === "docs" && <DocsView snapshot={snapshot} onCopy={copyText} />}
               </div>
             </div>
+            {selectedLogId ? (
+              <LogDetailModal
+                log={selectedLogDetail}
+                loading={selectedLogLoading}
+                error={selectedLogError}
+                onClose={closeLogDetail}
+                onDelete={deleteLog}
+              />
+            ) : null}
             <div className={`app-scrollbar-float ${appScrollbarVisible && appScrollbarThumb.scrollable ? "app-scrollbar-float-visible" : ""}`}>
               <div
                 className="app-scrollbar-thumb"
+                onPointerCancel={stopAppScrollbarDrag}
+                onPointerDown={startAppScrollbarDrag}
+                onPointerMove={moveAppScrollbarDrag}
+                onPointerUp={stopAppScrollbarDrag}
                 style={{
                   height: `${appScrollbarThumb.height}px`,
                   transform: `translateY(${appScrollbarThumb.top}px)`
@@ -1830,12 +2027,27 @@ function RoutesView(props: {
       model: models[0] || ""
     });
   };
+  const updateRouteProxy = (route: SwitchRoute, mode: RouteProxyConfig["mode"]) => {
+    const currentProxy = routeDraft(route).proxy;
+    const customUrl = currentProxy?.mode === "custom" ? currentProxy.url : route.proxy?.mode === "custom" ? route.proxy.url : currentProxy?.url;
+    updateRouteDraft(route, {
+      proxy: mode === "custom" ? { mode, url: customUrl } : { mode }
+    });
+  };
   const saveQuickRoute = async (route: SwitchRoute) => {
     const next = routeDraft(route);
     await props.onQuickSave(next);
     setQuickDrafts((current) => {
       const { [route.id]: _saved, ...rest } = current;
       return rest;
+    });
+  };
+  const toggleRouteEnabled = async (route: SwitchRoute) => {
+    const enabled = !route.enabled;
+    await props.onQuickSave({ ...route, enabled });
+    setQuickDrafts((current) => {
+      const draft = current[route.id];
+      return draft ? { ...current, [route.id]: { ...draft, enabled } } : current;
     });
   };
   const draftType = props.draft.type || "switch";
@@ -1889,7 +2101,7 @@ function RoutesView(props: {
     props.onDraft({ ...props.draft, type: "group", matchRule: props.draft.matchRule || query, members: uniqueMembers([...draftMembers, ...matched]) });
   };
   const clearGroupSelection = () => updateGroupMembers([]);
-  const canSaveRoute = draftType !== "group" || selectedAvailableCount > 0 || Boolean(props.draft.matchRule?.trim());
+  const canSaveRoute = draftType !== "group" || selectedAvailableCount > 0;
   return (
     <>
       {routeCount === 0 ? (
@@ -1911,18 +2123,21 @@ function RoutesView(props: {
               const quickSite = props.snapshot.sites.find((item) => item.id === quick.siteId) || site;
               const models = siteModels(quickSite);
               const modelOptions = mergeModelOptions([quick.model], models);
+              const quickProxy = normalizedRouteProxy(quick.proxy);
+              const hasCustomProxyOption = Boolean(route.proxy?.mode === "custom" && route.proxy.url?.trim());
               const isOpen = Boolean(expanded[route.id]);
               const hasChanges =
                 quick.siteId !== route.siteId ||
                 quick.model !== route.model ||
                 quick.endpoint !== route.endpoint ||
                 quick.headerTemplateId !== route.headerTemplateId ||
+                !routeProxyConfigsEqual(quick.proxy, route.proxy) ||
                 quick.enabled !== route.enabled;
               const toggleRoute = () => setExpanded((current) => ({ ...current, [route.id]: !isOpen }));
               return (
                 <article
                   key={route.id}
-                  className={`record route-record ${isOpen ? "route-record-open" : ""}`}
+                  className={`record route-record switch-route-record ${isOpen ? "route-record-open" : ""}`}
                   role="button"
                   tabIndex={0}
                   aria-expanded={isOpen}
@@ -1951,6 +2166,16 @@ function RoutesView(props: {
                     onClick={(event) => event.stopPropagation()}
                     onKeyDown={(event) => event.stopPropagation()}
                   >
+                    <ActionButton
+                      tone="ghost"
+                      className={`route-enable-action ${route.enabled ? "route-enable-action-on" : "route-enable-action-off"}`}
+                      aria-pressed={route.enabled}
+                      title={route.enabled ? "当前已启用，点击停用" : "当前已停用，点击启用"}
+                      onClick={() => toggleRouteEnabled(route)}
+                    >
+                      <span className="route-enable-dot" aria-hidden="true" />
+                      <span>{route.enabled ? "启用" : "停用"}</span>
+                    </ActionButton>
                     <ActionButton tone="ghost" title="复制模型名" onClick={() => props.onCopy(route.name)}>
                       <Copy className="h-4 w-4" />
                     </ActionButton>
@@ -1994,12 +2219,17 @@ function RoutesView(props: {
                             ))}
                           </SelectInput>
                         </label>
-                        <div className="route-quick-control">
-                          <span className="route-quick-label">可用模型</span>
-                          <div className="route-quick-body route-quick-stat">
-                            <strong>{models.length} 个</strong>
-                          </div>
-                        </div>
+                        <label className="route-quick-control">
+                          <span className="route-quick-label">代理模式</span>
+                          <SelectInput
+                            value={quickProxy.mode}
+                            onChange={(event) => updateRouteProxy(route, event.target.value as RouteProxyConfig["mode"])}
+                          >
+                            <option value="direct">{routeProxyModeLabels.direct}</option>
+                            <option value="system">{routeProxyModeLabels.system}</option>
+                            {hasCustomProxyOption ? <option value="custom">{routeProxyModeLabels.custom}</option> : null}
+                          </SelectInput>
+                        </label>
                         <label className="route-quick-control">
                           <span className="route-quick-label">Endpoint</span>
                           <SelectInput
@@ -2026,17 +2256,6 @@ function RoutesView(props: {
                               </option>
                             ))}
                           </SelectInput>
-                        </label>
-                        <label className="route-quick-control">
-                          <span className="route-quick-label">状态</span>
-                          <span className="route-quick-body route-quick-toggle">
-                            <input
-                              type="checkbox"
-                              checked={quick.enabled ?? true}
-                              onChange={(event) => updateRouteDraft(route, { enabled: event.target.checked })}
-                            />
-                            启用
-                          </span>
                         </label>
                       </div>
                       <div className="route-quick-actions">
@@ -2375,6 +2594,33 @@ function RoutesView(props: {
                     ))}
                   </SelectInput>
                 </label>
+                <label>
+                  代理模式
+                  <SelectInput
+                    value={props.draft.proxy?.mode || "direct"}
+                    onChange={(event) => {
+                      const mode = event.target.value as RouteProxyConfig["mode"];
+                      props.onDraft({
+                        ...props.draft,
+                        proxy: mode === "direct" ? { mode } : { mode, url: props.draft.proxy?.url }
+                      });
+                    }}
+                  >
+                    <option value="direct">{routeProxyModeLabels.direct}</option>
+                    <option value="system">{routeProxyModeLabels.system}</option>
+                    <option value="custom">{routeProxyModeLabels.custom}</option>
+                  </SelectInput>
+                </label>
+                {props.draft.proxy?.mode === "custom" ? (
+                  <label>
+                    代理地址
+                    <TextInput
+                      value={props.draft.proxy.url || ""}
+                      placeholder="http://127.0.0.1:7890"
+                      onChange={(event) => props.onDraft({ ...props.draft, proxy: { mode: "custom", url: event.target.value } })}
+                    />
+                  </label>
+                ) : null}
               </div>
               <label className="toggle-row mt-3">
                 <input
@@ -2679,9 +2925,12 @@ function ProviderKeysView(props: {
                       <TextInput
                         type="password"
                         value={apiKey.secret}
-                        placeholder={selectedSiteIsOfficialOpenAi ? "不填则使用 ChatGPT 官方账号池；填写 sk-... 则走 OpenAI API" : "sk-..."}
+                        placeholder={selectedSiteIsOfficialOpenAi ? "可留空，或填写 sk-..." : "sk-..."}
                         onChange={(event) => updateApiKey(index, { secret: event.target.value, kind: event.target.value.trim() ? "api-key" : apiKey.kind })}
                       />
+                      {selectedSiteIsOfficialOpenAi ? (
+                        <span className="field-hint">不填则使用 ChatGPT 官方账号池；填写 sk-... 则走 OpenAI API。</span>
+                      ) : null}
                     </label>
                   </div>
                   <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
@@ -2812,6 +3061,10 @@ function TemporaryAccountsView(props: {
   loading: boolean;
   error: string;
   checking: string | null;
+  checkProviderType: Extract<TemporaryAccountProviderType, "gpt" | "grok">;
+  onCheckProviderTypeChange: (providerType: Extract<TemporaryAccountProviderType, "gpt" | "grok">) => void;
+  checkProxyMode: RouteProxyConfig["mode"];
+  onCheckProxyModeChange: (mode: RouteProxyConfig["mode"]) => void;
   updating: string | null;
   deleting: string | null;
   selectedAccountIds: string[];
@@ -2829,9 +3082,17 @@ function TemporaryAccountsView(props: {
 }) {
   const groups = props.snapshot.temporaryAccountGroups || [];
   const openAiSite = props.snapshot.sites.find((site) => site.addresses.some((address) => address.baseUrl.includes("api.openai.com")));
+  const grokSite = props.snapshot.sites.find((site) => site.addresses.some((address) => address.baseUrl.includes("api.x.ai")));
+  const currentProviderSite = props.checkProviderType === "grok" ? grokSite : openAiSite;
   const totalAccounts = groups.reduce((total, group) => total + group.accounts.length, 0);
-  const totalAvailabilityStats = temporaryAccountAvailabilityStats(groups.flatMap((group) => group.accounts));
-  const selectedAccountIdSet = new Set(props.selectedAccountIds);
+  const visibleGroups = groups.filter((group) => (group.providerType || "gpt") === props.checkProviderType);
+  const visibleAccounts = visibleGroups.flatMap((group) => group.accounts);
+  const visibleAccountIds = visibleAccounts.map((account) => account.id);
+  const visibleAccountIdSet = new Set(visibleAccountIds);
+  const visibleAvailabilityStats = temporaryAccountAvailabilityStats(visibleAccounts);
+  const selectedVisibleAccountIds = props.selectedAccountIds.filter((id) => visibleAccountIdSet.has(id));
+  const selectedAccountIdSet = new Set(selectedVisibleAccountIds);
+  const currentTypeLabel = temporaryAccountProviderLabels[props.checkProviderType];
   const temporaryAccountStrategy = props.snapshot.settings.temporaryAccountStrategy || "sequential";
   const hasImportContent = props.draft.content.trim() || props.draft.contents.some((content) => content.trim());
   const readImportFiles = async (files?: FileList | null) => {
@@ -2874,23 +3135,41 @@ function TemporaryAccountsView(props: {
           <div className="temp-account-overview">
             <div>
               <h2>临时账号池</h2>
-              <p>{groups.length} 个类型 / {totalAccounts} 个账号 / {openAiSite?.name || "OpenAI"}</p>
+              <p>当前 {currentTypeLabel} / {visibleAccounts.length} 个账号 / 全部 {totalAccounts} 个账号 / {currentProviderSite?.name || currentTypeLabel}</p>
             </div>
             <div className="temp-account-stats" aria-label="临时账号状态统计">
-              <span><strong>{totalAvailabilityStats.available}</strong>可用</span>
-              <span><strong>{totalAvailabilityStats.unavailable}</strong>不可用</span>
-              <span><strong>{totalAvailabilityStats.unknown}</strong>未检查</span>
+              <span><strong>{visibleAvailabilityStats.available}</strong>可用</span>
+              <span><strong>{visibleAvailabilityStats.unavailable}</strong>不可用</span>
+              <span><strong>{visibleAvailabilityStats.unknown}</strong>未检查</span>
             </div>
           </div>
           <div className="temp-account-toolbar">
-              <ActionButton type="button" tone="ghost" disabled={props.checking !== null || totalAccounts === 0} onClick={() => props.onCheck()}>
-                <RefreshCw className={`h-4 w-4 ${props.checking === "all" ? "animate-spin" : ""}`} />
-                检查 GPT
-              </ActionButton>
-              <ActionButton type="button" tone="danger" disabled={props.deleting !== null || props.selectedAccountIds.length === 0} onClick={props.onDeleteSelected}>
-                <Trash2 className="h-4 w-4" />
-                删除选中{props.selectedAccountIds.length > 0 ? ` ${props.selectedAccountIds.length}` : ""}
-              </ActionButton>
+            <label className="temp-account-check-provider">
+              <span>检查账号</span>
+              <SelectInput value={props.checkProviderType} onChange={(event) => props.onCheckProviderTypeChange(event.target.value as Extract<TemporaryAccountProviderType, "gpt" | "grok">)}>
+                <option value="gpt">{temporaryAccountProviderLabels.gpt}</option>
+                <option value="grok">{temporaryAccountProviderLabels.grok}</option>
+              </SelectInput>
+            </label>
+            <label className="temp-account-check-proxy">
+              <span>检测代理</span>
+              <SelectInput value={props.checkProxyMode} onChange={(event) => props.onCheckProxyModeChange(event.target.value as RouteProxyConfig["mode"])}>
+                <option value="system">{routeProxyModeLabels.system}</option>
+                <option value="direct">{routeProxyModeLabels.direct}</option>
+              </SelectInput>
+            </label>
+            <ActionButton type="button" tone="ghost" disabled={props.checking !== null || visibleAccounts.length === 0} onClick={() => props.onCheck()}>
+              <RefreshCw className={`h-4 w-4 ${props.checking === "all" ? "animate-spin" : ""}`} />
+              检查 {currentTypeLabel}
+            </ActionButton>
+            <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || visibleAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(visibleAccountIds)}>
+              <Check className="h-4 w-4" />
+              全选 {currentTypeLabel}
+            </ActionButton>
+            <ActionButton type="button" tone="danger" disabled={props.deleting !== null || selectedVisibleAccountIds.length === 0} onClick={props.onDeleteSelected}>
+              <Trash2 className="h-4 w-4" />
+              删除选中{selectedVisibleAccountIds.length > 0 ? ` ${selectedVisibleAccountIds.length}` : ""}
+            </ActionButton>
             <label className="temp-account-strategy">
               <span>全局复用策略</span>
               <SelectInput value={temporaryAccountStrategy} onChange={(event) => props.onStrategyChange(event.target.value as GroupRouteStrategy)}>
@@ -2901,7 +3180,15 @@ function TemporaryAccountsView(props: {
             </label>
           </div>
           <div className="temp-account-groups">
-            {groups.map((group) => {
+            {visibleGroups.length === 0 ? (
+              <section className="temp-account-empty temp-account-empty-inline">
+                <div className="temp-account-empty-mark"><Upload className="h-5 w-5" /></div>
+                <div>
+                  <h2>暂无 {currentTypeLabel} 临时账号</h2>
+                  <p>切换类型或导入 {currentTypeLabel} 账号后，这里会只展示当前类型的账号。</p>
+                </div>
+              </section>
+            ) : visibleGroups.map((group) => {
               const availabilityStats = temporaryAccountAvailabilityStats(group.accounts);
               const models = Array.from(new Set(group.accounts.flatMap((account) => account.models))).sort();
               return (
@@ -2929,8 +3216,8 @@ function TemporaryAccountsView(props: {
                                   onChange={(event) =>
                                     props.onSelectedAccountIds(
                                       event.target.checked
-                                        ? [...props.selectedAccountIds, account.id]
-                                        : props.selectedAccountIds.filter((id) => id !== account.id)
+                                        ? Array.from(new Set([...selectedVisibleAccountIds, account.id]))
+                                        : selectedVisibleAccountIds.filter((id) => id !== account.id)
                                     )
                                   }
                                   aria-label={`选择 ${account.label}`}
@@ -3040,7 +3327,7 @@ function TemporaryAccountsView(props: {
               </label>
               <label>
                 数据格式
-                <TextInput value="自动识别 CPA / Sub2API / JSONL / 纯 token" disabled />
+                <TextInput value="自动识别 CPA / Sub2API / Codex auth / Grok2API / Cookie / JSONL / 纯 token" disabled />
                 <span className="field-hint">无需手动选择，导入时会自动解析支持的账号格式。</span>
               </label>
               <label className="form-span-2">
@@ -3053,7 +3340,7 @@ function TemporaryAccountsView(props: {
                 <textarea
                   className="field temp-account-textarea"
                   value={props.draft.content}
-                  placeholder="支持 CPA/SubAPI JSON、JSONL、CSV 或每行一个 sk-/token"
+                  placeholder="支持 CPA/SubAPI/Codex auth/Grok2API JSON、JSONL、CSV、sso/cf_clearance Cookie 或每行一个 sk-/token/sso"
                   onChange={(event) => props.onDraft({ ...props.draft, content: event.target.value })}
                 />
               </label>
@@ -3077,11 +3364,16 @@ function TemporaryAccountsView(props: {
 function KeysView(props: {
   snapshot: AppSnapshot;
   keyName: string;
+  keyModelsText: string;
+  modelOptions: string[];
   editorOpen: boolean;
+  editingKeyId: string | null;
   createdKey: ApiKeyCreated | null;
   onKeyName: (value: string) => void;
-  onCreate: () => void;
+  onKeyModelsText: (value: string) => void;
+  onSubmit: () => void;
   onClose: () => void;
+  onEdit: (key: AppSnapshot["apiKeys"][number]) => void;
   onToggle: (id: string, enabled: boolean) => void;
   onDelete: (id: string) => void;
   onCopy: (value: string) => void;
@@ -3106,12 +3398,18 @@ function KeysView(props: {
                   <div className="min-w-0">
                     <div className="record-title">{key.name}</div>
                     <div className="record-meta break-all">{fullKey || `${key.prefix}...（完整密钥仅生成时显示）`}</div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {key.models.length > 0 ? key.models.map((model) => <span key={model} className="pill pill-muted">{model}</span>) : <span className="pill pill-muted">全部模型</span>}
+                    </div>
                   </div>
                   <div className="record-actions">
                     <label className="toggle-row">
                       <input type="checkbox" checked={key.enabled} onChange={(event) => props.onToggle(key.id, event.target.checked)} />
                       启用
                     </label>
+                    <ActionButton tone="ghost" onClick={() => props.onEdit(key)} title="编辑名称和可用模型">
+                      <Pencil className="h-4 w-4" />
+                    </ActionButton>
                     <ActionButton tone="ghost" disabled={!fullKey} onClick={() => props.onCopy(fullKey)} title={fullKey ? "复制密钥" : "完整密钥仅生成时显示，无法从前缀还原"}>
                       <Copy className="h-4 w-4" />
                     </ActionButton>
@@ -3131,7 +3429,7 @@ function KeysView(props: {
           <section className="modal-panel" role="dialog" aria-modal="true" aria-label="密钥生成">
             <div className="form-head">
               <div className="flex items-center gap-2">
-                <h2>生成密钥</h2>
+                <h2>{props.editingKeyId ? "编辑密钥" : "生成密钥"}</h2>
                 <KeyRound className="h-5 w-5 text-rust" />
               </div>
               <ActionButton type="button" tone="ghost" onClick={props.onClose} title="关闭">
@@ -3142,13 +3440,37 @@ function KeysView(props: {
               名称
               <TextInput value={props.keyName} onChange={(event) => props.onKeyName(event.target.value)} />
             </label>
+            <label className="mt-3 block">
+              可用模型
+              <textarea
+                className="field min-h-24"
+                value={props.keyModelsText}
+                placeholder="留空表示允许全部模型；也可以每行/逗号填写一个路由模型名"
+                onChange={(event) => props.onKeyModelsText(event.target.value)}
+              />
+              <span className="field-hint">这里限制的是对外 model/路由名。留空则不限制。</span>
+            </label>
+            {props.modelOptions.length > 0 ? (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {props.modelOptions.map((model) => (
+                  <button
+                    key={model}
+                    type="button"
+                    className="pill pill-muted"
+                    onClick={() => props.onKeyModelsText(Array.from(new Set([...parseModelText(props.keyModelsText), model])).join("\n"))}
+                  >
+                    + {model}
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <div className="mt-4 flex justify-end gap-2">
               <ActionButton type="button" tone="ghost" onClick={props.onClose}>
                 取消
               </ActionButton>
-              <ActionButton type="button" onClick={props.onCreate}>
-                <Wand2 className="h-4 w-4" />
-                生成
+              <ActionButton type="button" onClick={props.onSubmit}>
+                {props.editingKeyId ? <Save className="h-4 w-4" /> : <Wand2 className="h-4 w-4" />}
+                {props.editingKeyId ? "保存" : "生成"}
               </ActionButton>
             </div>
             {props.createdKey ? (
@@ -3310,27 +3632,41 @@ function HeadersView(props: {
 function LogsView(props: {
   snapshot: AppSnapshot;
   total: number;
-  page: number;
   pageSize: number;
   autoRefresh: boolean;
+  refreshing: boolean;
+  loadingMore: boolean;
+  selectedLogId: string | null;
   onAutoRefresh: (enabled: boolean) => void;
-  onPage: (page: number) => void;
+  onLoadMore: () => void;
+  onOpenLog: (id: string) => void;
+  onCloseLog: () => void;
   onDelete: (id: string) => void;
   onClear: () => void;
 }) {
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const logs = props.snapshot.requestLogs;
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
   const successCount = logs.filter((log) => log.status === "success").length;
-  const failedCount = logs.length - successCount;
-  const totalPages = Math.max(1, Math.ceil(props.total / props.pageSize));
-  const pageStart = props.total === 0 ? 0 : props.page * props.pageSize + 1;
-  const pageEnd = Math.min(props.total, props.page * props.pageSize + logs.length);
+  const failedCount = logs.filter((log) => log.status === "failed").length;
+  const pendingCount = logs.filter((log) => log.status === "pending").length;
+  const hasMore = logs.length < props.total;
+
+  useEffect(() => {
+    const element = loadMoreRef.current;
+    if (!element || !hasMore || props.loadingMore || props.refreshing) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) props.onLoadMore();
+    }, { rootMargin: "160px" });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [hasMore, props.loadingMore, props.refreshing, props.onLoadMore, logs.length]);
+
   const header = (
     <div className="form-head">
       <div>
         <h2>请求日志</h2>
         <div className="mt-1 text-xs font-bold text-ink/55">
-          第 {props.page + 1} / {totalPages} 页，{pageStart}-{pageEnd} / 共 {props.total} 条 / 本页成功 {successCount} / 失败 {failedCount} / 5 秒刷新
+          已加载 {logs.length} / 共 {props.total} 条 / 成功 {successCount} / 失败 {failedCount}{pendingCount ? ` / 请求中 ${pendingCount}` : ""} / 5 秒刷新
         </div>
       </div>
       <div className="flex flex-wrap items-center justify-end gap-2">
@@ -3338,15 +3674,6 @@ function LogsView(props: {
           <input type="checkbox" checked={props.autoRefresh} onChange={(event) => props.onAutoRefresh(event.target.checked)} />
           自动刷新
         </label>
-        <div className="logs-pagination">
-          <ActionButton type="button" tone="ghost" disabled={props.page <= 0} onClick={() => props.onPage(Math.max(0, props.page - 1))}>
-            上一页
-          </ActionButton>
-          <span>{props.page + 1} / {totalPages}</span>
-          <ActionButton type="button" tone="ghost" disabled={props.page >= totalPages - 1} onClick={() => props.onPage(Math.min(totalPages - 1, props.page + 1))}>
-            下一页
-          </ActionButton>
-        </div>
         {props.total > 0 ? (
           <ActionButton tone="danger" onClick={props.onClear}>
             <Trash2 className="h-4 w-4" />
@@ -3357,102 +3684,143 @@ function LogsView(props: {
     </div>
   );
 
-  if (logs.length === 0) {
-    return (
-      <div className="logs-empty-page">
-        <section className="panel p-4">{header}</section>
-        <div className="center-empty">暂无日志</div>
-      </div>
-    );
-  }
-
   return (
     <section className="panel p-4">
       {header}
-      <div className="log-table">
-        {logs.map((log) => {
-            const isOpen = expanded[log.id];
-            return (
-              <article key={log.id} className="log-row">
-                <button
-                  type="button"
-                  className="log-summary"
-                  onClick={() => setExpanded((current) => ({ ...current, [log.id]: !isOpen }))}
-                >
-                  <span className="grid h-9 w-9 place-items-center rounded-lg bg-white/75 text-ink">
-                    {isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-                  </span>
-                  <span className="min-w-0">
-                    <span className="record-title block">{log.model}</span>
-                    <span className="record-meta block">
-                      {log.summary || `${log.providerName} / ${log.userAgent || "unknown ua"}`}
-                    </span>
-                  </span>
-                  <span className={`status-badge status-${log.status}`}>{log.status === "success" ? "成功" : "失败"}</span>
-                  <span className="hidden text-right text-xs font-bold text-ink/55 md:block">
-                    {formatTime(log.createdAt)}
-                    <br />
-                    {log.statusCode} / {log.durationMs}ms
-                  </span>
-                </button>
-
-                {isOpen ? (
-                  <div className="log-detail">
-                    <div className="detail-grid">
-                      <LogSummaryDetail log={log} />
-                      <DetailBlock
-                        title="下游请求"
-                        value={{
-                          ...(log.downstream || { model: log.routeName, endpoint: log.path, userAgent: log.userAgent }),
-                          method: log.method,
-                          path: log.path,
-                          clientIp: log.clientIp
-                        }}
-                      />
-                      <DetailBlock title="下游 Body" value={log.requestBody} />
-                      <DetailBlock title="下游 Header" value={log.requestHeaders} />
-                      <DetailBlock
-                        title="路由目标"
-                        value={{
-                          ...(log.routeTarget || { routeName: log.routeName, model: log.model, endpoint: log.endpoint, providerName: log.providerName }),
-                          routeId: log.routeId,
-                          upstreamUrl: log.upstreamUrl
-                        }}
-                      />
-                      <DetailBlock title="上游尝试" value={upstreamAttemptsSummary(log)} />
-                      <DetailBlock title="上游请求 Body" value={upstreamRequestBodies(log)} />
-                      <DetailBlock
-                        title="上游返回"
-                        value={{
-                          upstreamUrl: log.upstreamUrl,
-                          contentType: log.upstreamContentType,
-                          preview: log.responsePreview,
-                          error: log.errorMessage || undefined
-                        }}
-                      />
-                      <DetailBlock
-                        title="返回"
-                        value={{
-                          status: log.status,
-                          statusCode: log.statusCode,
-                          durationMs: log.durationMs,
-                          preview: log.responsePreview,
-                          error: log.errorMessage || undefined
-                        }}
-                      />
-                    </div>
-                    <div className="mt-3 flex justify-end">
-                      <ActionButton tone="danger" onClick={() => props.onDelete(log.id)}>
-                        <Trash2 className="h-4 w-4" />
-                      </ActionButton>
-                    </div>
-                  </div>
-                ) : null}
-              </article>
-            );
-          })}
-      </div>
+      {logs.length === 0 ? (
+        <div className="center-empty">暂无日志</div>
+      ) : (
+        <>
+          <div className="log-table">
+            {logs.map((log) => (
+              <LogSummaryRow key={log.id} log={log} selected={props.selectedLogId === log.id} onOpen={props.onOpenLog} />
+            ))}
+          </div>
+          <div ref={loadMoreRef} className="logs-load-more">
+            {props.loadingMore ? "正在加载更多日志..." : hasMore ? "滚动到底部自动加载更多" : "已加载全部日志"}
+          </div>
+        </>
+      )}
     </section>
+  );
+}
+
+function logStatusLabel(status: RequestLogSummary["status"]) {
+  if (status === "success") return "成功";
+  if (status === "pending") return "请求中";
+  return "失败";
+}
+
+function LogSummaryRow(props: { log: RequestLogSummary; selected: boolean; onOpen: (id: string) => void }) {
+  const { log } = props;
+  const downstream = log.downstream;
+  const routeTarget = log.routeTarget;
+  return (
+    <article className={`log-row ${props.selected ? "log-row-selected" : ""}`}>
+      <button type="button" className="log-summary log-summary-card" onClick={() => props.onOpen(log.id)}>
+        <span className="grid h-9 w-9 place-items-center rounded-lg bg-white/75 text-ink">
+          <ChevronRight className="h-4 w-4" />
+        </span>
+        <span className="log-summary-grid min-w-0">
+          <span className="log-summary-section">
+            <span className="summary-node-label">下游请求</span>
+            <span className="record-title block">{downstream.model || log.routeName || "-"}</span>
+            <span className="record-meta block">{downstream.endpoint || downstream.path || "-"}</span>
+            <span className="record-meta block">{downstream.userAgent || "unknown ua"}</span>
+          </span>
+          <span className="log-summary-section">
+            <span className="summary-node-label">转发目标</span>
+            <span className="record-title block">{routeTarget.model || log.model || "-"}</span>
+            <span className="record-meta block">供应商：{routeTarget.providerName || log.providerName || "-"}</span>
+            <span className="record-meta block">Header：{log.headerTemplateName || "未使用"}</span>
+            <span className="record-meta block">代理：{log.proxy ? routeProxyModeLabels[log.proxy.mode] : "直连"}</span>
+          </span>
+        </span>
+        <span className={`status-badge status-${log.status}`}>{logStatusLabel(log.status)}</span>
+        <span className="hidden text-right text-xs font-bold text-ink/55 md:block">
+          {formatTime(log.createdAt)}
+          <br />
+          {log.statusCode} / {log.durationMs}ms
+        </span>
+      </button>
+    </article>
+  );
+}
+
+function LogDetailModal(props: { log: RequestLog | null; loading: boolean; error: string; onClose: () => void; onDelete: (id: string) => void }) {
+  const log = props.log;
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="modal-panel log-detail-modal" role="dialog" aria-modal="true" aria-label="日志详情">
+        <div className="form-head">
+          <div>
+            <h2>日志详情</h2>
+            <div className="mt-1 text-xs font-bold text-ink/55">{log ? `${log.routeName} / ${formatTime(log.createdAt)}` : "正在获取完整日志"}</div>
+          </div>
+          <ActionButton type="button" tone="ghost" onClick={props.onClose} title="关闭">
+            <X className="h-4 w-4" />
+          </ActionButton>
+        </div>
+        <div className="log-detail-modal-body">
+          {props.loading ? <div className="empty-state">正在加载日志详情...</div> : null}
+          {props.error ? <div className="empty-state">{props.error}</div> : null}
+          {log && !props.loading ? (
+            <>
+              <div className="detail-grid">
+              <LogSummaryDetail log={log} />
+              <DetailBlock
+                title="下游请求"
+                value={{
+                  ...(log.downstream || { model: log.routeName, endpoint: log.path, userAgent: log.userAgent }),
+                  method: log.method,
+                  path: log.path,
+                  clientIp: log.clientIp
+                }}
+              />
+              <DetailBlock title="下游 Body" value={log.requestBody} />
+              <DetailBlock title="下游 Header" value={log.requestHeaders} />
+              <DetailBlock
+                title="路由目标"
+                value={{
+                  ...(log.routeTarget || { routeName: log.routeName, model: log.model, endpoint: log.endpoint, providerName: log.providerName }),
+                  routeId: log.routeId,
+                  upstreamUrl: log.upstreamUrl
+                }}
+              />
+              <DetailBlock title="代理" value={log.proxy || { mode: "direct" }} />
+              <DetailBlock title="上游尝试" value={upstreamAttemptsSummary(log)} />
+              <DetailBlock title="上游请求 Body" value={upstreamRequestBodies(log)} />
+              <DetailBlock
+                title="上游返回"
+                value={{
+                  upstreamUrl: log.upstreamUrl,
+                  contentType: log.upstreamContentType,
+                  preview: log.responsePreview,
+                  error: log.errorMessage || undefined
+                }}
+              />
+              <DetailBlock
+                title="返回"
+                value={{
+                  status: log.status,
+                  statusCode: log.statusCode,
+                  durationMs: log.durationMs,
+                  preview: log.responsePreview,
+                  error: log.errorMessage || undefined
+                }}
+              />
+              </div>
+              <div className="mt-3 flex justify-end">
+                <ActionButton tone="danger" onClick={() => props.onDelete(log.id)}>
+                  <Trash2 className="h-4 w-4" />
+                  删除日志
+                </ActionButton>
+              </div>
+            </>
+          ) : null}
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -3681,7 +4049,7 @@ function LogSummaryDetail(props: { log: RequestLog }) {
         <div>
           <div className="detail-title">总结</div>
         </div>
-        <span className={`status-badge status-${log.status}`}>{log.status === "success" ? "成功" : "失败"}</span>
+        <span className={`status-badge status-${log.status}`}>{logStatusLabel(log.status)}</span>
       </div>
       <div className="summary-flow">
         <section className="summary-node">
@@ -3701,6 +4069,7 @@ function LogSummaryDetail(props: { log: RequestLog }) {
           <SummaryField label="Endpoint" value={routeTarget.endpoint || log.endpoint} />
           <SummaryField label="供应商" value={routeTarget.providerName || log.providerName} />
           <SummaryField label="UA" value={routeTarget.userAgent || "fetch default"} />
+          <SummaryField label="代理" value={log.proxy ? routeProxyModeLabels[log.proxy.mode] : "直连"} />
         </section>
         <div className="summary-arrow">
           <ChevronRight className="h-4 w-4" />
@@ -3708,7 +4077,7 @@ function LogSummaryDetail(props: { log: RequestLog }) {
         <section className="summary-node summary-result">
           <div className="summary-node-label">返回</div>
           <div className="summary-node-main">{log.statusCode}</div>
-          <SummaryField label="状态" value={log.status === "success" ? "成功" : "失败"} />
+          <SummaryField label="状态" value={logStatusLabel(log.status)} />
           <SummaryField label="耗时" value={`${log.durationMs}ms`} />
           <SummaryField label="时间" value={formatTime(log.createdAt)} />
         </section>

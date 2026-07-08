@@ -14,6 +14,7 @@ import type {
   RouteRecord,
   Site,
   TemporaryAccountGroup,
+  TemporaryAccountCheckOptions,
   TemporaryAccountCheckResult,
   TemporaryAccountImportInput,
   TemporaryAccountImportResult,
@@ -96,10 +97,10 @@ export const api = {
     }),
   deleteSite: (id: string) => request<{ ok: true }>(`/api/sites/${id}`, { method: "DELETE" }),
   listKeys: () => request<ApiKeyRecord[]>("/api/keys"),
-  createKey: (name: string) =>
+  createKey: (name: string, models: string[] = []) =>
     request<ApiKeyCreated>("/api/keys", {
       method: "POST",
-      body: JSON.stringify({ name })
+      body: JSON.stringify({ name, models })
     }),
   updateKey: (id: string, body: Partial<ApiKeyRecord>) =>
     request<ApiKeyRecord>(`/api/keys/${id}`, {
@@ -126,8 +127,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input)
     }),
-  checkTemporaryAccounts: () => request<TemporaryAccountCheckResult>("/api/temporary-accounts/check", { method: "POST" }),
-  checkTemporaryAccount: (id: string) => request<TemporaryAccountCheckResult>(`/api/temporary-accounts/accounts/${id}/check`, { method: "POST" }),
+  checkTemporaryAccounts: (options?: TemporaryAccountCheckOptions) =>
+    request<TemporaryAccountCheckResult>("/api/temporary-accounts/check", {
+      method: "POST",
+      body: JSON.stringify(options || {})
+    }),
+  checkTemporaryAccount: (id: string, options?: TemporaryAccountCheckOptions) =>
+    request<TemporaryAccountCheckResult>(`/api/temporary-accounts/accounts/${id}/check`, {
+      method: "POST",
+      body: JSON.stringify(options || {})
+    }),
   updateTemporaryAccount: (id: string, body: Partial<TemporaryAccountGroup["accounts"][number]>) =>
     request<TemporaryAccountGroup["accounts"][number]>(`/api/temporary-accounts/accounts/${id}`, {
       method: "PATCH",
@@ -159,10 +168,11 @@ export const api = {
       body: JSON.stringify(route)
     }),
   deleteRoute: (id: string) => request<{ ok: true }>(`/api/routes/${id}`, { method: "DELETE" }),
-  listLogs: (limit = 5, offset = 0) =>
+  listLogs: (limit = 3, offset = 0) =>
     request<RequestLogPage>(`/api/logs?limit=${encodeURIComponent(String(limit))}&offset=${encodeURIComponent(String(offset))}`),
   listNewLogs: (since: string, limit = 25) =>
     request<RequestLogPage>(`/api/logs?since=${encodeURIComponent(since)}&limit=${encodeURIComponent(String(limit))}`),
+  getLog: (id: string) => request<RequestLog>(`/api/logs/${id}`),
   deleteLog: (id: string) => request<{ ok: true }>(`/api/logs/${id}`, { method: "DELETE" }),
   clearLogs: () => request<{ ok: true }>("/api/logs/clear", { method: "DELETE" }),
   updateSettings: (settings: Partial<AppSettings>) =>

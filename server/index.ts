@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { URL } from "node:url";
-import { ProxyAgent, setGlobalDispatcher } from "undici";
+import { ProxyAgent } from "undici";
 import {
   ChatCompletionToMessagesConverter,
   ChatCompletionToResponsesConverter,
@@ -23,7 +23,9 @@ import type {
   ProviderApiKeyEntry,
   ProviderModelSyncResult,
   RequestLog,
+  RequestLogProxy,
   RequestLogStatus,
+  RouteProxyConfig,
   RouteRecord,
   Site,
   SiteAddress,
@@ -31,6 +33,7 @@ import type {
   TemporaryAccount,
   TemporaryAccountCheckItemResult,
   TemporaryAccountCheckResult,
+  TemporaryAccountProviderType,
   TemporaryAccountQuotaStage
 } from "../shared/types.js";
 
@@ -163,14 +166,87 @@ function proxyFromSystemSettings() {
   return undefined;
 }
 
-function configureFetchProxy() {
-  const proxyUrl = proxyFromAppEnvironment() || proxyFromSystemSettings() || proxyFromGenericEnvironment();
-  if (!proxyUrl) return undefined;
-  setGlobalDispatcher(new ProxyAgent(proxyUrl));
-  return proxyUrl;
+interface ResolvedProxy {
+  mode: RequestLogProxy["mode"];
+  url?: string;
+  source?: RequestLogProxy["source"];
 }
 
-const FETCH_PROXY_URL = configureFetchProxy();
+const proxyAgents = new Map<string, ProxyAgent>();
+let systemProxyCache: { checkedAt: number; proxy?: ResolvedProxy } = { checkedAt: 0 };
+const SYSTEM_PROXY_CACHE_TTL_MS = 10_000;
+
+function resolveSystemProxy(force = false): ResolvedProxy {
+  const nowMs = Date.now();
+  if (!force && nowMs - systemProxyCache.checkedAt < SYSTEM_PROXY_CACHE_TTL_MS) return systemProxyCache.proxy || { mode: "system" };
+  const envProxy = proxyFromAppEnvironment() || proxyFromGenericEnvironment();
+  const systemProxy = envProxy ? undefined : proxyFromSystemSettings();
+  const proxy = envProxy
+    ? { mode: "system" as const, url: envProxy, source: "env" as const }
+    : systemProxy
+      ? { mode: "system" as const, url: systemProxy, source: "system" as const }
+      : { mode: "system" as const };
+  systemProxyCache = { checkedAt: nowMs, proxy };
+  return proxy;
+}
+
+function routeProxy(routeProxy?: RouteProxyConfig, forceSystemRefresh = false): ResolvedProxy {
+  if (!routeProxy || routeProxy.mode === "direct") return { mode: "direct" };
+  if (routeProxy.mode === "custom") return { mode: "custom", url: routeProxy.url, source: "route" };
+  return resolveSystemProxy(forceSystemRefresh);
+}
+
+function maskedProxyUrlValue(proxyUrl?: string) {
+  return proxyUrl ? maskedProxyUrl(proxyUrl) : undefined;
+}
+
+function requestLogProxyForRoute(routeProxyConfig?: RouteProxyConfig, forceSystemRefresh = false): RequestLogProxy {
+  const resolvedProxy = routeProxy(routeProxyConfig, forceSystemRefresh);
+  return { ...resolvedProxy, url: maskedProxyUrlValue(resolvedProxy.url) };
+}
+
+function proxyAgentFor(proxyUrl: string) {
+  const existing = proxyAgents.get(proxyUrl);
+  if (existing) return existing;
+  const agent = new ProxyAgent(proxyUrl);
+  proxyAgents.set(proxyUrl, agent);
+  return agent;
+}
+
+function clearProxyAgent(proxyUrl?: string) {
+  if (!proxyUrl) return;
+  proxyAgents.delete(proxyUrl);
+}
+
+function isNetworkError(error: unknown) {
+  const message = errorText(error).toLowerCase();
+  const cause = nestedErrorCause(error);
+  const causeCause = nestedErrorCause(cause);
+  const code = errorCode(error) || errorCode(cause) || errorCode(causeCause);
+  return Boolean(
+    code ||
+      message.includes("fetch failed") ||
+      message.includes("network") ||
+      message.includes("timeout") ||
+      message.includes("socket")
+  );
+}
+
+async function fetchWithRouteProxy(target: Parameters<typeof fetch>[0], init: RequestInit, routeProxyConfig?: RouteProxyConfig) {
+  let resolvedProxy = routeProxy(routeProxyConfig);
+  const proxyInit = resolvedProxy.url ? { ...init, dispatcher: proxyAgentFor(resolvedProxy.url) } as RequestInit & { dispatcher: ProxyAgent } : init;
+  try {
+    const response = await fetch(target, proxyInit);
+    return { response, proxy: { ...resolvedProxy, url: maskedProxyUrlValue(resolvedProxy.url) } satisfies RequestLogProxy };
+  } catch (error) {
+    if (!routeProxyConfig || routeProxyConfig.mode === "direct" || !isNetworkError(error)) throw error;
+    clearProxyAgent(resolvedProxy.url);
+    resolvedProxy = routeProxy(routeProxyConfig, true);
+    const retryInit = resolvedProxy.url ? { ...init, dispatcher: proxyAgentFor(resolvedProxy.url) } as RequestInit & { dispatcher: ProxyAgent } : init;
+    const response = await fetch(target, retryInit);
+    return { response, proxy: { ...resolvedProxy, url: maskedProxyUrlValue(resolvedProxy.url), retried: true } satisfies RequestLogProxy };
+  }
+}
 
 interface ProxyExecutionCandidate {
   site: Site;
@@ -292,6 +368,12 @@ function hasAdminSession(request: http.IncomingMessage) {
   return verifyAdminSessionToken(parseCookies(request).get(ADMIN_SESSION_COOKIE));
 }
 
+function renewAdminSession(response: http.ServerResponse) {
+  const session = createAdminSession();
+  response.setHeader("Set-Cookie", adminSessionCookie(session.token));
+  return session;
+}
+
 function adminSessionCookie(token: string) {
   const maxAge = Math.max(0, Math.floor(adminSessionTtlMs() / 1000));
   return `${ADMIN_SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${maxAge}${ADMIN_COOKIE_SECURE ? "; Secure" : ""}`;
@@ -312,7 +394,11 @@ function isPublicApiPath(method: string, pathname: string) {
 
 function requireAdminSession(request: http.IncomingMessage, response: http.ServerResponse, url: URL) {
   const method = request.method || "GET";
-  if (isPublicApiPath(method, url.pathname) || hasAdminSession(request)) return true;
+  if (isPublicApiPath(method, url.pathname)) return true;
+  if (hasAdminSession(request)) {
+    renewAdminSession(response);
+    return true;
+  }
   sendJson(response, 401, { error: "请先输入管理密码" });
   return false;
 }
@@ -433,6 +519,11 @@ function extractUpstreamError(text: string) {
   return compactPreview(text);
 }
 
+function looksLikeHtmlText(text: string) {
+  const compact = text.trim().slice(0, 120).toLowerCase();
+  return compact.startsWith("<!doctype") || compact.startsWith("<html") || compact.includes("<head") || compact.includes("<body");
+}
+
 function maskedProxyUrl(proxyUrl: string) {
   try {
     const parsed = new URL(proxyUrl);
@@ -501,9 +592,10 @@ function upstreamNetworkErrorMessage(error: unknown, fallback: string) {
 
   if (message && message !== "fetch failed" && parts.length === 0) return message;
 
-  const proxyHint = FETCH_PROXY_URL
-    ? `当前代理 ${maskedProxyUrl(FETCH_PROXY_URL)}，请确认代理可访问 OpenAI/Codex`
-    : "当前未配置代理，请确认服务器可直连 OpenAI/Codex，或设置 SAMAPI_PROXY_URL";
+  const currentProxy = resolveSystemProxy();
+  const proxyHint = currentProxy.url
+    ? `当前系统代理 ${maskedProxyUrl(currentProxy.url)}，请确认代理可访问 OpenAI/Codex`
+    : "当前未配置系统代理，请确认服务器可直连 OpenAI/Codex，或为对应路由设置代理";
   const detailText = parts.length > 0 ? `${parts.join("；")}；${proxyHint}` : proxyHint;
   return `${fallback}：${detailText}`;
 }
@@ -948,6 +1040,141 @@ function extractResponseText(payload: unknown): string {
   return "";
 }
 
+function openAiMessagesFromAnyBody(body: unknown) {
+  const source = bodyRecord(body);
+  if (Array.isArray(source.messages)) return source.messages;
+  if (Array.isArray(source.input)) return source.input;
+  if (typeof source.input === "string") return [{ role: "user", content: source.input }];
+  if (Array.isArray(source.contents)) return geminiContentsToMessages(body);
+  return [];
+}
+
+function grokMessageFromBody(body: unknown) {
+  const source = bodyRecord(body);
+  const messages = openAiMessagesFromAnyBody(body);
+  const text = messages
+    .map((message) => {
+      if (!isRecord(message)) return "";
+      const role = typeof message.role === "string" ? message.role : "user";
+      const content = textFromContent(message.content);
+      return content ? `${role}: ${content}` : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+  return text || textFromContent(source.prompt) || textFromContent(source.message) || textFromContent(source.input);
+}
+
+function grokWebRequestBody(body: unknown, model: string) {
+  const message = grokMessageFromBody(body);
+  if (!message) throw new Error("Grok Web SSO 请求缺少可发送的文本内容");
+  return {
+    temporary: false,
+    modelName: model,
+    message,
+    fileAttachments: [],
+    imageAttachments: [],
+    disableSearch: false,
+    enableImageGeneration: true,
+    returnImageBytes: false,
+    returnRawGrokInXaiRequest: false,
+    enableImageStreaming: true,
+    imageGenerationCount: 2,
+    forceConcise: false,
+    toolOverrides: {},
+    enableSideBySide: true,
+    isPreset: false,
+    sendFinalMetadata: true,
+    customInstructions: "",
+    deepsearchPreset: "",
+    isReasoning: false,
+    webpageUrls: [],
+    disableTextFollowUps: false,
+    responseMetadata: { requestModelDetails: { modelId: model } },
+    disableMemory: false,
+    forceSideBySide: false,
+    modelMode: model,
+    isAsyncChat: false
+  };
+}
+
+function grokWebTextFromEvent(event: unknown) {
+  if (!isRecord(event)) return "";
+  const result = isRecord(event.result) ? event.result : {};
+  const response = isRecord(result.response) ? result.response : {};
+  const token = typeof response.token === "string" ? response.token : "";
+  const modelResponse = isRecord(response.modelResponse) ? response.modelResponse : {};
+  const message = typeof modelResponse.message === "string" ? modelResponse.message : "";
+  return token || message;
+}
+
+function extractGrokWebResponseText(text: string) {
+  const tokens: string[] = [];
+  let finalMessage = "";
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      const eventText = grokWebTextFromEvent(parsed);
+      if (eventText) tokens.push(eventText);
+      const result = isRecord(parsed) && isRecord(parsed.result) ? parsed.result : {};
+      const response = isRecord(result.response) ? result.response : {};
+      const modelResponse = isRecord(response.modelResponse) ? response.modelResponse : {};
+      if (typeof modelResponse.message === "string") finalMessage = modelResponse.message;
+    } catch {
+      // Grok Web returns NDJSON; ignore non-JSON keepalive lines.
+    }
+  }
+  return finalMessage || tokens.join("");
+}
+
+function grokWebToChatCompletionText(text: string, model: string) {
+  const content = extractGrokWebResponseText(text);
+  if (!content) return text;
+  return JSON.stringify({
+    id: `chatcmpl-grok-web-${randomBytes(8).toString("hex")}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content },
+        finish_reason: "stop"
+      }
+    ]
+  });
+}
+
+async function collectGrokWebStreamBody(stream: ReadableStream<Uint8Array>) {
+  const decoder = new TextDecoder();
+  let text = "";
+  for await (const chunk of stream) text += decoder.decode(chunk, { stream: true });
+  text += decoder.decode();
+  return text;
+}
+
+function adaptGrokWebResponseText(text: string, proxyKind: ProxyKind, model: string, converter?: RosettaConverter, downstreamStream = false) {
+  const chatText = grokWebToChatCompletionText(text, model);
+  return convertUpstreamResponseText({
+    text: chatText,
+    contentType: "application/json; charset=utf-8",
+    proxyKind,
+    converter,
+    downstreamStream
+  });
+}
+
+function isGrokWebTemporaryAccount(account: TemporaryAccount | undefined): account is TemporaryAccount {
+  return account?.providerType === "grok" && !isGrokOAuthTemporaryAccount(account);
+}
+
+function isGrokOAuthTemporaryAccount(account: TemporaryAccount | undefined) {
+  if (account?.providerType !== "grok") return false;
+  if (account.refreshToken?.trim() || account.idToken?.trim()) return true;
+  return account.secret.split(".").length === 3;
+}
+
 function adaptResponseText(text: string, contentType: string | undefined, proxyKind: ProxyKind) {
   if (proxyKind !== "gemini-generate" && proxyKind !== "gemini-stream") return { text, contentType };
   try {
@@ -1293,6 +1520,11 @@ const CODEX_ORIGINATOR = "codex-tui";
 const CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_MODELS_URL = "https://api.openai.com/v1/models";
+const XAI_OAUTH_TOKEN_URL = "https://auth.x.ai/oauth2/token";
+const XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
+const XAI_RESPONSES_URL = "https://api.x.ai/v1/responses";
+const GROK_RATE_LIMITS_URL = "https://grok.com/rest/rate-limits";
+const GROK_CONVERSATIONS_NEW_URL = "https://grok.com/rest/app-chat/conversations/new";
 const CHATGPT_MODELS_URL = "https://chatgpt.com/backend-api/models";
 const CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL = "ChatGPT 官方";
 const TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS = positiveIntegerEnv("SAMAPI_TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS", 15_000);
@@ -1303,7 +1535,81 @@ function positiveIntegerEnv(name: string, fallback: number) {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
-async function fetchTemporaryAccountCheckText(input: Parameters<typeof fetch>[0], init: RequestInit = {}) {
+function temporaryAccountCheckProxyFromBody(body: unknown): RouteProxyConfig {
+  if (!isRecord(body) || !isRecord(body.proxy)) return { mode: "system" };
+  const mode = body.proxy.mode;
+  if (mode === "direct" || mode === "system") return { mode };
+  if (mode === "custom") {
+    const url = typeof body.proxy.url === "string" ? body.proxy.url.trim() : "";
+    if (!url) throw new Error("自定义代理地址不能为空");
+    return { mode, url };
+  }
+  return { mode: "system" };
+}
+
+function temporaryAccountProviderTypeFromBody(body: unknown): TemporaryAccountProviderType {
+  if (!isRecord(body)) return "gpt";
+  return body.providerType === "grok" ? "grok" : "gpt";
+}
+
+function grokCookiePairsFromText(value?: string) {
+  const trimmed = value?.trim();
+  if (!trimmed) return [];
+  const normalized = trimmed.replace(/^(?:cookie|cookies)\s*[:：=]\s*/i, "");
+  if (!normalized.includes("=") && /^[A-Za-z0-9._\-]{20,}$/.test(normalized)) return [`cf_clearance=${normalized}`];
+  return normalized
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .flatMap((part) => {
+      const separatorIndex = part.indexOf("=");
+      if (separatorIndex <= 0) return [];
+      const key = part.slice(0, separatorIndex).trim();
+      const val = part.slice(separatorIndex + 1).trim();
+      if (!key || !val) return [];
+      const normalizedKey = key.toLowerCase();
+      if (!["cf_clearance", "__cf_bm", "_cfuvid"].includes(normalizedKey)) return [];
+      return [`${key}=${val}`];
+    });
+}
+
+function grokSsoCookie(secret: string, browserCookieState?: string) {
+  const token = secret.trim().replace(/^sso=/i, "");
+  return [`sso=${token}`, `sso-rw=${token}`, ...grokCookiePairsFromText(browserCookieState)].join("; ");
+}
+
+function grokStatsigId() {
+  const message = `x1:TypeError: Cannot read properties of undefined (reading '${randomBytes(5).toString("hex")}')`;
+  return Buffer.from(message).toString("base64");
+}
+
+function grokTemporaryHeaders(account: TemporaryAccount, templateHeaders: Record<string, string> = {}) {
+  return {
+    ...templateHeaders,
+    Accept: "*/*",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Content-Type": "application/json",
+    Cookie: grokSsoCookie(account.secret, account.sessionToken),
+    Origin: "https://grok.com",
+    Priority: "u=1, i",
+    Referer: "https://grok.com/",
+    "Sec-Ch-Ua": '"Google Chrome";v="137", "Chromium";v="137", "Not(A:Brand";v="24"',
+    "Sec-Ch-Ua-Arch": "arm",
+    "Sec-Ch-Ua-Bitness": "64",
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Model": "",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+    "x-statsig-id": grokStatsigId(),
+    "x-xai-request-id": randomBytes(16).toString("hex")
+  };
+}
+
+async function fetchTemporaryAccountCheckText(input: Parameters<typeof fetch>[0], init: RequestInit = {}, proxyConfig: RouteProxyConfig = { mode: "system" }) {
   const controller = new AbortController();
   let timedOut = false;
   const timeout = setTimeout(() => {
@@ -1312,8 +1618,12 @@ async function fetchTemporaryAccountCheckText(input: Parameters<typeof fetch>[0]
   }, TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS);
 
   try {
+    const resolvedProxy = routeProxy(proxyConfig);
+    const proxyInit = resolvedProxy.url
+      ? { ...init, dispatcher: proxyAgentFor(resolvedProxy.url) } as RequestInit & { dispatcher: ProxyAgent }
+      : init;
     const response = await fetch(input, {
-      ...init,
+      ...proxyInit,
       signal: controller.signal
     });
     return {
@@ -1382,7 +1692,7 @@ function emailFromIdToken(idToken?: string) {
   return typeof email === "string" && email.trim() ? email.trim() : undefined;
 }
 
-async function refreshCodexTemporaryAccountToken(account: TemporaryAccount) {
+async function refreshCodexTemporaryAccountToken(account: TemporaryAccount, proxyConfig?: RouteProxyConfig) {
   if (!account.refreshToken?.trim()) return undefined;
   const body = new URLSearchParams({
     client_id: CODEX_OAUTH_CLIENT_ID,
@@ -1397,7 +1707,7 @@ async function refreshCodexTemporaryAccountToken(account: TemporaryAccount) {
       "Content-Type": "application/x-www-form-urlencoded"
     },
     body
-  });
+  }, proxyConfig);
   if (!response.ok) throw new Error(`刷新 Codex token 失败：${response.status} ${extractUpstreamError(text)}`);
   const payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
   const accessToken = typeof payload.access_token === "string" ? payload.access_token.trim() : "";
@@ -1518,13 +1828,13 @@ function codexUsageCheckResult(payload: unknown) {
   };
 }
 
-async function fetchCodexUsage(account: TemporaryAccount, accessToken = account.secret) {
+async function fetchCodexUsage(account: TemporaryAccount, accessToken = account.secret, proxyConfig?: RouteProxyConfig) {
   return fetchTemporaryAccountCheckText(CODEX_USAGE_URL, {
     headers: codexQuotaHeaders(account, accessToken)
-  });
+  }, proxyConfig);
 }
 
-async function checkCodexTemporaryAccount(account: TemporaryAccount, checkedAt: string) {
+async function checkCodexTemporaryAccount(account: TemporaryAccount, checkedAt: string, proxyConfig?: RouteProxyConfig) {
   let tokenPatch:
     | {
         secret: string;
@@ -1534,13 +1844,13 @@ async function checkCodexTemporaryAccount(account: TemporaryAccount, checkedAt: 
         email?: string;
       }
     | undefined;
-  let attempt = await fetchCodexUsage(account);
+  let attempt = await fetchCodexUsage(account, account.secret, proxyConfig);
   if ([401, 403].includes(attempt.response.status) && account.refreshToken) {
-    const refreshedTokenPatch = await refreshCodexTemporaryAccountToken(account);
+    const refreshedTokenPatch = await refreshCodexTemporaryAccountToken(account, proxyConfig);
     if (refreshedTokenPatch) {
       tokenPatch = refreshedTokenPatch;
       const refreshedAccount = { ...account, ...tokenPatch };
-      attempt = await fetchCodexUsage(refreshedAccount, tokenPatch.secret);
+      attempt = await fetchCodexUsage(refreshedAccount, tokenPatch.secret, proxyConfig);
     }
   }
 
@@ -1613,13 +1923,13 @@ async function checkCodexTemporaryAccount(account: TemporaryAccount, checkedAt: 
   };
 }
 
-async function checkOpenAiApiKeyTemporaryAccount(account: TemporaryAccount, checkedAt: string) {
+async function checkOpenAiApiKeyTemporaryAccount(account: TemporaryAccount, checkedAt: string, proxyConfig?: RouteProxyConfig) {
   const { response, text } = await fetchTemporaryAccountCheckText(OPENAI_MODELS_URL, {
     headers: {
       Authorization: `Bearer ${account.secret}`,
       Accept: "application/json"
     }
-  });
+  }, proxyConfig);
   if (!response.ok) {
     const errorMessage = extractUpstreamError(text) || `HTTP ${response.status}`;
     return {
@@ -1658,13 +1968,281 @@ async function checkOpenAiApiKeyTemporaryAccount(account: TemporaryAccount, chec
   };
 }
 
-async function checkTemporaryAccount(groupId: string, account: TemporaryAccount): Promise<TemporaryAccountCheckItemResult> {
+const GROK_RATE_LIMIT_MODES = [
+  { label: "Fast", modelName: "fast" },
+  { label: "Auto", modelName: "auto" },
+  { label: "Expert", modelName: "expert" },
+  { label: "Heavy", modelName: "heavy" },
+  { label: "Grok 4.3", modelName: "grok-420-computer-use-sa" }
+];
+
+function grokInvalidCredentialsText(text: string) {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes("invalid-credentials") ||
+    normalized.includes("bad-credentials") ||
+    normalized.includes("failed to look up session id") ||
+    normalized.includes("blocked-user") ||
+    normalized.includes("email-domain-rejected") ||
+    normalized.includes("session not found") ||
+    normalized.includes("account suspended") ||
+    normalized.includes("token revoked") ||
+    normalized.includes("token expired")
+  );
+}
+
+function grokQuotaStage(label: string, payload: unknown): TemporaryAccountQuotaStage | undefined {
+  if (!isRecord(payload)) return undefined;
+  const remaining = typeof payload.remainingQueries === "number" ? payload.remainingQueries : undefined;
+  if (remaining == null) return undefined;
+  const total = typeof payload.totalQueries === "number" ? payload.totalQueries : remaining;
+  const windowSeconds = typeof payload.windowSizeSeconds === "number" ? payload.windowSizeSeconds : undefined;
+  return {
+    label,
+    remaining,
+    total,
+    unit: "次",
+    resetAt: windowSeconds && windowSeconds > 0 ? new Date(Date.now() + windowSeconds * 1000).toISOString() : undefined
+  };
+}
+
+function numberHeader(headers: Headers, name: string) {
+  const value = Number(headers.get(name));
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function xaiQuotaStageFromHeaders(label: string, headers: Headers, dimension: "requests" | "tokens"): TemporaryAccountQuotaStage | undefined {
+  const remaining = numberHeader(headers, `x-ratelimit-remaining-${dimension}`);
+  const total = numberHeader(headers, `x-ratelimit-limit-${dimension}`);
+  const reset = headers.get(`x-ratelimit-reset-${dimension}`);
+  if (remaining == null && total == null && !reset) return undefined;
+  const resetNumber = reset ? Number(reset) : undefined;
+  const resetAt = reset && resetNumber != null && Number.isFinite(resetNumber)
+    ? new Date((resetNumber > 1_000_000_000_000 ? resetNumber : resetNumber * 1000)).toISOString()
+    : reset || undefined;
+  return {
+    label,
+    remaining,
+    total,
+    unit: dimension === "requests" ? "次" : "tokens",
+    resetAt
+  };
+}
+
+function xaiQuotaStagesFromHeaders(headers: Headers) {
+  return [
+    xaiQuotaStageFromHeaders("xAI 请求额度", headers, "requests"),
+    xaiQuotaStageFromHeaders("xAI Token 额度", headers, "tokens")
+  ].filter((stage): stage is TemporaryAccountQuotaStage => Boolean(stage));
+}
+
+function grokOAuthHeaders(account: TemporaryAccount, accessToken = account.secret) {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+    "User-Agent": "samapi-grok-oauth/1.0"
+  };
+}
+
+async function refreshGrokOAuthTemporaryAccountToken(account: TemporaryAccount, proxyConfig?: RouteProxyConfig) {
+  if (!account.refreshToken?.trim()) return undefined;
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: XAI_OAUTH_CLIENT_ID,
+    refresh_token: account.refreshToken.trim()
+  });
+  const { response, text } = await fetchTemporaryAccountCheckText(XAI_OAUTH_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": "samapi-grok-oauth/1.0"
+    },
+    body
+  }, proxyConfig);
+  if (!response.ok) throw new Error(`刷新 Grok OAuth token 失败：${response.status} ${extractUpstreamError(text)}`);
+  const payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  const accessToken = typeof payload.access_token === "string" ? payload.access_token.trim() : "";
+  if (!accessToken) throw new Error("刷新 Grok OAuth token 失败：响应缺少 access_token");
+  const refreshToken = typeof payload.refresh_token === "string" && payload.refresh_token.trim() ? payload.refresh_token.trim() : account.refreshToken;
+  const idToken = typeof payload.id_token === "string" && payload.id_token.trim() ? payload.id_token.trim() : account.idToken;
+  const email = emailFromIdToken(idToken) || account.email;
+  return {
+    secret: accessToken,
+    refreshToken,
+    idToken,
+    email
+  };
+}
+
+async function fetchGrokOAuthResponses(account: TemporaryAccount, accessToken = account.secret, proxyConfig?: RouteProxyConfig) {
+  const model = account.models.find((item) => item.toLowerCase().includes("grok")) || "grok-4.3";
+  return fetchTemporaryAccountCheckText(XAI_RESPONSES_URL, {
+    method: "POST",
+    headers: grokOAuthHeaders(account, accessToken),
+    body: JSON.stringify({
+      model,
+      input: "hi",
+      stream: false
+    })
+  }, proxyConfig);
+}
+
+async function checkGrokOAuthTemporaryAccount(account: TemporaryAccount, checkedAt: string, proxyConfig?: RouteProxyConfig) {
+  let tokenPatch:
+    | {
+        secret: string;
+        refreshToken?: string;
+        idToken?: string;
+        email?: string;
+      }
+    | undefined;
+  let attempt = await fetchGrokOAuthResponses(account, account.secret, proxyConfig);
+  if (attempt.response.status === 401 && account.refreshToken) {
+    const refreshedTokenPatch = await refreshGrokOAuthTemporaryAccountToken(account, proxyConfig);
+    if (refreshedTokenPatch) {
+      tokenPatch = refreshedTokenPatch;
+      const refreshedAccount = { ...account, ...tokenPatch };
+      attempt = await fetchGrokOAuthResponses(refreshedAccount, tokenPatch.secret, proxyConfig);
+    }
+  }
+
+  const quotaStages = xaiQuotaStagesFromHeaders(attempt.response.headers);
+  if (!attempt.response.ok) {
+    const errorMessage = extractUpstreamError(attempt.text) || `HTTP ${attempt.response.status}`;
+    const availability = attempt.response.status === 429 ? "unavailable" as const : "unavailable" as const;
+    return {
+      patch: {
+        ...tokenPatch,
+        availability,
+        quotaStages: quotaStages.length > 0 ? quotaStages : account.quotaStages,
+        lastQuotaCheckedAt: checkedAt,
+        lastCheckStatusCode: attempt.response.status,
+        lastCheckError: errorMessage
+      },
+      result: {
+        availability,
+        status: "failed" as const,
+        statusCode: attempt.response.status,
+        quotaStages: quotaStages.length > 0 ? quotaStages : account.quotaStages,
+        errorMessage,
+        checkedAt
+      }
+    };
+  }
+
+  return {
+    patch: {
+      ...tokenPatch,
+      availability: "available" as const,
+      quotaStages,
+      lastQuotaCheckedAt: checkedAt,
+      lastCheckStatusCode: attempt.response.status,
+      lastCheckError: undefined
+    },
+    result: {
+      availability: "available" as const,
+      status: "success" as const,
+      statusCode: attempt.response.status,
+      quotaStages,
+      checkedAt
+    }
+  };
+}
+
+async function checkGrokTemporaryAccount(account: TemporaryAccount, checkedAt: string, proxyConfig?: RouteProxyConfig) {
+  if (isGrokOAuthTemporaryAccount(account)) return checkGrokOAuthTemporaryAccount(account, checkedAt, proxyConfig);
+  const existingQuotaStages = account.quotaStages;
+
+  const checks = await Promise.all(
+    GROK_RATE_LIMIT_MODES.map(async (mode) => {
+      try {
+        const { response, text } = await fetchTemporaryAccountCheckText(GROK_RATE_LIMITS_URL, {
+          method: "POST",
+          headers: grokTemporaryHeaders(account),
+          body: JSON.stringify({ modelName: mode.modelName })
+        }, proxyConfig);
+        if (looksLikeHtmlText(text)) {
+          return { mode, statusCode: response.status, ok: false, text: "Grok 检查返回了网页，通常是 Cloudflare/浏览器校验页；账号未判定不可用", stage: undefined };
+        }
+        if (!response.ok) {
+          return { mode, statusCode: response.status, ok: false, text, stage: undefined };
+        }
+        let payload: unknown = {};
+        try {
+          payload = text ? JSON.parse(text) : {};
+        } catch {
+          return { mode, statusCode: response.status, ok: true, text: "Grok rate-limits 返回内容不是合法 JSON", stage: undefined };
+        }
+        return { mode, statusCode: response.status, ok: true, text, stage: grokQuotaStage(mode.label, payload) };
+      } catch (error) {
+        return { mode, statusCode: 599, ok: false, text: upstreamNetworkErrorMessage(error, "Grok rate-limits 检查请求失败"), stage: undefined };
+      }
+    })
+  );
+  const stages = checks.map((item) => item.stage).filter((stage): stage is TemporaryAccountQuotaStage => Boolean(stage));
+  const firstSuccess = checks.find((item) => item.ok);
+  if (stages.length > 0) {
+    const hasRemaining = stages.some((stage) => typeof stage.remaining !== "number" || stage.remaining > 0);
+    const availability = hasRemaining ? "available" as const : "unavailable" as const;
+    const errorMessage = hasRemaining ? undefined : "Grok 额度已耗尽或当前不允许请求";
+    return {
+      patch: {
+        availability,
+        quotaStages: stages,
+        lastQuotaCheckedAt: checkedAt,
+        lastCheckStatusCode: firstSuccess?.statusCode,
+        lastCheckError: errorMessage
+      },
+      result: {
+        availability,
+        status: hasRemaining ? "success" as const : "failed" as const,
+        statusCode: firstSuccess?.statusCode,
+        quotaStages: stages,
+        errorMessage,
+        checkedAt
+      }
+    };
+  }
+
+  const firstFailure = checks.find((item) => !item.ok);
+  const failureText = checks.map((item) => item.text).join("\n");
+  const statusCode = firstFailure?.statusCode;
+  const errorMessage = failureText.includes("Grok 检查返回了网页")
+    ? "Grok 检查返回了网页，通常是 Cloudflare/浏览器校验页；需要可用的 cf_clearance/浏览器态才能实时读取额度，账号未判定不可用"
+    : extractUpstreamError(failureText) || (statusCode ? `HTTP ${statusCode}` : "Grok 检查失败");
+  const invalidCredentials = checks.some((item) => [400, 401, 403].includes(item.statusCode) && grokInvalidCredentialsText(item.text));
+  const availability = invalidCredentials ? "unavailable" as const : "unknown" as const;
+  return {
+    patch: {
+      availability,
+      quotaStages: existingQuotaStages,
+      lastQuotaCheckedAt: checkedAt,
+      lastCheckStatusCode: statusCode,
+      lastCheckError: errorMessage
+    },
+    result: {
+      availability,
+      status: "failed" as const,
+      statusCode,
+      quotaStages: existingQuotaStages,
+      errorMessage,
+      checkedAt
+    }
+  };
+}
+
+async function checkTemporaryAccount(groupId: string, account: TemporaryAccount, proxyConfig?: RouteProxyConfig): Promise<TemporaryAccountCheckItemResult> {
   const checkedAt = new Date().toISOString();
   try {
     const accountIsCodex = account.accountType === "codex" || Boolean(account.accountId);
-    const check = accountIsCodex
-      ? await checkCodexTemporaryAccount(account, checkedAt)
-      : await checkOpenAiApiKeyTemporaryAccount(account, checkedAt);
+    const providerType = account.providerType || "gpt";
+    const check = providerType === "grok"
+      ? await checkGrokTemporaryAccount(account, checkedAt, proxyConfig)
+      : accountIsCodex
+        ? await checkCodexTemporaryAccount(account, checkedAt, proxyConfig)
+        : await checkOpenAiApiKeyTemporaryAccount(account, checkedAt, proxyConfig);
     const updated = store.updateTemporaryAccountCheckResult(account.id, check.patch);
     return {
       groupId,
@@ -1679,8 +2257,10 @@ async function checkTemporaryAccount(groupId: string, account: TemporaryAccount)
     };
   } catch (error) {
     const errorMessage = upstreamNetworkErrorMessage(error, "账号检查请求上游失败");
+    const providerType = account.providerType || "gpt";
+    const availability = providerType === "grok" ? "unknown" : "unavailable";
     const updated = store.updateTemporaryAccountCheckResult(account.id, {
-      availability: "unavailable",
+      availability,
       quotaStages: account.quotaStages,
       lastQuotaCheckedAt: checkedAt,
       lastCheckStatusCode: 599,
@@ -1690,7 +2270,7 @@ async function checkTemporaryAccount(groupId: string, account: TemporaryAccount)
       groupId,
       accountId: account.id,
       label: account.label,
-      availability: "unavailable",
+      availability,
       status: "failed",
       statusCode: 599,
       quotaStages: updated?.quotaStages || account.quotaStages,
@@ -1710,27 +2290,27 @@ function temporaryAccountCheckResult(results: TemporaryAccountCheckItemResult[])
   };
 }
 
-async function checkTemporaryAccounts(groupId?: string): Promise<TemporaryAccountCheckResult> {
-  const targets = store.temporaryAccountCheckTargets(groupId);
+async function checkTemporaryAccounts(groupId?: string, proxyConfig?: RouteProxyConfig, providerType: TemporaryAccountProviderType = "gpt"): Promise<TemporaryAccountCheckResult> {
+  const targets = store.temporaryAccountCheckTargets(groupId, providerType);
   if (groupId && targets.length === 0) throw new Error("临时账号组不存在");
   const results = await mapWithConcurrency(targets, TEMPORARY_ACCOUNT_CHECK_CONCURRENCY, ({ group, account }) =>
-    checkTemporaryAccount(group.id, account)
+    checkTemporaryAccount(group.id, account, proxyConfig)
   );
   return temporaryAccountCheckResult(results);
 }
 
-async function checkTemporaryAccountIds(accountIds: string[]): Promise<TemporaryAccountCheckResult> {
-  const targets = accountIds.map((accountId) => store.temporaryAccountCheckTarget(accountId));
+async function checkTemporaryAccountIds(accountIds: string[], proxyConfig?: RouteProxyConfig, providerType?: TemporaryAccountProviderType): Promise<TemporaryAccountCheckResult> {
+  const targets = accountIds.map((accountId) => store.temporaryAccountCheckTarget(accountId, providerType));
   if (targets.some((target) => !target)) throw new Error("临时账号不存在或不支持刷新");
   const validTargets = targets.filter((target): target is NonNullable<typeof target> => Boolean(target));
   const results = await mapWithConcurrency(validTargets, TEMPORARY_ACCOUNT_CHECK_CONCURRENCY, ({ group, account }) =>
-    checkTemporaryAccount(group.id, account)
+    checkTemporaryAccount(group.id, account, proxyConfig)
   );
   return temporaryAccountCheckResult(results);
 }
 
-async function checkSingleTemporaryAccount(accountId: string): Promise<TemporaryAccountCheckResult> {
-  return checkTemporaryAccountIds([accountId]);
+async function checkSingleTemporaryAccount(accountId: string, proxyConfig?: RouteProxyConfig): Promise<TemporaryAccountCheckResult> {
+  return checkTemporaryAccountIds([accountId], proxyConfig);
 }
 
 function shouldMarkTemporaryAccountUnavailable(statusCode: number, errorMessage = "") {
@@ -1984,6 +2564,26 @@ function routeMemberKey(member: { siteId: string; apiKeyId: string; model: strin
   return `${member.siteId}::${member.apiKeyId}::${member.model}`;
 }
 
+function temporaryAccountProviderTypeForSite(site: Site) {
+  const text = [site.name, ...site.addresses.map((address) => address.baseUrl)].join(" ").toLowerCase();
+  if (text.includes("grok") || text.includes("x.ai")) return "grok" as const;
+  return undefined;
+}
+
+function temporaryAccountProviderTypeForModel(model: string) {
+  return model.toLowerCase().includes("grok") ? "grok" as const : undefined;
+}
+
+function resolveTemporaryProviderAccountsForRoute(site: Site, model: string) {
+  const providerType = temporaryAccountProviderTypeForSite(site) || temporaryAccountProviderTypeForModel(model);
+  if (!providerType) return [];
+  return store.resolveTemporaryProviderAccounts(providerType, model);
+}
+
+function isCodexTemporaryAccount(account: TemporaryAccount) {
+  return account.providerType === "gpt" && (account.accountType === "codex" || Boolean(account.accountId));
+}
+
 function resolveProxyExecution(routeNameOrId: string) {
   const db = store.getDb();
   const route = db.routes.find((item) => item.id === routeNameOrId || item.name === routeNameOrId);
@@ -1995,15 +2595,17 @@ function resolveProxyExecution(routeNameOrId: string) {
     if (!site || addresses.length === 0) throw new Error("路由绑定的供应商地址不可用");
     const officialProviderApiKey = store.resolveProviderApiKey(site.id, route.model);
     const useChatGptOfficial = officialProviderApiKey?.kind === "chatgpt-official";
-    const temporaryAccounts = useChatGptOfficial || store.isOfficialOpenAiSite(site.id) ? store.resolveTemporaryOpenAiAccounts(route.model) : [];
+    const temporaryAccounts = useChatGptOfficial || store.isOfficialOpenAiSite(site.id)
+      ? store.resolveTemporaryOpenAiAccounts(route.model)
+      : resolveTemporaryProviderAccountsForRoute(site, route.model);
     if (temporaryAccounts.length > 0) {
       const candidates: ProxyExecutionCandidate[] = temporaryAccounts.map((temporaryAccount, index) => {
-        const temporaryAccountIsCodex = temporaryAccount.accountType === "codex" || Boolean(temporaryAccount.accountId);
+        const temporaryAccountIsCodex = isCodexTemporaryAccount(temporaryAccount);
         return {
           site,
           addresses,
           model: route.model,
-          providerApiKey: temporaryAccountIsCodex ? undefined : temporaryAccount,
+          providerApiKey: temporaryAccountIsCodex || isGrokWebTemporaryAccount(temporaryAccount) ? undefined : temporaryAccount,
           temporaryAccount: temporaryAccountIsCodex ? temporaryAccount : undefined,
           temporaryApiKeyAccount: temporaryAccountIsCodex ? undefined : temporaryAccount,
           headerTemplate: routeHeaderTemplate(route),
@@ -2057,12 +2659,12 @@ function resolveProxyExecution(routeNameOrId: string) {
     if (!apiKey?.enabled || !apiKey.models.includes(member.model)) continue;
     if (apiKey.kind === "chatgpt-official") {
       for (const temporaryAccount of store.resolveTemporaryOpenAiAccounts(member.model)) {
-        const temporaryAccountIsCodex = temporaryAccount.accountType === "codex" || Boolean(temporaryAccount.accountId);
+        const temporaryAccountIsCodex = isCodexTemporaryAccount(temporaryAccount);
         candidates.push({
           site,
           addresses,
           model: member.model,
-          providerApiKey: temporaryAccountIsCodex ? undefined : temporaryAccount,
+          providerApiKey: temporaryAccountIsCodex || isGrokWebTemporaryAccount(temporaryAccount) ? undefined : temporaryAccount,
           temporaryAccount: temporaryAccountIsCodex ? temporaryAccount : undefined,
           temporaryApiKeyAccount: temporaryAccountIsCodex ? undefined : temporaryAccount,
           headerTemplate,
@@ -2728,7 +3330,12 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
 
     if (parts[1] === "auth") {
       if (method === "GET" && parts[2] === "session") {
-        sendJson(response, 200, { authenticated: hasAdminSession(request) });
+        if (!hasAdminSession(request)) {
+          sendJson(response, 200, { authenticated: false });
+          return;
+        }
+        const session = renewAdminSession(response);
+        sendJson(response, 200, { authenticated: true, expiresAt: session.expiresAt });
         return;
       }
       if (method === "POST" && parts[2] === "login") {
@@ -2782,6 +3389,11 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
     }
 
     if (parts[1] === "logs") {
+      if (method === "GET" && parts[2]) {
+        const log = store.getRequestLog(routeParam(parts, 2));
+        if (!log) return sendJson(response, 404, { error: "日志不存在" });
+        return sendJson(response, 200, log);
+      }
       if (method === "GET") {
         const requestedLimit = Number(url.searchParams.get("limit") || "");
         const requestedOffset = Number(url.searchParams.get("offset") || "");
@@ -2819,8 +3431,8 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
     if (parts[1] === "keys") {
       if (method === "GET") return sendJson(response, 200, store.getDb().apiKeys);
       if (method === "POST") {
-        const body = await readJson(request);
-        return sendJson(response, 201, store.createApiKey(String(body.name || "")));
+        const body = await readJson(request) as { name?: unknown; models?: unknown };
+        return sendJson(response, 201, store.createApiKey(String(body.name || ""), Array.isArray(body.models) ? body.models.map(String) : []));
       }
       if (method === "PATCH") return sendJson(response, 200, store.updateApiKey(routeParam(parts, 2), await readJson(request)));
       if (method === "DELETE") {
@@ -2851,11 +3463,16 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
       if (method === "GET") return sendJson(response, 200, store.getDb().temporaryAccountGroups);
       if (method === "POST" && parts[2] === "import") {
         const imported = store.importTemporaryAccounts(await readJson(request));
-        const checkResult = imported.group.providerType === "gpt" ? await checkTemporaryAccountIds(imported.accountIds) : undefined;
+        const checkResult = ["gpt", "grok"].includes(imported.group.providerType || "")
+          ? await checkTemporaryAccountIds(imported.accountIds, undefined, imported.group.providerType)
+          : undefined;
         const updatedGroup = store.getDb().temporaryAccountGroups.find((group) => group.id === imported.group.id) || imported.group;
         return sendJson(response, 201, { ...imported, group: updatedGroup, checkResult });
       }
-      if (method === "POST" && parts[2] === "check") return sendJson(response, 200, await checkTemporaryAccounts());
+      if (method === "POST" && parts[2] === "check") {
+        const body = await readJson(request);
+        return sendJson(response, 200, await checkTemporaryAccounts(undefined, temporaryAccountCheckProxyFromBody(body), temporaryAccountProviderTypeFromBody(body)));
+      }
       if (method === "DELETE" && parts[2] === "batch") {
         const body = await readJson(request);
         store.deleteTemporaryAccounts(Array.isArray(body.ids) ? body.ids.map(String) : []);
@@ -2863,7 +3480,10 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
       }
       if (parts[2] === "accounts") {
         const accountId = routeParam(parts, 3);
-        if (method === "POST" && parts[4] === "check") return sendJson(response, 200, await checkSingleTemporaryAccount(accountId));
+        if (method === "POST" && parts[4] === "check") {
+          const body = await readJson(request);
+          return sendJson(response, 200, await checkSingleTemporaryAccount(accountId, temporaryAccountCheckProxyFromBody(body)));
+        }
         if (method === "PATCH") return sendJson(response, 200, store.updateTemporaryAccount(accountId, await readJson(request)));
         if (method === "DELETE") {
           store.deleteTemporaryAccount(accountId);
@@ -2972,7 +3592,8 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
   };
 
   const apiKey = requestApiKey(request, url);
-  if (!store.verifyApiKey(apiKey)) {
+  const authenticatedApiKey = store.verifyApiKey(apiKey);
+  if (!authenticatedApiKey) {
     store.recordRequestLog({
       ...requestLogBase,
       ...routeLogContext,
@@ -3006,6 +3627,10 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
 
     const modelsFormat = wantsAnthropicModelsFormat(request, url) ? "anthropic" : "openai";
     const payload = proxyModelsPayload(modelsFormat);
+    if (authenticatedApiKey !== true && authenticatedApiKey.models.length > 0) {
+      const allowed = new Set(authenticatedApiKey.models);
+      payload.data = payload.data.filter((item) => allowed.has(item.id));
+    }
     const modelIds = payload.data.map((item) => item.id).filter((item): item is string => typeof item === "string");
     store.recordRequestLog({
       ...requestLogBase,
@@ -3026,6 +3651,9 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
 
   try {
     if (!routeNameOrId) throw new Error("请求体中的 model 必须填写路由名称");
+    if (authenticatedApiKey !== true && authenticatedApiKey.models.length > 0 && !authenticatedApiKey.models.includes(routeNameOrId)) {
+      throw new Error(`当前客户端密钥不允许使用模型 ${routeNameOrId}`);
+    }
     const { route, candidates } = resolveProxyExecution(routeNameOrId);
     const downstreamStream = isStreamingRequest(body) || proxyInfo.kind === "gemini-stream";
 
@@ -3054,7 +3682,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
         "Content-Type": "application/json",
         ...parseHeaderTemplate(candidate.headerTemplate?.headersText)
       };
-      if (!candidate.providerApiKey && !candidate.temporaryAccount && !headerValue(headers, "Authorization")) {
+      if (!candidate.providerApiKey && !candidate.temporaryAccount && !candidate.temporaryApiKeyAccount && !headerValue(headers, "Authorization")) {
         throw new Error(`未找到支持模型 ${candidate.model} 的上游 API Key`);
       }
       if (candidate.providerApiKey) setHeader(headers, "Authorization", `Bearer ${candidate.providerApiKey.secret}`);
@@ -3076,6 +3704,11 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
               "upstream-api-key": candidate.temporaryAccount.label,
               "upstream-authorization": `Bearer ${maskSecret(candidate.temporaryAccount.secret)}`
             }
+        : candidate.temporaryApiKeyAccount
+          ? {
+              "upstream-api-key": candidate.temporaryApiKeyAccount.label,
+              "upstream-authorization": candidate.temporaryApiKeyAccount.providerType === "grok" ? "Grok Web SSO Cookie" : `Bearer ${maskSecret(candidate.temporaryApiKeyAccount.secret)}`
+            }
         : {
             "upstream-authorization": "Header 模版已提供"
       };
@@ -3088,6 +3721,146 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
         ...upstreamAuthLog
       };
       lastAttemptContext = { candidate, routeUa, routeTargetLog, upstreamAuthLog };
+
+      if (isGrokWebTemporaryAccount(candidate.temporaryApiKeyAccount)) {
+        const grokAccount = candidate.temporaryApiKeyAccount;
+        const grokHeaders = grokTemporaryHeaders(grokAccount, headers);
+        const grokRouteUa = headerValue(grokHeaders, "User-Agent") || "Grok Web";
+        const grokRouteTargetLog = {
+          ...routeTargetLog,
+          userAgent: grokRouteUa
+        };
+        const grokAuthLog: Record<string, string> = {
+          "upstream-api-key": grokAccount.label,
+          "upstream-authorization": "Grok Web SSO Cookie"
+        };
+        lastAttemptContext = { candidate, routeUa: grokRouteUa, routeTargetLog: grokRouteTargetLog, upstreamAuthLog: grokAuthLog };
+        const convertedForGrok = convertedRouteRequestBody(body, candidate.model, "chat/completions", proxyInfo.kind);
+        const grokForwardedBody = grokWebRequestBody(convertedForGrok.body, candidate.model);
+        const grokUpstreamRequestHeaders = {
+          ...maskedStringHeaders(grokHeaders),
+          ...grokAuthLog
+        };
+        const attemptStartedAt = Date.now();
+        try {
+          const { response: upstream, proxy: attemptProxy } = await fetchWithRouteProxy(GROK_CONVERSATIONS_NEW_URL, {
+            method: "POST",
+            headers: grokHeaders,
+            body: JSON.stringify(grokForwardedBody)
+          }, route.proxy);
+          const contentType = upstream.headers.get("content-type") || undefined;
+          const text = upstream.body ? await collectGrokWebStreamBody(upstream.body) : await upstream.text();
+
+          if (upstream.ok && !looksLikeHtml(contentType, text)) {
+            const adapted = adaptGrokWebResponseText(text, proxyInfo.kind, candidate.model, convertedForGrok.converter, downstreamStream);
+            upstreamAttempts.push({
+              addressLabel: "Grok Web",
+              upstreamUrl: GROK_CONVERSATIONS_NEW_URL,
+              method: "POST",
+              model: candidate.model,
+              endpoint: "chat/completions",
+              userAgent: grokRouteUa,
+              requestHeaders: grokUpstreamRequestHeaders,
+              requestBody: grokForwardedBody,
+              status: "success",
+              statusCode: upstream.status,
+              durationMs: Date.now() - attemptStartedAt,
+              contentType,
+              responsePreview: responsePreview(adapted.text || text)
+            });
+            store.recordRequestLog({
+              ...requestLogBase,
+              routeId: route.id,
+              routeName: route.name,
+              endpoint: route.endpoint,
+              providerName: candidate.site.name,
+              providerId: candidate.site.id,
+              addressLabel: "Grok Web",
+              model: candidate.model,
+              requestBody: body,
+              status: "success",
+              statusCode: upstream.status,
+              durationMs: Date.now() - startedAt,
+              requestHeaders: {
+                ...requestLogBase.requestHeaders,
+                ...grokAuthLog
+              },
+              upstreamUrl: GROK_CONVERSATIONS_NEW_URL,
+              upstreamContentType: contentType,
+              responsePreview: responsePreview(adapted.text || text),
+              downstream: downstreamLog,
+              routeTarget: grokRouteTargetLog,
+              upstreamAttempts,
+              proxy: attemptProxy,
+              summary: chainSummary({
+                downstreamModel: downstreamLog.model,
+                downstreamEndpoint,
+                downstreamUa,
+                routeModel: candidate.model,
+                routeEndpoint: route.endpoint,
+                routeUa: grokRouteUa,
+                status: "success"
+              })
+            });
+            markTemporaryAccountAttempt(candidate, upstream.status);
+            markCandidateSuccess(route, candidate);
+            response.writeHead(upstream.status, {
+              "Content-Type": adapted.contentType || "application/json; charset=utf-8",
+              "Access-Control-Allow-Origin": "*"
+            });
+            response.end(adapted.text);
+            return;
+          }
+
+          const htmlMessage = looksLikeHtml(contentType, text) ? "Grok Web 返回了 HTML 页面，请检查 SSO Cookie、代理或浏览器校验状态" : "";
+          const errorMessage = htmlMessage || extractUpstreamError(text) || `HTTP ${upstream.status}`;
+          markTemporaryAccountAttempt(candidate, upstream.status, errorMessage);
+          errors.push(`Grok Web：${upstream.status} ${errorMessage}`);
+          upstreamAttempts.push({
+            addressLabel: "Grok Web",
+            upstreamUrl: GROK_CONVERSATIONS_NEW_URL,
+            method: "POST",
+            model: candidate.model,
+            endpoint: "chat/completions",
+            userAgent: grokRouteUa,
+            requestHeaders: grokUpstreamRequestHeaders,
+            requestBody: grokForwardedBody,
+            status: "failed",
+            statusCode: upstream.status,
+            durationMs: Date.now() - attemptStartedAt,
+            contentType,
+            responsePreview: responsePreview(text),
+            errorMessage
+          });
+          lastFailure = {
+            address: candidate.addresses[0],
+            target: GROK_CONVERSATIONS_NEW_URL,
+            statusCode: upstream.status,
+            text,
+            contentType
+          };
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : "请求 Grok Web 上游失败";
+          markTemporaryAccountAttempt(candidate, 599, errorMessage);
+          errors.push(`Grok Web：${errorMessage}`);
+          upstreamAttempts.push({
+            addressLabel: "Grok Web",
+            upstreamUrl: GROK_CONVERSATIONS_NEW_URL,
+            method: "POST",
+            model: candidate.model,
+            endpoint: "chat/completions",
+            userAgent: grokRouteUa,
+            requestHeaders: grokUpstreamRequestHeaders,
+            requestBody: grokForwardedBody,
+            status: "failed",
+            statusCode: 599,
+            durationMs: Date.now() - attemptStartedAt,
+            responsePreview: responsePreview(JSON.stringify({ error: errorMessage })),
+            errorMessage
+          });
+        }
+        continue;
+      }
 
       if (candidate.temporaryAccount) {
         const codexHeaders = codexTemporaryHeaders(candidate.temporaryAccount, headers, true);
@@ -3110,11 +3883,11 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
         };
         const attemptStartedAt = Date.now();
         try {
-          const upstream = await fetch(CODEX_BACKEND_RESPONSES_URL, {
+          const { response: upstream, proxy: attemptProxy } = await fetchWithRouteProxy(CODEX_BACKEND_RESPONSES_URL, {
             method: "POST",
             headers: codexHeaders,
             body: JSON.stringify(codexForwardedBody)
-          });
+          }, route.proxy);
           const contentType = upstream.headers.get("content-type") || undefined;
 
           if (upstream.ok && upstream.body && !looksLikeHtml(contentType, "")) {
@@ -3180,6 +3953,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                   downstream: downstreamLog,
                   routeTarget: codexRouteTargetLog,
                   upstreamAttempts,
+                  proxy: attemptProxy,
                   summary: chainSummary({
                     downstreamModel: downstreamLog.model,
                     downstreamEndpoint,
@@ -3236,6 +4010,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                   downstream: downstreamLog,
                   routeTarget: codexRouteTargetLog,
                   upstreamAttempts,
+                  proxy: attemptProxy,
                   summary: chainSummary({
                     downstreamModel: downstreamLog.model,
                     downstreamEndpoint,
@@ -3297,6 +4072,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
               downstream: downstreamLog,
               routeTarget: codexRouteTargetLog,
               upstreamAttempts,
+              proxy: attemptProxy,
               summary: chainSummary({
                 downstreamModel: downstreamLog.model,
                 downstreamEndpoint,
@@ -3372,11 +4148,11 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
       for (const target of proxyEndpointCandidates(address.baseUrl, route.endpoint)) {
         const attemptStartedAt = Date.now();
         try {
-          const upstream = await fetch(target, {
+          const { response: upstream, proxy: attemptProxy } = await fetchWithRouteProxy(target, {
             method: request.method || "POST",
             headers,
             body: JSON.stringify(forwardedBody)
-          });
+          }, route.proxy);
           const contentType = upstream.headers.get("content-type") || undefined;
 
           if (upstream.ok && !looksLikeHtml(contentType, "")) {
@@ -3442,6 +4218,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                   downstream: downstreamLog,
                   routeTarget: routeTargetLog,
                   upstreamAttempts,
+                  proxy: attemptProxy,
                   summary: chainSummary({
                     downstreamModel: downstreamLog.model,
                     downstreamEndpoint,
@@ -3498,6 +4275,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                   downstream: downstreamLog,
                   routeTarget: routeTargetLog,
                   upstreamAttempts,
+                  proxy: attemptProxy,
                   summary: chainSummary({
                     downstreamModel: downstreamLog.model,
                     downstreamEndpoint,
@@ -3587,6 +4365,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
               downstream: downstreamLog,
               routeTarget: routeTargetLog,
               upstreamAttempts,
+              proxy: attemptProxy,
               summary: chainSummary({
                 downstreamModel: downstreamLog.model,
                 downstreamEndpoint,
@@ -3703,6 +4482,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
       downstream: downstreamLog,
       routeTarget: failedRouteTargetLog,
       upstreamAttempts,
+      proxy: requestLogProxyForRoute(route.proxy),
       summary: chainSummary({
         downstreamModel: downstreamLog.model,
         downstreamEndpoint,
@@ -3791,7 +4571,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Local access: http://127.0.0.1:${PORT}`);
   console.log(`Database: ${store.dbPath}`);
   console.log(`Web UI: ${WEB_DIR}`);
-  console.log(`Fetch proxy: ${FETCH_PROXY_URL || "direct"}`);
+  console.log("Fetch proxy: per-route");
   if (ADMIN_PASSWORD_IS_DEFAULT && !store.getAdminPasswordHash()) {
     console.warn("Admin password is using the local default: samapi-admin. Set SAMAPI_ADMIN_PASSWORD before exposing SamAPI publicly.");
   }

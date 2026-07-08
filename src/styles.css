@@ -524,6 +524,7 @@ textarea {
 
 .app-scrollbar-float-visible {
   opacity: 1;
+  pointer-events: auto;
 }
 
 .app-scrollbar-thumb {
@@ -534,7 +535,14 @@ textarea {
   border-radius: 999px;
   background: color-mix(in srgb, var(--accent) 44%, transparent);
   box-shadow: 0 0 0 1px var(--surface-solid);
+  cursor: grab;
+  touch-action: none;
   transition: background 160ms ease, transform 60ms linear, height 60ms linear;
+}
+
+.app-scrollbar-thumb:active {
+  background: color-mix(in srgb, var(--accent) 68%, transparent);
+  cursor: grabbing;
 }
 
 .app-scroll .center-empty {
@@ -1102,8 +1110,17 @@ label {
   color: var(--accent-strong);
 }
 
+.temp-account-empty-inline {
+  box-shadow: none;
+}
+
+.temp-account-check-provider,
+.temp-account-check-proxy,
 .temp-account-strategy {
   width: min(220px, 100%);
+}
+
+.temp-account-strategy {
   margin-left: auto;
 }
 
@@ -1418,6 +1435,10 @@ label {
   text-align: left;
 }
 
+.switch-route-record .route-record-main {
+  padding-right: 15.5rem;
+}
+
 .route-record-main,
 .route-quick-panel,
 .route-detail-panel {
@@ -1477,6 +1498,37 @@ label {
   padding: 0;
 }
 
+.route-record-actions .route-enable-action {
+  width: auto;
+  min-width: 66px;
+  gap: 0.42rem;
+  padding: 0 0.72rem;
+  color: var(--muted-strong);
+  font-size: 0.76rem;
+  font-weight: 840;
+}
+
+.route-enable-action-on {
+  border-color: color-mix(in srgb, var(--accent) 24%, transparent);
+  background: var(--accent-softer);
+  color: var(--accent-strong);
+}
+
+.route-enable-action-off {
+  border-color: var(--line);
+  background: var(--surface-muted);
+  color: var(--muted);
+}
+
+.route-enable-dot {
+  width: 0.48rem;
+  height: 0.48rem;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: currentColor;
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 12%, transparent);
+}
+
 .route-record-open .route-record-actions {
   top: 1rem;
   transform: none;
@@ -1494,7 +1546,7 @@ label {
 .route-quick-grid {
   display: grid;
   width: 100%;
-  grid-template-columns: minmax(180px, 0.9fr) minmax(220px, 1.25fr) minmax(108px, 0.42fr) minmax(14ch, 1.2fr) minmax(88px, auto);
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   align-items: end;
   gap: 0.75rem;
 }
@@ -1540,15 +1592,6 @@ label {
   padding: 0 0.86rem;
 }
 
-.route-quick-stat strong {
-  display: block;
-  min-width: 0;
-  color: var(--ink);
-  font-size: 0.9rem;
-  font-weight: 840;
-  overflow-wrap: anywhere;
-}
-
 .route-quick-endpoint strong {
   overflow: visible;
   text-overflow: clip;
@@ -1563,22 +1606,6 @@ label {
   min-height: 56px;
   padding-top: 0.5rem;
   padding-bottom: 0.5rem;
-}
-
-.route-quick-toggle {
-  justify-content: center;
-  gap: 0.55rem;
-  color: var(--ink);
-  font-size: 0.86rem;
-  font-weight: 820;
-  white-space: nowrap;
-}
-
-.route-quick-toggle input {
-  width: 18px;
-  height: 18px;
-  flex: 0 0 auto;
-  accent-color: var(--accent);
 }
 
 .route-quick-actions {
@@ -2116,9 +2143,10 @@ label {
   position: fixed;
   z-index: 80;
   top: 1rem;
-  right: 1rem;
+  left: 50%;
   display: grid;
-  width: min(560px, calc(100vw - 2rem));
+  width: fit-content;
+  max-width: min(560px, calc(100vw - 2rem));
   max-height: min(360px, calc(100vh - 2rem));
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
@@ -2133,6 +2161,7 @@ label {
   font-size: 0.82rem;
   font-weight: 780;
   line-height: 1.4;
+  transform: translateX(-50%);
   backdrop-filter: blur(16px);
 }
 
@@ -2396,6 +2425,87 @@ label {
   color: var(--danger-strong);
 }
 
+.status-pending {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--muted-strong);
+}
+
+.log-row-selected {
+  border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+}
+
+.log-summary-card {
+  grid-template-columns: 36px minmax(0, 1fr) auto auto;
+}
+
+.log-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.log-summary-section {
+  min-width: 0;
+  border-left: 1px solid var(--line);
+  padding-left: 0.75rem;
+}
+
+.log-summary-section:first-child {
+  border-left: 0;
+  padding-left: 0;
+}
+
+.logs-load-more {
+  padding: 1rem 0 0.2rem;
+  color: var(--muted);
+  text-align: center;
+  font-size: 0.78rem;
+  font-weight: 820;
+}
+
+.log-detail-modal {
+  display: flex;
+  width: min(1100px, 100%);
+  overflow: hidden;
+  flex-direction: column;
+}
+
+.log-detail-modal > .form-head {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.85rem;
+}
+
+.log-detail-modal-body {
+  min-height: 0;
+  overflow: auto;
+  padding-top: 0.85rem;
+  overscroll-behavior: contain;
+  scrollbar-color: color-mix(in srgb, var(--accent) 28%, transparent) transparent;
+  scrollbar-width: thin;
+}
+
+.log-detail-modal-body::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.log-detail-modal-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.log-detail-modal-body::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+  background-clip: padding-box;
+}
+
+.log-detail-modal-body::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--accent) 42%, transparent);
+  background-clip: padding-box;
+}
+
 .log-detail {
   border-top: 1px solid var(--line);
   background: var(--surface-soft);
@@ -2595,8 +2705,21 @@ label {
     grid-template-columns: 1fr;
   }
 
-  .detail-grid {
+  .detail-grid,
+  .log-summary-grid {
     grid-template-columns: 1fr;
+  }
+
+  .log-summary-section {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    padding-left: 0;
+    padding-top: 0.65rem;
+  }
+
+  .log-summary-section:first-child {
+    border-top: 0;
+    padding-top: 0;
   }
 
   .route-quick-grid {
@@ -2918,9 +3041,7 @@ label {
 
   .toast-float {
     top: 0.75rem;
-    right: 0.75rem;
-    left: 0.75rem;
-    width: auto;
+    max-width: calc(100vw - 1.5rem);
     max-height: min(280px, calc(100svh - 7rem));
   }
 
@@ -2963,6 +3084,10 @@ label {
   .route-record-main {
     min-height: 0;
     align-items: center;
+    padding: 0.9rem;
+  }
+
+  .switch-route-record .route-record-main {
     padding: 0.9rem;
   }
 
@@ -3079,6 +3204,8 @@ label {
   }
 
   .temp-account-toolbar .action,
+  .temp-account-check-provider,
+  .temp-account-check-proxy,
   .temp-account-strategy {
     width: 100%;
     margin-left: 0;
@@ -3131,6 +3258,12 @@ label {
   .log-summary .status-badge {
     grid-column: 2;
     justify-self: start;
+  }
+
+  .log-summary-card > .hidden {
+    grid-column: 2;
+    justify-self: start;
+    text-align: left;
   }
 
   .detail-block pre {
