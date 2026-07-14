@@ -250,7 +250,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function temporaryAccountLabel(record: Record<string, unknown>, fallback: string) {
-  for (const key of ["label", "name", "email", "username", "account", "remark", "备注", "pool"]) {
+  for (const key of ["label", "name", "email", "username", "user_id", "principal_id", "sub", "account", "account_id", "remark", "备注", "pool"]) {
     const value = record[key];
     if (typeof value === "string" && value.trim()) return value.trim();
   }
@@ -452,6 +452,76 @@ type TemporaryAccountImportCandidate = {
   quotaStages: TemporaryAccountQuotaStage[];
 };
 
+function normalizeGrokAuthKey(key: string) {
+  const normalized = key.trim().toLowerCase().replace(/[\s.\-]+/g, "_");
+  if (["auth_mode", "authmode"].includes(normalized)) return "auth_mode";
+  if (["key", "access_token", "accesstoken", "token", "bearer", "authorization", "sso", "sso_token", "ssotoken"].includes(normalized)) return "access_token";
+  if (["refresh_token", "refreshtoken", "refresh"].includes(normalized)) return "refresh_token";
+  if (["id_token", "idtoken"].includes(normalized)) return "id_token";
+  if (["user_id", "userid", "sub", "principal_id", "principalid"].includes(normalized)) return "user_id";
+  if (["email", "mail", "username"].includes(normalized)) return "email";
+  if (["principal_type", "principaltype"].includes(normalized)) return "principal_type";
+  if (["create_time", "createtime", "created_at", "createdat"].includes(normalized)) return "create_time";
+  if (["expires_at", "expiresat", "expires", "expiry", "expire_at", "expireat"].includes(normalized)) return "expires_at";
+  if (["oidc_issuer", "issuer"].includes(normalized)) return "oidc_issuer";
+  if (["oidc_client_id", "client_id", "clientid"].includes(normalized)) return "oidc_client_id";
+  if (["label", "name", "remark", "备注", "名称"].includes(normalized)) return "label";
+  if (["account_id", "accountid", "chatgpt_account_id", "chatgptaccountid"].includes(normalized)) return "account_id";
+  if (["session_token", "sessiontoken", "session", "cf_clearance", "cookie", "cookies", "browser_cookie", "browsercookie", "浏览器cookie", "浏览器态"].includes(normalized)) return "session_token";
+  if (["models", "model", "模型"].includes(normalized)) return "models";
+  return undefined;
+}
+
+function isGrokAuthJson(value: unknown) {
+  if (!isRecord(value)) return false;
+  return Object.values(value).some((entry) => {
+    if (!isRecord(entry)) return false;
+    const mode = stringField(entry, "auth_mode");
+    const issuer = stringField(entry, "oidc_issuer");
+    const clientId = stringField(entry, "oidc_client_id");
+    return mode === "oidc" || Boolean(issuer && clientId);
+  });
+}
+
+function grokAuthRecordFromEntry(entry: Record<string, unknown>) {
+  const normalized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(entry)) {
+    const normalizedKey = normalizeGrokAuthKey(key);
+    if (normalizedKey && normalized[normalizedKey] == null) normalized[normalizedKey] = value;
+  }
+  return normalized;
+}
+
+function collectGrokAuthJson(value: unknown, models: string[], output: TemporaryAccountImportCandidate[]) {
+  if (!isRecord(value)) return false;
+  const records = Object.values(value).filter(isRecord).map((item) => grokAuthRecordFromEntry(item));
+  const hasAuthEntries = records.some((record) => stringField(record, "auth_mode") === "oidc" || (stringField(record, "oidc_issuer") && stringField(record, "oidc_client_id")));
+  if (!hasAuthEntries) return false;
+
+  for (const record of records) {
+    const accessToken = firstStringField([record], ["access_token"]);
+    if (!accessToken) continue;
+    const idToken = firstStringField([record], ["id_token"]);
+    const refreshToken = firstStringField([record], ["refresh_token"]);
+    const userId = firstStringField([record], ["user_id"]) || codexAccountIdFromIdToken(idToken);
+    const email = firstStringField([record], ["email"]) || emailFromIdToken(idToken);
+    const label = firstStringField([record], ["label"]) || email || userId || `账号 ${output.length + 1}`;
+    output.push({
+      label,
+      secret: accessToken,
+      accountType: userId ? "codex" : "codex",
+      accountId: userId,
+      email,
+      refreshToken,
+      idToken,
+      sessionToken: firstStringField([record], ["session_token"]),
+      models,
+      quotaStages: [],
+    });
+  }
+  return true;
+}
+
 function temporaryAccountFromRecord(
   record: Record<string, unknown>,
   models: string[],
@@ -484,7 +554,17 @@ function temporaryAccountFromRecord(
   if (!secret) return undefined;
 
   const idToken = firstStringField(records, ["id_token", "idToken"]);
-  const accountId = firstStringField(records, ["account_id", "chatgpt_account_id", "chatgptAccountId", "accountId"]) || codexAccountIdFromIdToken(idToken);
+  const accountId = firstStringField(records, [
+    "account_id",
+    "chatgpt_account_id",
+    "chatgptAccountId",
+    "accountId",
+    "principal_id",
+    "principalId",
+    "user_id",
+    "userId",
+    "sub"
+  ]) || codexAccountIdFromIdToken(idToken);
   return {
     label: temporaryAccountLabelFromRecords(records, fallbackLabel),
     secret,
@@ -519,6 +599,10 @@ function collectTemporaryAccounts(
     const nestedModels = containerModels.length > 0 ? containerModels : models;
     for (const nestedKey of ["accounts", "data", "items", "list", "keys", "tokens", "subscriptions", "result", "basic", "super", "heavy"]) {
       if (nestedKey in record) collectTemporaryAccounts(record[nestedKey], nestedModels, output);
+    }
+    for (const [nestedKey, nestedValue] of Object.entries(record)) {
+      if (["accounts", "data", "items", "list", "keys", "tokens", "subscriptions", "result", "basic", "super", "heavy"].includes(nestedKey)) continue;
+      if (nestedValue && typeof nestedValue === "object") collectTemporaryAccounts(nestedValue, nestedModels, output);
     }
     return;
   }
@@ -637,7 +721,8 @@ function parseTemporaryAccountImport(content: string, models: string[]) {
   if (!trimmed) return output;
 
   try {
-    collectTemporaryAccounts(JSON.parse(trimmed), models, output);
+    const parsed = JSON.parse(trimmed);
+    if (!collectGrokAuthJson(parsed, models, output)) collectTemporaryAccounts(parsed, models, output);
   } catch {
     // Fall through to line parser.
   }
@@ -646,7 +731,8 @@ function parseTemporaryAccountImport(content: string, models: string[]) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
     try {
-      collectTemporaryAccounts(JSON.parse(line), models, output);
+      const parsed = JSON.parse(line);
+      if (!collectGrokAuthJson(parsed, models, output)) collectTemporaryAccounts(parsed, models, output);
       continue;
     } catch {
       // Not JSONL.
@@ -795,6 +881,18 @@ export class JsonStore {
 
   getRequestLog(id: string) {
     return this.requestLogs.find((log) => log.id === id);
+  }
+
+  updateRequestLog(id: string, patch: Partial<Omit<RequestLog, "id" | "createdAt">>) {
+    const index = this.requestLogs.findIndex((log) => log.id === id);
+    if (index < 0) return undefined;
+    const updated = {
+      ...this.requestLogs[index],
+      ...patch
+    };
+    this.requestLogs[index] = updated;
+    this.insertRequestLogRow(updated);
+    return updated;
   }
 
   requestLogCount() {

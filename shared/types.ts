@@ -184,6 +184,7 @@ export interface TemporaryAccountImportInput {
   content: string;
   contents?: string[];
   models?: string[];
+  checkProxy?: RouteProxyConfig;
 }
 
 export interface TemporaryAccountImportResult {

@@ -1,3 +1,4 @@
+import * as Popover from "@radix-ui/react-popover";
 import {
   Activity,
   Braces,
@@ -533,6 +534,7 @@ function temporaryAccountAvailabilityStats(accounts: TemporaryAccount[]) {
 
 function temporaryAccountTypeLabel(account: TemporaryAccount) {
   if (account.accountType === "openai-api-key") return "OpenAI API Key";
+  if (account.providerType === "grok" && (account.refreshToken?.trim() || account.idToken?.trim() || account.secret.split(".").length === 3)) return "Grok OAuth";
   if (account.accountType === "codex" || account.accountId) return "Codex";
   return "临时账号";
 }
@@ -627,14 +629,22 @@ function selectOptionLabel(value: React.ReactNode): string {
   return "";
 }
 
+type SelectOption = {
+  value: string;
+  label: string;
+  disabled: boolean;
+};
+
+const closeSelectInputsEvent = "samapi-close-select-inputs";
+let activeSelectInputId: string | null = null;
+
 function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
   const { className, children, disabled, value, defaultValue, onChange, name } = props;
   const selectId = useId();
-  const rootRef = useRef<HTMLSpanElement>(null);
   const [open, setOpen] = useState(false);
-  const [activeIndex, setActiveIndex] = useState(0);
+  const [query, setQuery] = useState("");
   const currentValue = String(value ?? defaultValue ?? "");
-  const options = useMemo(
+  const options = useMemo<SelectOption[]>(
     () =>
       Children.toArray(children).flatMap((child) => {
         if (!isValidElement<{ value?: string | number; disabled?: boolean; children?: React.ReactNode }>(child)) return [];
@@ -643,124 +653,130 @@ function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
         return [
           {
             value: optionValue,
-            label: selectOptionLabel(child.props.children) || optionValue,
+            label: selectOptionLabel(child.props.children) || optionValue || "请选择",
             disabled: Boolean(child.props.disabled)
           }
         ];
       }),
     [children]
   );
-  const selectedIndex = options.findIndex((option) => option.value === currentValue);
-  const selectedOption = selectedIndex >= 0 ? options[selectedIndex] : undefined;
-  const firstEnabledIndex = options.findIndex((option) => !option.disabled);
+  const selectedOption = options.find((option) => option.value === currentValue);
+  const showSearch = options.length > 5;
+  const visibleOptions = showSearch && query.trim()
+    ? options.filter((option) => smartModelMatches(option.label, query) || smartModelMatches(option.value, query))
+    : options;
 
   useEffect(() => {
-    if (!open) return;
-    setActiveIndex(selectedIndex >= 0 && !options[selectedIndex]?.disabled ? selectedIndex : Math.max(firstEnabledIndex, 0));
-  }, [firstEnabledIndex, open, options, selectedIndex]);
-
-  useEffect(() => {
-    if (!open) return;
-    const handlePointerDown = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    const closeFromOtherSelect = (event: Event) => {
+      if ((event as CustomEvent<string>).detail !== selectId) setOpen(false);
     };
-    document.addEventListener("pointerdown", handlePointerDown);
-    return () => document.removeEventListener("pointerdown", handlePointerDown);
-  }, [open]);
+    window.addEventListener(closeSelectInputsEvent, closeFromOtherSelect);
+    return () => window.removeEventListener(closeSelectInputsEvent, closeFromOtherSelect);
+  }, [selectId]);
 
   const commitValue = (nextValue: string) => {
     setOpen(false);
+    setQuery("");
     onChange?.({
       target: { value: nextValue, name },
       currentTarget: { value: nextValue, name }
     } as unknown as React.ChangeEvent<HTMLSelectElement>);
   };
 
-  const moveActive = (direction: 1 | -1) => {
-    if (options.length === 0) return;
-    setActiveIndex((current) => {
-      let next = current;
-      for (let step = 0; step < options.length; step += 1) {
-        next = (next + direction + options.length) % options.length;
-        if (!options[next].disabled) return next;
-      }
-      return current;
-    });
-  };
-
-  const handleKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
-    if (disabled) return;
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-      event.preventDefault();
-      if (!open) setOpen(true);
-      moveActive(event.key === "ArrowDown" ? 1 : -1);
-      return;
-    }
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      if (!open) {
+  return (
+    <Popover.Root open={open} onOpenChange={(nextOpen) => {
+      if (nextOpen) {
+        if (activeSelectInputId && activeSelectInputId !== selectId) {
+          window.dispatchEvent(new CustomEvent(closeSelectInputsEvent, { detail: selectId }));
+          activeSelectInputId = null;
+          return;
+        }
+        activeSelectInputId = selectId;
         setOpen(true);
         return;
       }
-      const option = options[activeIndex];
-      if (option && !option.disabled) commitValue(option.value);
-      return;
-    }
-    if (event.key === "Escape") {
-      event.preventDefault();
+      if (activeSelectInputId === selectId) activeSelectInputId = null;
       setOpen(false);
-    }
-  };
-
-  return (
-    <span
-      ref={rootRef}
-      className={`select-shell ${open ? "select-shell-open" : ""} ${disabled ? "select-shell-disabled" : ""}`}
-      onClick={(event) => event.stopPropagation()}
-    >
-      <button
-        type="button"
-        className={`field select-trigger ${className || ""}`}
-        disabled={disabled}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        aria-controls={`${selectId}-listbox`}
-        onClick={() => setOpen((current) => !current)}
-        onKeyDown={handleKeyDown}
+      setQuery("");
+    }}>
+      <span
+        className={`select-shell ${disabled ? "select-shell-disabled" : ""}`}
+        onPointerDown={() => {
+          if (activeSelectInputId && activeSelectInputId !== selectId) {
+            window.dispatchEvent(new CustomEvent(closeSelectInputsEvent, { detail: selectId }));
+            activeSelectInputId = null;
+          }
+        }}
+        onClick={(event) => event.stopPropagation()}
       >
-        <span className={`select-trigger-value ${selectedOption ? "" : "select-trigger-placeholder"}`}>
-          {selectedOption?.label || "请选择"}
-        </span>
-        <ChevronDown className="select-chevron h-4 w-4" aria-hidden="true" />
-      </button>
-      {open ? (
-        <div id={`${selectId}-listbox`} className="select-menu" role="listbox">
-          {options.map((option, index) => {
-            const selected = option.value === currentValue;
-            const active = index === activeIndex;
-            return (
-              <button
-                key={`${option.value}-${index}`}
-                type="button"
-                role="option"
-                aria-selected={selected}
-                disabled={option.disabled}
-                className={`select-option ${selected ? "select-option-selected" : ""} ${active ? "select-option-active" : ""}`}
-                onMouseEnter={() => setActiveIndex(index)}
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={(event) => {
+        <Popover.Trigger asChild>
+          <button
+            type="button"
+            className={`field select-trigger ${className || ""}`}
+            disabled={disabled}
+            aria-haspopup="listbox"
+            aria-expanded={open}
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            <span className={`select-trigger-value ${selectedOption ? "" : "select-trigger-placeholder"}`}>
+              {selectedOption?.label || "请选择"}
+            </span>
+            <ChevronDown className="select-chevron h-4 w-4" aria-hidden="true" />
+          </button>
+        </Popover.Trigger>
+      </span>
+      <Popover.Portal>
+        <Popover.Content
+          className="select-menu"
+          align="start"
+          side="bottom"
+          sideOffset={6}
+          avoidCollisions={false}
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+        >
+          {showSearch ? (
+            <div className="select-search-row">
+              <input
+                className="select-search-input"
+                value={query}
+                autoFocus
+                placeholder="搜索选项..."
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={(event) => {
                   event.stopPropagation();
-                  if (!option.disabled) commitValue(option.value);
+                  if (event.key === "Escape") setOpen(false);
                 }}
-              >
-                <span>{option.label}</span>
-                {selected ? <Check className="h-4 w-4" /> : null}
-              </button>
-            );
-          })}
-        </div>
-      ) : null}
-    </span>
+              />
+            </div>
+          ) : null}
+          <div className="select-viewport" role="listbox">
+            {visibleOptions.length > 0 ? (
+              visibleOptions.map((option, index) => (
+                <button
+                  key={`${option.value}-${index}`}
+                  type="button"
+                  role="option"
+                  aria-selected={option.value === currentValue}
+                  disabled={option.disabled}
+                  className={`select-option ${option.value === currentValue ? "select-option-selected" : ""}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (!option.disabled) commitValue(option.value);
+                  }}
+                >
+                  <span>{option.label}</span>
+                  {option.value === currentValue ? <Check className="h-4 w-4" /> : null}
+                </button>
+              ))
+            ) : (
+              <div className="select-empty">没有匹配的选项</div>
+            )}
+          </div>
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
   );
 }
 
@@ -818,7 +834,7 @@ function AuthLanding(props: {
           </div>
           <h1 id="auth-title">SamAPI</h1>
           <p className="auth-intro">
-            一个面向本地和私有部署的模型路由控制台，用来集中管理上游模型供应商、Header 模版、客户端密钥和路由策略。
+            一个面向本地和私有部署的模型路由控制台，用来集中管理上游模型供应商、请求头模板、客户端密钥和路由策略。
           </p>
           <div className="auth-metric-row" aria-label="SamAPI capability summary">
             <div>
@@ -921,7 +937,7 @@ export default function App() {
   const [providerModelGroupOptions, setProviderModelGroupOptions] = useState<Record<number, ProviderModelGroupOption[]>>({});
   const [temporaryAccountChecking, setTemporaryAccountChecking] = useState<string | null>(null);
   const [temporaryAccountCheckProviderType, setTemporaryAccountCheckProviderType] = useState<Extract<TemporaryAccountProviderType, "gpt" | "grok">>("gpt");
-  const [temporaryAccountCheckProxyMode, setTemporaryAccountCheckProxyMode] = useState<RouteProxyConfig["mode"]>("system");
+  const [temporaryAccountCheckProxy, setTemporaryAccountCheckProxy] = useState<RouteProxyConfig>({ mode: "system" });
   const [temporaryAccountUpdating, setTemporaryAccountUpdating] = useState<string | null>(null);
   const [temporaryAccountDeleting, setTemporaryAccountDeleting] = useState<string | null>(null);
   const [selectedTemporaryAccountIds, setSelectedTemporaryAccountIds] = useState<string[]>([]);
@@ -1221,15 +1237,22 @@ export default function App() {
         if (showSuccess) setToast("日志已刷新");
         return;
       }
-      const result = await api.listNewLogs(latestCreatedAt);
-      if (result.items.length > 0) {
+      const [result, latestPage] = await Promise.all([
+        api.listNewLogs(latestCreatedAt),
+        api.listLogs(LOGS_PAGE_SIZE, 0)
+      ]);
+      const mergedLatest = [...result.items, ...latestPage.items].filter((log, index, items) => items.findIndex((item) => item.id === log.id) === index);
+      if (mergedLatest.length > 0) {
         setSnapshot((current) => {
           if (!current) return current;
           const existingIds = new Set(current.requestLogs.map((log) => log.id));
-          return { ...current, requestLogs: [...result.items.filter((log) => !existingIds.has(log.id)), ...current.requestLogs] };
+          const latestIds = new Set(mergedLatest.map((log) => log.id));
+          const newItems = mergedLatest.filter((log) => !existingIds.has(log.id));
+          const updatedItems = current.requestLogs.map((log) => mergedLatest.find((item) => item.id === log.id) || log);
+          return { ...current, requestLogs: [...newItems, ...updatedItems.filter((log) => !latestIds.has(log.id) || existingIds.has(log.id))] };
         });
       }
-      setLogsTotal(result.total);
+      setLogsTotal(latestPage.total);
       if (showSuccess) setToast(result.items.length > 0 ? `日志已刷新，新增 ${result.items.length} 条` : "日志已刷新");
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "日志刷新失败");
@@ -1391,7 +1414,7 @@ export default function App() {
     mutate(async () => {
       await api.saveProviderKeyGroup(providerKeyDraft);
       setProviderKeyEditorOpen(false);
-    }, "API Key 分组已保存");
+    }, "上游密钥分组已保存");
   };
 
   const importTemporaryAccounts = (event: FormEvent) => {
@@ -1402,7 +1425,8 @@ export default function App() {
         name: temporaryAccountDraft.name,
         providerType: temporaryAccountDraft.providerType,
         content: temporaryAccountDraft.content,
-        contents: temporaryAccountDraft.contents
+        contents: temporaryAccountDraft.contents,
+        checkProxy: temporaryAccountCheckProxy
       });
       setTemporaryAccountEditorOpen(false);
       setTemporaryAccountDraft(emptyTemporaryAccountImport());
@@ -1422,7 +1446,7 @@ export default function App() {
   const checkTemporaryAccounts = async () => {
     setTemporaryAccountChecking("all");
     try {
-      const result = await api.checkTemporaryAccounts({ providerType: temporaryAccountCheckProviderType, proxy: { mode: temporaryAccountCheckProxyMode } });
+      const result = await api.checkTemporaryAccounts({ providerType: temporaryAccountCheckProviderType, proxy: temporaryAccountCheckProxy });
       const temporaryAccountGroups = await api.listTemporaryAccountGroups();
       setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
       setTemporaryAccountsLoaded(true);
@@ -1439,7 +1463,7 @@ export default function App() {
     if (temporaryAccountChecking) return;
     setTemporaryAccountChecking(id);
     try {
-      const result = await api.checkTemporaryAccount(id, { proxy: { mode: temporaryAccountCheckProxyMode } });
+      const result = await api.checkTemporaryAccount(id, { proxy: temporaryAccountCheckProxy });
       const temporaryAccountGroups = await api.listTemporaryAccountGroups();
       setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
       setTemporaryAccountsLoaded(true);
@@ -1516,7 +1540,7 @@ export default function App() {
         headersText: serializeHeaderRows(headerDraft.headerRows)
       });
       setHeaderEditorOpen(false);
-    }, "Header 模版已保存");
+    }, "请求头模板已保存");
   };
 
   const apiKeyModelOptions = useMemo(() => (snapshot?.routes || []).filter((route) => route.enabled).map((route) => route.name).sort(), [snapshot?.routes]);
@@ -1848,7 +1872,7 @@ export default function App() {
                 onDiscoverModels={discoverProviderModels}
                 onSyncModels={syncProviderModels}
                 onEdit={openEditProviderKeyGroup}
-                onDelete={(id) => mutate(async () => api.deleteProviderKeyGroup(id), "API Key 分组已删除")}
+                onDelete={(id) => mutate(async () => api.deleteProviderKeyGroup(id), "上游密钥分组已删除")}
               />
             )}
             {section === "temporaryAccounts" && (
@@ -1863,8 +1887,8 @@ export default function App() {
                   setTemporaryAccountCheckProviderType(providerType);
                   setSelectedTemporaryAccountIds([]);
                 }}
-                checkProxyMode={temporaryAccountCheckProxyMode}
-                onCheckProxyModeChange={setTemporaryAccountCheckProxyMode}
+                checkProxy={temporaryAccountCheckProxy}
+                onCheckProxyChange={setTemporaryAccountCheckProxy}
                 updating={temporaryAccountUpdating}
                 deleting={temporaryAccountDeleting}
                 selectedAccountIds={selectedTemporaryAccountIds}
@@ -1922,7 +1946,7 @@ export default function App() {
                 onSubmit={saveHeader}
                 onClose={() => setHeaderEditorOpen(false)}
                 onEdit={openEditHeader}
-                onDelete={(id) => mutate(async () => api.deleteHeader(id), "Header 模版已删除")}
+                onDelete={(id) => mutate(async () => api.deleteHeader(id), "请求头模板已删除")}
               />
             )}
             {section === "logs" && (
@@ -2244,7 +2268,7 @@ function RoutesView(props: {
                           </SelectInput>
                         </label>
                         <label className="route-quick-control">
-                          <span className="route-quick-label">Header 模版</span>
+                          <span className="route-quick-label">请求头模板</span>
                           <SelectInput
                             value={quick.headerTemplateId || ""}
                             onChange={(event) => updateRouteDraft(route, { headerTemplateId: event.target.value || undefined })}
@@ -2375,7 +2399,7 @@ function RoutesView(props: {
                             <strong>{groupStrategyLabels[route.strategy]}</strong>
                           </div>
                           <div>
-                            <span>Header 模版</span>
+                            <span>请求头模板</span>
                             <strong>{headerTemplate?.name || "不使用"}</strong>
                           </div>
                           <div>
@@ -2568,12 +2592,12 @@ function RoutesView(props: {
                   </>
                 )}
                 <label>
-                  Header 模版
+                  请求头模板
                   <SelectInput
                     value={props.draft.headerTemplateId || ""}
                     onChange={(event) => props.onDraft({ ...props.draft, headerTemplateId: event.target.value || undefined })}
                   >
-                    <option value="">不使用模版</option>
+                    <option value="">不使用模板</option>
                     {props.snapshot.headerTemplates.map((template) => (
                       <option key={template.id} value={template.id}>
                         {template.name}
@@ -2840,12 +2864,12 @@ function ProviderKeysView(props: {
   return (
     <>
       {groups.length === 0 ? (
-        <div className="center-empty">暂无 API Key 分组</div>
+        <div className="center-empty">暂无上游密钥分组</div>
       ) : (
         <section className="panel p-4">
           <div className="form-head">
             <div>
-              <h2>API Key 分组</h2>
+              <h2>上游密钥分组</h2>
               <div className="mt-1 text-xs font-bold text-ink/55">{groups.length} 个分组</div>
             </div>
             <ActionButton type="button" tone="ghost" disabled={props.modelSyncing || groups.length === 0} onClick={props.onSyncModels}>
@@ -2869,10 +2893,10 @@ function ProviderKeysView(props: {
 
       {props.editorOpen ? (
         <div className="modal-backdrop" role="presentation">
-          <form onSubmit={props.onSubmit} className="modal-panel" role="dialog" aria-modal="true" aria-label="API Key 分组编辑">
+          <form onSubmit={props.onSubmit} className="modal-panel" role="dialog" aria-modal="true" aria-label="上游密钥分组编辑">
             <div className="form-head">
               <div>
-                <h2>{props.draft.id ? "编辑 API Key 分组" : "新增 API Key 分组"}</h2>
+                <h2>{props.draft.id ? "编辑上游密钥分组" : "新增上游密钥分组"}</h2>
                 <div className="mt-1 text-xs font-bold text-ink/55">{selectedSite?.name || "请选择供应商"}</div>
               </div>
               <ActionButton type="button" tone="ghost" onClick={props.onClose} title="关闭">
@@ -3063,8 +3087,8 @@ function TemporaryAccountsView(props: {
   checking: string | null;
   checkProviderType: Extract<TemporaryAccountProviderType, "gpt" | "grok">;
   onCheckProviderTypeChange: (providerType: Extract<TemporaryAccountProviderType, "gpt" | "grok">) => void;
-  checkProxyMode: RouteProxyConfig["mode"];
-  onCheckProxyModeChange: (mode: RouteProxyConfig["mode"]) => void;
+  checkProxy: RouteProxyConfig;
+  onCheckProxyChange: (proxy: RouteProxyConfig) => void;
   updating: string | null;
   deleting: string | null;
   selectedAccountIds: string[];
@@ -3123,19 +3147,23 @@ function TemporaryAccountsView(props: {
           </ActionButton>
         </div>
       ) : groups.length === 0 ? (
-        <section className="temp-account-empty panel">
-          <div className="temp-account-empty-mark"><Upload className="h-5 w-5" /></div>
-          <div>
-            <h2>暂无临时账号</h2>
-            <p>选择 GPT、Grok、Claude 或 Gemini 类型后导入 Sub2API / CPA 数据。</p>
+        <section className="panel p-4">
+          <div className="center-empty center-empty-stack temp-account-empty-state">
+            <div className="temp-account-empty-mark"><Upload className="h-5 w-5" /></div>
+            <div>
+              <div className="center-empty-title">暂无临时账号</div>
+              <div className="center-empty-description">导入 GPT、Grok、Claude 或 Gemini 账号后，这里会展示可用状态和额度信息。</div>
+            </div>
           </div>
         </section>
       ) : (
-        <section className="temp-account-surface panel">
-          <div className="temp-account-overview">
+        <section className="temp-account-panel panel p-4">
+          <div className="form-head temp-account-head">
             <div>
               <h2>临时账号池</h2>
-              <p>当前 {currentTypeLabel} / {visibleAccounts.length} 个账号 / 全部 {totalAccounts} 个账号 / {currentProviderSite?.name || currentTypeLabel}</p>
+              <div className="mt-1 text-xs font-bold text-ink/55">
+                当前 {currentTypeLabel} / {visibleAccounts.length} 个账号 / 全部 {totalAccounts} 个账号 / {currentProviderSite?.name || currentTypeLabel}
+              </div>
             </div>
             <div className="temp-account-stats" aria-label="临时账号状态统计">
               <span><strong>{visibleAvailabilityStats.available}</strong>可用</span>
@@ -3153,11 +3181,28 @@ function TemporaryAccountsView(props: {
             </label>
             <label className="temp-account-check-proxy">
               <span>检测代理</span>
-              <SelectInput value={props.checkProxyMode} onChange={(event) => props.onCheckProxyModeChange(event.target.value as RouteProxyConfig["mode"])}>
+              <SelectInput
+                value={props.checkProxy.mode}
+                onChange={(event) => {
+                  const mode = event.target.value as RouteProxyConfig["mode"];
+                  props.onCheckProxyChange(mode === "custom" ? { mode, url: props.checkProxy.url || "http://127.0.0.1:7897" } : { mode });
+                }}
+              >
                 <option value="system">{routeProxyModeLabels.system}</option>
                 <option value="direct">{routeProxyModeLabels.direct}</option>
+                <option value="custom">防封 Docker / 自定义代理</option>
               </SelectInput>
             </label>
+            {props.checkProxy.mode === "custom" ? (
+              <label className="temp-account-check-proxy temp-account-check-proxy-url">
+                <span>代理地址</span>
+                <TextInput
+                  value={props.checkProxy.url || ""}
+                  placeholder="http://127.0.0.1:7897"
+                  onChange={(event) => props.onCheckProxyChange({ mode: "custom", url: event.target.value })}
+                />
+              </label>
+            ) : null}
             <ActionButton type="button" tone="ghost" disabled={props.checking !== null || visibleAccounts.length === 0} onClick={() => props.onCheck()}>
               <RefreshCw className={`h-4 w-4 ${props.checking === "all" ? "animate-spin" : ""}`} />
               检查 {currentTypeLabel}
@@ -3181,11 +3226,11 @@ function TemporaryAccountsView(props: {
           </div>
           <div className="temp-account-groups">
             {visibleGroups.length === 0 ? (
-              <section className="temp-account-empty temp-account-empty-inline">
+              <section className="center-empty center-empty-stack temp-account-empty-inline">
                 <div className="temp-account-empty-mark"><Upload className="h-5 w-5" /></div>
                 <div>
-                  <h2>暂无 {currentTypeLabel} 临时账号</h2>
-                  <p>切换类型或导入 {currentTypeLabel} 账号后，这里会只展示当前类型的账号。</p>
+                  <div className="center-empty-title">暂无 {currentTypeLabel} 临时账号</div>
+                  <div className="center-empty-description">切换类型或导入 {currentTypeLabel} 账号后，这里会只展示当前类型的账号。</div>
                 </div>
               </section>
             ) : visibleGroups.map((group) => {
@@ -3327,7 +3372,7 @@ function TemporaryAccountsView(props: {
               </label>
               <label>
                 数据格式
-                <TextInput value="自动识别 CPA / Sub2API / Codex auth / Grok2API / Cookie / JSONL / 纯 token" disabled />
+                <TextInput value="自动识别 CPA / Sub2API / Codex auth / Grok auth / Grok2API / Cookie / JSONL / 纯 token" disabled />
                 <span className="field-hint">无需手动选择，导入时会自动解析支持的账号格式。</span>
               </label>
               <label className="form-span-2">
@@ -3340,7 +3385,7 @@ function TemporaryAccountsView(props: {
                 <textarea
                   className="field temp-account-textarea"
                   value={props.draft.content}
-                  placeholder="支持 CPA/SubAPI/Codex auth/Grok2API JSON、JSONL、CSV、sso/cf_clearance Cookie 或每行一个 sk-/token/sso"
+                  placeholder="支持 CPA/SubAPI/Codex auth/Grok auth/Grok2API JSON、JSONL、CSV、sso/cf_clearance Cookie 或每行一个 sk-/token/sso"
                   onChange={(event) => props.onDraft({ ...props.draft, content: event.target.value })}
                 />
               </label>
@@ -3521,13 +3566,13 @@ function HeadersView(props: {
   return (
     <>
       {props.snapshot.headerTemplates.length === 0 ? (
-        <div className="center-empty">暂无 Header 模版</div>
+        <div className="center-empty">暂无请求头模板</div>
       ) : (
         <section className="panel p-4">
           <div className="form-head">
             <div>
-              <h2>Header 模版</h2>
-              <div className="mt-1 text-xs font-bold text-ink/55">{props.snapshot.headerTemplates.length} 个模版</div>
+              <h2>请求头模板</h2>
+              <div className="mt-1 text-xs font-bold text-ink/55">{props.snapshot.headerTemplates.length} 个模板</div>
             </div>
           </div>
           <div className="site-list">
@@ -3545,7 +3590,7 @@ function HeadersView(props: {
                           </span>
                         ))
                       ) : (
-                        <span className="pill">空模版</span>
+                        <span className="pill">空模板</span>
                       )}
                     </div>
                   </div>
@@ -3566,9 +3611,9 @@ function HeadersView(props: {
 
       {props.editorOpen ? (
         <div className="modal-backdrop" role="presentation">
-          <form onSubmit={props.onSubmit} className="modal-panel" role="dialog" aria-modal="true" aria-label="Header 模版编辑">
+          <form onSubmit={props.onSubmit} className="modal-panel" role="dialog" aria-modal="true" aria-label="请求头模板编辑">
             <div className="form-head">
-              <h2>{props.draft.id ? "编辑 Header 模版" : "新增 Header 模版"}</h2>
+              <h2>{props.draft.id ? "编辑请求头模板" : "新增请求头模板"}</h2>
               <ActionButton type="button" tone="ghost" onClick={props.onClose} title="关闭">
                 <X className="h-4 w-4" />
               </ActionButton>
@@ -3581,8 +3626,8 @@ function HeadersView(props: {
               {props.draft.headerRows.map((row, index) => (
                 <div key={index} className="address-block">
                   <div className="address-block-head">
-                    <div className="text-xs font-black text-ink/55">Header {index + 1}</div>
-                    <ActionButton type="button" tone="danger" title="删除 Header" onClick={() => removeHeaderRow(index)}>
+                    <div className="text-xs font-black text-ink/55">请求头 {index + 1}</div>
+                    <ActionButton type="button" tone="danger" title="删除请求头" onClick={() => removeHeaderRow(index)}>
                       <Trash2 className="h-4 w-4" />
                     </ActionButton>
                   </div>
@@ -3591,7 +3636,7 @@ function HeadersView(props: {
                       Key
                       <TextInput
                         value={row.key}
-                        placeholder="请输入 Header 名称"
+                        placeholder="请输入请求头名称"
                         onChange={(event) => updateHeaderRow(index, { key: event.target.value })}
                       />
                     </label>
@@ -3599,7 +3644,7 @@ function HeadersView(props: {
                       Value
                       <TextInput
                         value={row.value}
-                        placeholder="请输入 Header 值"
+                        placeholder="请输入请求头值"
                         onChange={(event) => updateHeaderRow(index, { value: event.target.value })}
                       />
                     </label>
@@ -3610,7 +3655,7 @@ function HeadersView(props: {
             <div className="mt-4 flex flex-wrap justify-between gap-2">
               <ActionButton type="button" tone="ghost" onClick={addHeaderRow}>
                 <Plus className="h-4 w-4" />
-                Header
+                请求头
               </ActionButton>
               <div className="flex gap-2">
                 <ActionButton type="button" tone="ghost" onClick={props.onClose}>
@@ -3618,7 +3663,7 @@ function HeadersView(props: {
                 </ActionButton>
                 <ActionButton type="submit">
                   <Save className="h-4 w-4" />
-                  保存模版
+                  保存模板
                 </ActionButton>
               </div>
             </div>
@@ -3691,7 +3736,7 @@ function LogsView(props: {
         <div className="center-empty">暂无日志</div>
       ) : (
         <>
-          <div className="log-table">
+          <div className="site-list log-table">
             {logs.map((log) => (
               <LogSummaryRow key={log.id} log={log} selected={props.selectedLogId === log.id} onOpen={props.onOpenLog} />
             ))}
@@ -3732,7 +3777,7 @@ function LogSummaryRow(props: { log: RequestLogSummary; selected: boolean; onOpe
             <span className="summary-node-label">转发目标</span>
             <span className="record-title block">{routeTarget.model || log.model || "-"}</span>
             <span className="record-meta block">供应商：{routeTarget.providerName || log.providerName || "-"}</span>
-            <span className="record-meta block">Header：{log.headerTemplateName || "未使用"}</span>
+            <span className="record-meta block">请求头：{log.headerTemplateName || "未使用"}</span>
             <span className="record-meta block">代理：{log.proxy ? routeProxyModeLabels[log.proxy.mode] : "直连"}</span>
           </span>
         </span>
@@ -3778,7 +3823,7 @@ function LogDetailModal(props: { log: RequestLog | null; loading: boolean; error
                 }}
               />
               <DetailBlock title="下游 Body" value={log.requestBody} />
-              <DetailBlock title="下游 Header" value={log.requestHeaders} />
+              <DetailBlock title="下游请求头" value={log.requestHeaders} />
               <DetailBlock
                 title="路由目标"
                 value={{
@@ -4127,7 +4172,18 @@ model = ${modelName}`;
   -H "Authorization: Bearer sk-samapi-..."`;
   return (
     <section className="panel usage-panel p-4">
-      <div className="grid gap-3 md:grid-cols-3">
+      <div className="form-head">
+        <div>
+          <h2>接入配置</h2>
+          <div className="mt-1 text-xs font-bold text-ink/55">下游客户端使用本地代理地址，把路由名当作模型名调用。</div>
+        </div>
+        <ActionButton tone="ghost" onClick={() => props.onCopy(ccSwitchConfig)}>
+          <Copy className="h-4 w-4" />
+          复制配置
+        </ActionButton>
+      </div>
+
+      <div className="usage-summary-grid">
         <div className="metric">
           <span>{props.snapshot.sites.length}</span>
           站点
@@ -4142,33 +4198,24 @@ model = ${modelName}`;
         </div>
       </div>
 
-      <div className="usage-hero">
-        <div>
-          <p>下游接入</p>
-          <h2>把路由名当作模型名使用</h2>
+      <div className="usage-config-grid">
+        <div className="usage-config-block">
+          <div className="usage-block-head">
+            <span>CC-Switch / Claude 配置</span>
+            <ActionButton tone="ghost" onClick={() => props.onCopy(ccSwitchConfig)} title="复制配置">
+              <Copy className="h-4 w-4" />
+            </ActionButton>
+          </div>
+          <pre>{ccSwitchConfig}</pre>
         </div>
-        <ActionButton tone="ghost" onClick={() => props.onCopy(ccSwitchConfig)}>
-          <Copy className="h-4 w-4" />
-          复制配置
-        </ActionButton>
-      </div>
 
-      <div className="usage-config-block">
-        <div className="usage-block-head">
-          <span>CC-Switch / Claude 配置</span>
-          <ActionButton tone="ghost" onClick={() => props.onCopy(ccSwitchConfig)} title="复制配置">
-            <Copy className="h-4 w-4" />
-          </ActionButton>
+        <div className="usage-copy-list">
+          <UsageCopyRow label="base_url" value={proxyBaseUrl} note="推荐给会自动拼接 /v1/messages 的客户端。" onCopy={props.onCopy} />
+          <UsageCopyRow label="api_key" value="sk-samapi-..." note="从客户端密钥页面复制完整密钥，作为 Bearer Token 使用。" onCopy={props.onCopy} />
+          <UsageCopyRow label="model" value={modelName} note="填写模型路由里的路由名称；分组路由也复制分组名称作为模型名。" onCopy={props.onCopy} />
+          <UsageCopyRow label="models" value={`${proxyV1BaseUrl}/models`} note="用于下游获取可用模型列表，返回启用中的路由名称。" onCopy={props.onCopy} />
+          <UsageCopyRow label="OpenAI base_url" value={proxyV1BaseUrl} note="如果客户端要求 base_url 已包含 /v1，可以使用这个地址。" onCopy={props.onCopy} />
         </div>
-        <pre>{ccSwitchConfig}</pre>
-      </div>
-
-      <div className="usage-copy-list">
-        <UsageCopyRow label="base_url" value={proxyBaseUrl} note="推荐给 CC-Switch、Claude CLI 这类会自动拼接 /v1/messages 的客户端。" onCopy={props.onCopy} />
-        <UsageCopyRow label="api_key" value="sk-samapi-..." note="从客户端密钥页面复制完整密钥，作为 Bearer Token 使用。" onCopy={props.onCopy} />
-        <UsageCopyRow label="model" value={modelName} note="填写路由管理里的路由名称；分组路由也复制分组名称作为模型名。" onCopy={props.onCopy} />
-        <UsageCopyRow label="models" value={`${proxyV1BaseUrl}/models`} note="用于下游获取可用模型列表，返回启用中的路由名称。" onCopy={props.onCopy} />
-        <UsageCopyRow label="OpenAI base_url" value={proxyV1BaseUrl} note="如果客户端要求 base_url 已经包含 /v1，可以使用这个地址。" onCopy={props.onCopy} />
       </div>
 
       <div className="usage-example-grid">

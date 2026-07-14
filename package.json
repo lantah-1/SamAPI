@@ -14,6 +14,7 @@
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
+    "@radix-ui/react-popover": "^1.1.19",
     "@vitejs/plugin-react": "^5.0.0",
     "@zenmux/rosetta-ai": "^1.0.1",
     "better-sqlite3": "^12.11.1",
@@ -36,6 +37,8 @@
     "vite": "^6.0.7"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["better-sqlite3"]
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
   }
 }

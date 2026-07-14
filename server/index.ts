@@ -1302,8 +1302,30 @@ function streamResponseContentType(proxyKind: ProxyKind, contentType?: string) {
 }
 
 async function writeResponseChunk(response: http.ServerResponse, chunk: string | Uint8Array) {
+  if (response.destroyed || response.writableEnded) throw new Error("客户端已断开连接");
   if (response.write(chunk)) return;
-  await new Promise<void>((resolve) => response.once("drain", resolve));
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      response.off("drain", onDrain);
+      response.off("close", onClose);
+      response.off("error", onError);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error("客户端已断开连接"));
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    response.once("drain", onDrain);
+    response.once("close", onClose);
+    response.once("error", onError);
+  });
 }
 
 async function* textChunksFromReadable(stream: ReadableStream<Uint8Array>) {
@@ -1467,6 +1489,27 @@ function serializeStreamEvent(proxyKind: ProxyKind, event: unknown) {
   return `data: ${JSON.stringify(event)}\n\n`;
 }
 
+function streamEventErrorMessage(event: unknown) {
+  if (!isRecord(event)) return "";
+  const type = typeof event.type === "string" ? event.type.toLowerCase() : "";
+  const error = event.error;
+  const errorRecord = isRecord(error) ? error : undefined;
+  const message =
+    (typeof errorRecord?.message === "string" && errorRecord.message) ||
+    (typeof error === "string" && error) ||
+    (typeof event.message === "string" && event.message) ||
+    "";
+  if (type === "error" || type.includes(".error") || type.endsWith(".failed") || errorRecord) {
+    return message || JSON.stringify(event);
+  }
+  return "";
+}
+
+function streamPreviewErrorMessage(preview: string) {
+  if (!/(^|\n)event:\s*error\b|"type"\s*:\s*"(?:error|response\.failed)"/i.test(preview)) return "";
+  return extractUpstreamError(preview) || "上游流返回错误事件";
+}
+
 async function streamConvertedResponse(input: {
   upstreamBody: ReadableStream<Uint8Array>;
   response: http.ServerResponse;
@@ -1490,6 +1533,8 @@ async function streamConvertedResponse(input: {
     preview += chunk;
     if (preview.length > 1200) preview = preview.slice(0, 1200);
     await writeResponseChunk(input.response, chunk);
+    const errorMessage = streamEventErrorMessage(event);
+    if (errorMessage) throw new Error(errorMessage);
   }
   if (input.proxyKind === "chat-completions" || input.proxyKind === "generic") {
     const done = "data: [DONE]\n\n";
@@ -1510,6 +1555,8 @@ async function streamRawResponse(input: {
     if (preview.length > 1200) preview = preview.slice(0, 1200);
     await writeResponseChunk(input.response, chunk);
   }
+  const errorMessage = streamPreviewErrorMessage(preview);
+  if (errorMessage) throw new Error(errorMessage);
   return preview;
 }
 
@@ -1536,11 +1583,13 @@ function positiveIntegerEnv(name: string, fallback: number) {
 }
 
 function temporaryAccountCheckProxyFromBody(body: unknown): RouteProxyConfig {
-  if (!isRecord(body) || !isRecord(body.proxy)) return { mode: "system" };
-  const mode = body.proxy.mode;
+  if (!isRecord(body)) return { mode: "system" };
+  const proxy = isRecord(body.proxy) ? body.proxy : isRecord(body.checkProxy) ? body.checkProxy : undefined;
+  if (!proxy) return { mode: "system" };
+  const mode = proxy.mode;
   if (mode === "direct" || mode === "system") return { mode };
   if (mode === "custom") {
-    const url = typeof body.proxy.url === "string" ? body.proxy.url.trim() : "";
+    const url = typeof proxy.url === "string" ? proxy.url.trim() : "";
     if (!url) throw new Error("自定义代理地址不能为空");
     return { mode, url };
   }
@@ -1581,6 +1630,45 @@ function grokSsoCookie(secret: string, browserCookieState?: string) {
 function grokStatsigId() {
   const message = `x1:TypeError: Cannot read properties of undefined (reading '${randomBytes(5).toString("hex")}')`;
   return Buffer.from(message).toString("base64");
+}
+
+function grokCookieDiagnostics(account: TemporaryAccount) {
+  const cookie = grokSsoCookie(account.secret, account.sessionToken);
+  return {
+    hasSso: /(?:^|;\s*)sso=/.test(cookie),
+    hasSsoRw: /(?:^|;\s*)sso-rw=/.test(cookie),
+    hasCfClearance: /(?:^|;\s*)cf_clearance=/.test(cookie),
+    hasCfBm: /(?:^|;\s*)__cf_bm=/.test(cookie),
+    hasCfuvid: /(?:^|;\s*)_cfuvid=/.test(cookie)
+  };
+}
+
+function grokCookieDiagnosticText(account: TemporaryAccount) {
+  const diagnostics = grokCookieDiagnostics(account);
+  const present = [
+    diagnostics.hasSso ? "sso" : "",
+    diagnostics.hasSsoRw ? "sso-rw" : "",
+    diagnostics.hasCfClearance ? "cf_clearance" : "",
+    diagnostics.hasCfBm ? "__cf_bm" : "",
+    diagnostics.hasCfuvid ? "_cfuvid" : ""
+  ].filter(Boolean);
+  return present.length > 0 ? `Cookie: ${present.join("+")}` : "Cookie: 未识别到 sso/cf_clearance";
+}
+
+function grokFailureMessage(statusCode: number, text: string, contentType?: string, account?: TemporaryAccount) {
+  const normalized = text.toLowerCase();
+  const cookieHint = account ? `；${grokCookieDiagnosticText(account)}` : "";
+  if (looksLikeHtml(contentType, text) || looksLikeHtmlText(text)) {
+    const cloudflareHint = normalized.includes("cloudflare") || normalized.includes("cf-") ? "Cloudflare/浏览器校验页" : "HTML 页面";
+    return `Grok 返回 ${cloudflareHint}（HTTP ${statusCode}），当前出口环境未通过浏览器校验或浏览器态已失效，需要使用健康的防封代理/Docker 环境并导入最新 cf_clearance${cookieHint}`;
+  }
+  if (grokInvalidCredentialsText(text)) {
+    return `Grok SSO 会话无效或已过期（HTTP ${statusCode}），请重新导入 sso/sso-rw${cookieHint}`;
+  }
+  if (statusCode === 403) {
+    return `Grok 返回 403，通常是出口 IP/浏览器指纹/Cloudflare Cookie 不健康，请切到防封 Docker 代理并确认 cf_clearance 与该出口匹配${cookieHint}${text.trim() ? `：${extractUpstreamError(text)}` : ""}`;
+  }
+  return extractUpstreamError(text) || `HTTP ${statusCode}`;
 }
 
 function grokTemporaryHeaders(account: TemporaryAccount, templateHeaders: Record<string, string> = {}) {
@@ -1991,6 +2079,23 @@ function grokInvalidCredentialsText(text: string) {
   );
 }
 
+function grokBrowserEnvironmentIssueText(text = "") {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes("cloudflare") ||
+    normalized.includes("cf_clearance") ||
+    normalized.includes("__cf_bm") ||
+    normalized.includes("_cfuvid") ||
+    normalized.includes("浏览器") ||
+    normalized.includes("防封") ||
+    normalized.includes("出口") ||
+    normalized.includes("环境") ||
+    normalized.includes("html 页面") ||
+    normalized.includes("html page") ||
+    normalized.includes("just a moment")
+  );
+}
+
 function grokQuotaStage(label: string, payload: unknown): TemporaryAccountQuotaStage | undefined {
   if (!isRecord(payload)) return undefined;
   const remaining = typeof payload.remainingQueries === "number" ? payload.remainingQueries : undefined;
@@ -2164,10 +2269,10 @@ async function checkGrokTemporaryAccount(account: TemporaryAccount, checkedAt: s
           body: JSON.stringify({ modelName: mode.modelName })
         }, proxyConfig);
         if (looksLikeHtmlText(text)) {
-          return { mode, statusCode: response.status, ok: false, text: "Grok 检查返回了网页，通常是 Cloudflare/浏览器校验页；账号未判定不可用", stage: undefined };
+          return { mode, statusCode: response.status, ok: false, text: grokFailureMessage(response.status, text, response.headers.get("content-type") || undefined, account), stage: undefined };
         }
         if (!response.ok) {
-          return { mode, statusCode: response.status, ok: false, text, stage: undefined };
+          return { mode, statusCode: response.status, ok: false, text: grokFailureMessage(response.status, text, response.headers.get("content-type") || undefined, account), stage: undefined };
         }
         let payload: unknown = {};
         try {
@@ -2209,25 +2314,27 @@ async function checkGrokTemporaryAccount(account: TemporaryAccount, checkedAt: s
   const firstFailure = checks.find((item) => !item.ok);
   const failureText = checks.map((item) => item.text).join("\n");
   const statusCode = firstFailure?.statusCode;
-  const errorMessage = failureText.includes("Grok 检查返回了网页")
-    ? "Grok 检查返回了网页，通常是 Cloudflare/浏览器校验页；需要可用的 cf_clearance/浏览器态才能实时读取额度，账号未判定不可用"
-    : extractUpstreamError(failureText) || (statusCode ? `HTTP ${statusCode}` : "Grok 检查失败");
+  const errorMessage = extractUpstreamError(failureText) || (statusCode ? `HTTP ${statusCode}` : "Grok 检查失败");
   const invalidCredentials = checks.some((item) => [400, 401, 403].includes(item.statusCode) && grokInvalidCredentialsText(item.text));
+  const browserEnvironmentIssue = checks.some((item) => item.statusCode === 403 || grokBrowserEnvironmentIssueText(item.text));
   const availability = invalidCredentials ? "unavailable" as const : "unknown" as const;
+  const checkErrorMessage = browserEnvironmentIssue && !invalidCredentials
+    ? `${errorMessage}；账号未判定不可用，请用导出 cf_clearance 的同一出口/防封 Docker 代理重试`
+    : errorMessage;
   return {
     patch: {
       availability,
       quotaStages: existingQuotaStages,
       lastQuotaCheckedAt: checkedAt,
       lastCheckStatusCode: statusCode,
-      lastCheckError: errorMessage
+      lastCheckError: checkErrorMessage
     },
     result: {
       availability,
       status: "failed" as const,
       statusCode,
       quotaStages: existingQuotaStages,
-      errorMessage,
+      errorMessage: checkErrorMessage,
       checkedAt
     }
   };
@@ -2340,6 +2447,27 @@ function markTemporaryAccountAttempt(candidate: ProxyExecutionCandidate, statusC
       lastCheckError: undefined
     });
     return;
+  }
+  if (account.providerType === "grok") {
+    const message = errorMessage || `HTTP ${statusCode}`;
+    if (statusCode === 401 || grokInvalidCredentialsText(message)) {
+      store.updateTemporaryAccountCheckResult(account.id, {
+        availability: "unavailable",
+        lastQuotaCheckedAt: checkedAt,
+        lastCheckStatusCode: statusCode,
+        lastCheckError: message
+      });
+      return;
+    }
+    if (statusCode === 403 || grokBrowserEnvironmentIssueText(message)) {
+      store.updateTemporaryAccountCheckResult(account.id, {
+        availability: "unknown",
+        lastQuotaCheckedAt: checkedAt,
+        lastCheckStatusCode: statusCode,
+        lastCheckError: `${message}；账号未判定不可用，请用导出 cf_clearance 的同一出口/防封 Docker 代理重试`
+      });
+      return;
+    }
   }
   if (!shouldMarkTemporaryAccountUnavailable(statusCode, errorMessage)) return;
   store.updateTemporaryAccountCheckResult(account.id, {
@@ -2484,7 +2612,7 @@ function chainSummary(input: {
   routeUa?: string;
   status: RequestLogStatus;
 }) {
-  return `下游 ${input.downstreamModel || "unknown"} (${input.downstreamEndpoint || "unknown"} / ${input.downstreamUa || "unknown ua"}) -> 路由目标 ${input.routeModel || "unknown"} (${input.routeEndpoint || "unknown"} / ${input.routeUa || "unknown ua"}) -> ${input.status === "success" ? "成功" : "失败"}`;
+  return `下游 ${input.downstreamModel || "unknown"} (${input.downstreamEndpoint || "unknown"} / ${input.downstreamUa || "unknown ua"}) -> 路由目标 ${input.routeModel || "unknown"} (${input.routeEndpoint || "unknown"} / ${input.routeUa || "unknown ua"}) -> ${input.status === "success" ? "成功" : input.status === "pending" ? "请求中" : "失败"}`;
 }
 
 function headerKey(headers: Record<string, string>, name: string) {
@@ -3462,9 +3590,11 @@ async function handleApi(request: http.IncomingMessage, response: http.ServerRes
     if (parts[1] === "temporary-accounts") {
       if (method === "GET") return sendJson(response, 200, store.getDb().temporaryAccountGroups);
       if (method === "POST" && parts[2] === "import") {
-        const imported = store.importTemporaryAccounts(await readJson(request));
+        const body = await readJson(request);
+        const imported = store.importTemporaryAccounts(body);
+        const checkProxy = temporaryAccountCheckProxyFromBody(body);
         const checkResult = ["gpt", "grok"].includes(imported.group.providerType || "")
-          ? await checkTemporaryAccountIds(imported.accountIds, undefined, imported.group.providerType)
+          ? await checkTemporaryAccountIds(imported.accountIds, checkProxy, imported.group.providerType)
           : undefined;
         const updatedGroup = store.getDb().temporaryAccountGroups.find((group) => group.id === imported.group.id) || imported.group;
         return sendJson(response, 201, { ...imported, group: updatedGroup, checkResult });
@@ -3739,7 +3869,8 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
         const grokForwardedBody = grokWebRequestBody(convertedForGrok.body, candidate.model);
         const grokUpstreamRequestHeaders = {
           ...maskedStringHeaders(grokHeaders),
-          ...grokAuthLog
+          ...grokAuthLog,
+          "grok-cookie-state": grokCookieDiagnosticText(grokAccount)
         };
         const attemptStartedAt = Date.now();
         try {
@@ -3812,8 +3943,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
             return;
           }
 
-          const htmlMessage = looksLikeHtml(contentType, text) ? "Grok Web 返回了 HTML 页面，请检查 SSO Cookie、代理或浏览器校验状态" : "";
-          const errorMessage = htmlMessage || extractUpstreamError(text) || `HTTP ${upstream.status}`;
+          const errorMessage = grokFailureMessage(upstream.status, text, contentType, grokAccount);
           markTemporaryAccountAttempt(candidate, upstream.status, errorMessage);
           errors.push(`Grok Web：${upstream.status} ${errorMessage}`);
           upstreamAttempts.push({
@@ -3901,6 +4031,39 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                 "Access-Control-Allow-Origin": "*"
               });
               response.flushHeaders();
+              const streamLog = store.recordRequestLog({
+                ...requestLogBase,
+                routeId: route.id,
+                routeName: route.name,
+                endpoint: route.endpoint,
+                providerName: candidate.site.name,
+                providerId: candidate.site.id,
+                addressLabel: "Codex Backend",
+                model: candidate.model,
+                requestBody: body,
+                status: "pending",
+                statusCode: upstream.status,
+                durationMs: Date.now() - startedAt,
+                requestHeaders: {
+                  ...requestLogBase.requestHeaders,
+                  ...codexAuthLog
+                },
+                upstreamUrl: CODEX_BACKEND_RESPONSES_URL,
+                upstreamContentType: contentType,
+                downstream: downstreamLog,
+                routeTarget: codexRouteTargetLog,
+                upstreamAttempts,
+                proxy: attemptProxy,
+                summary: chainSummary({
+                  downstreamModel: downstreamLog.model,
+                  downstreamEndpoint,
+                  downstreamUa,
+                  routeModel: candidate.model,
+                  routeEndpoint: route.endpoint,
+                  routeUa: codexRouteUa,
+                  status: "pending"
+                })
+              });
               try {
                 const streamPreviewText =
                   convertedForCodex.converter?.convertStream
@@ -3930,7 +4093,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                   contentType,
                   responsePreview: responsePreview(streamPreviewText)
                 });
-                store.recordRequestLog({
+                store.updateRequestLog(streamLog.id, {
                   ...requestLogBase,
                   routeId: route.id,
                   routeName: route.name,
@@ -3986,7 +4149,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                   responsePreview: responsePreview(JSON.stringify({ error: errorMessage })),
                   errorMessage
                 });
-                store.recordRequestLog({
+                store.updateRequestLog(streamLog.id, {
                   ...requestLogBase,
                   routeId: route.id,
                   routeName: route.name,
@@ -4166,6 +4329,39 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                 "Access-Control-Allow-Origin": "*"
               });
               response.flushHeaders();
+              const streamLog = store.recordRequestLog({
+                ...requestLogBase,
+                routeId: route.id,
+                routeName: route.name,
+                endpoint: route.endpoint,
+                providerName: candidate.site.name,
+                providerId: candidate.site.id,
+                addressLabel: address.label,
+                model: candidate.model,
+                requestBody: body,
+                status: "pending",
+                statusCode: upstream.status,
+                durationMs: Date.now() - startedAt,
+                requestHeaders: {
+                  ...requestLogBase.requestHeaders,
+                  ...upstreamAuthLog
+                },
+                upstreamUrl: target,
+                upstreamContentType: contentType,
+                downstream: downstreamLog,
+                routeTarget: routeTargetLog,
+                upstreamAttempts,
+                proxy: attemptProxy,
+                summary: chainSummary({
+                  downstreamModel: downstreamLog.model,
+                  downstreamEndpoint,
+                  downstreamUa,
+                  routeModel: candidate.model,
+                  routeEndpoint: route.endpoint,
+                  routeUa,
+                  status: "pending"
+                })
+              });
               try {
                 const streamPreviewText =
                   responseConverter?.convertStream
@@ -4195,7 +4391,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                   contentType,
                   responsePreview: responsePreview(streamPreviewText)
                 });
-                store.recordRequestLog({
+                store.updateRequestLog(streamLog.id, {
                   ...requestLogBase,
                   routeId: route.id,
                   routeName: route.name,
@@ -4251,7 +4447,7 @@ async function handleProxy(request: http.IncomingMessage, response: http.ServerR
                   responsePreview: responsePreview(JSON.stringify({ error: errorMessage })),
                   errorMessage
                 });
-                store.recordRequestLog({
+                store.updateRequestLog(streamLog.id, {
                   ...requestLogBase,
                   routeId: route.id,
                   routeName: route.name,
