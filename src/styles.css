@@ -1964,6 +1964,111 @@ label {
   transform: none;
 }
 
+.group-priority-picker {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.group-priority-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-bottom: 1px solid var(--line);
+  padding: 0.75rem;
+}
+
+.group-priority-head strong {
+  display: block;
+  color: var(--ink);
+  font-size: 0.92rem;
+  font-weight: 860;
+}
+
+.group-priority-head span {
+  display: block;
+  margin-top: 0.12rem;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 720;
+}
+
+.group-priority-empty {
+  display: grid;
+  min-height: 92px;
+  place-items: center;
+  color: var(--muted);
+  font-size: 0.84rem;
+  font-weight: 760;
+}
+
+.group-priority-list,
+.group-route-priority-list {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0.75rem;
+  list-style: none;
+}
+
+.group-route-priority-list {
+  padding: 0;
+}
+
+.group-priority-item,
+.group-route-priority-item {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-solid);
+  padding: 0.55rem 0.65rem;
+}
+
+.group-priority-rank {
+  display: grid;
+  flex: 0 0 auto;
+  width: 1.65rem;
+  height: 1.65rem;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.8rem;
+  font-weight: 860;
+}
+
+.group-priority-info {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 0.12rem;
+}
+
+.group-priority-info strong {
+  color: var(--ink);
+  font-size: 0.86rem;
+  font-weight: 820;
+  overflow-wrap: anywhere;
+}
+
+.group-priority-info span {
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-weight: 720;
+  overflow-wrap: anywhere;
+}
+
+.group-priority-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.3rem;
+}
+
 .address-block {
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -2920,6 +3025,18 @@ label {
     background: var(--mobile-nav-bg);
     box-shadow: var(--shadow-popover);
     scrollbar-width: none;
+    transition: transform 180ms ease, opacity 180ms ease, visibility 180ms ease;
+  }
+
+  html.keyboard-visible .app-shell {
+    padding-bottom: 0.5rem !important;
+  }
+
+  html.keyboard-visible .app-nav {
+    visibility: hidden;
+    transform: translateY(calc(100% + 1rem + env(safe-area-inset-bottom)));
+    opacity: 0;
+    pointer-events: none;
   }
 
   .app-nav::-webkit-scrollbar {

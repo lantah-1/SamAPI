@@ -4,7 +4,7 @@ export type RouteType = "switch" | "group";
 
 export type SiteType = "newapi" | "unknown";
 
-export type GroupRouteStrategy = "stable-first" | "sequential" | "random";
+export type GroupRouteStrategy = "stable-first" | "sequential" | "random" | "priority";
 
 export type RouteProxyMode = "direct" | "system" | "custom";
 
