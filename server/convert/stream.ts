@@ -319,6 +319,32 @@ export function streamPreviewErrorMessage(preview: string) {
   return extractUpstreamError(preview) || "上游流返回错误事件";
 }
 
+// A stream is "done" the moment its terminal event reaches the client. Waiting for the upstream
+// socket to hit EOF after that is pure dead time — and it's exactly the window where a client that
+// has already seen the terminal event closes its side, tripping clientAbort and turning a fully
+// delivered response into a bogus 599 "This operation was aborted". Detecting the terminal event and
+// stopping there closes that race.
+export function isTerminalStreamEvent(proxyKind: ProxyKind, event: unknown) {
+  if (!isRecord(event)) return false;
+  const type = typeof event.type === "string" ? event.type : "";
+  if (proxyKind === "responses") {
+    return type === "response.completed" || type === "response.failed" || type === "response.incomplete";
+  }
+  if (proxyKind === "messages") {
+    return type === "message_stop";
+  }
+  return false;
+}
+
+// Raw passthrough has no parsed events, so the terminal frame has to be spotted in the forwarded
+// text. Returns the marker regex for the kind, or null when the kind has no SSE terminal frame.
+export function terminalSseMarker(proxyKind: ProxyKind): RegExp | null {
+  if (proxyKind === "responses") return /event:\s*response\.(completed|failed|incomplete)\b/;
+  if (proxyKind === "messages") return /event:\s*message_stop\b/;
+  if (proxyKind === "chat-completions" || proxyKind === "generic") return /data:\s*\[DONE\]/;
+  return null;
+}
+
 export async function streamConvertedResponse(input: {
   upstreamBody: ReadableStream<Uint8Array>;
   response: http.ServerResponse;
@@ -337,6 +363,7 @@ export async function streamConvertedResponse(input: {
           requestBody: input.requestBody
         })
       : sseJsonObjectsFromReadable(input.upstreamBody);
+  let sawTerminal = false;
   for await (const event of input.converter.convertStream?.(upstreamStream) || []) {
     const chunk = serializeStreamEvent(input.proxyKind, event);
     preview += chunk;
@@ -344,7 +371,13 @@ export async function streamConvertedResponse(input: {
     await writeResponseChunk(input.response, chunk);
     const errorMessage = streamEventErrorMessage(event);
     if (errorMessage) throw new Error(errorMessage);
+    if (isTerminalStreamEvent(input.proxyKind, event)) {
+      // Terminal event delivered — stop reading upstream instead of blocking on its EOF.
+      sawTerminal = true;
+      break;
+    }
   }
+  if (sawTerminal) input.upstreamBody.cancel().catch(() => {});
   if (input.proxyKind === "chat-completions" || input.proxyKind === "generic") {
     const done = "data: [DONE]\n\n";
     preview += done;
@@ -357,13 +390,38 @@ export async function streamConvertedResponse(input: {
 export async function streamRawResponse(input: {
   upstreamBody: ReadableStream<Uint8Array>;
   response: http.ServerResponse;
+  proxyKind: ProxyKind;
 }) {
   let preview = "";
+  const marker = terminalSseMarker(input.proxyKind);
+  // `preview` is truncated from the front for logging, so a separate rolling tail is needed to spot
+  // the terminal marker even when it lands split across chunk boundaries.
+  let tail = "";
+  // Once the marker is seen we accumulate from the marker onward and only stop after the frame's
+  // closing blank line has been forwarded. Breaking at the marker itself would truncate a terminal
+  // frame whose payload (e.g. responses `response.completed`) spans several chunks.
+  let terminalFrame: string | null = null;
+  let sawTerminal = false;
   for await (const chunk of textChunksFromReadable(input.upstreamBody)) {
     preview += chunk;
     if (preview.length > 1200) preview = preview.slice(0, 1200);
     await writeResponseChunk(input.response, chunk);
+    if (!marker) continue;
+    if (terminalFrame === null) {
+      tail += chunk;
+      if (tail.length > 512) tail = tail.slice(-512);
+      const match = tail.match(marker);
+      if (match && match.index !== undefined) terminalFrame = tail.slice(match.index);
+    } else {
+      terminalFrame += chunk;
+    }
+    if (terminalFrame !== null && /\r?\n\r?\n/.test(terminalFrame)) {
+      // Whole terminal frame delivered — stop reading upstream instead of blocking on its EOF.
+      sawTerminal = true;
+      break;
+    }
   }
+  if (sawTerminal) input.upstreamBody.cancel().catch(() => {});
   const errorMessage = streamPreviewErrorMessage(preview);
   if (errorMessage) throw new Error(errorMessage);
   return preview;

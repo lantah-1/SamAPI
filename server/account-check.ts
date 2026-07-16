@@ -1,8 +1,7 @@
 import type { JsonStore } from "./store.js";
-import { extractUpstreamError, looksLikeHtmlText, mapWithConcurrency } from "./util/text.js";
+import { extractUpstreamError, mapWithConcurrency } from "./util/text.js";
 import { upstreamNetworkErrorMessage } from "./proxy.js";
 import {
-  GROK_RATE_LIMITS_URL,
   OPENAI_MODELS_URL,
   TEMPORARY_ACCOUNT_CHECK_CONCURRENCY,
   fetchTemporaryAccountCheckText
@@ -13,13 +12,8 @@ import {
   refreshCodexTemporaryAccountToken
 } from "./providers/codex.js";
 import {
-  GROK_RATE_LIMIT_MODES,
   fetchGrokOAuthResponses,
-  grokBrowserEnvironmentIssueText,
-  grokFailureMessage,
-  grokInvalidCredentialsText,
-  grokQuotaStage,
-  grokTemporaryHeaders,
+  grokOAuthAccessTokenNeedsRefresh,
   isGrokOAuthTemporaryAccount,
   refreshGrokOAuthTemporaryAccountToken,
   xaiQuotaStagesFromHeaders
@@ -29,8 +23,7 @@ import type {
   TemporaryAccount,
   TemporaryAccountCheckItemResult,
   TemporaryAccountCheckResult,
-  TemporaryAccountProviderType,
-  TemporaryAccountQuotaStage
+  TemporaryAccountProviderType
 } from "../shared/types.js";
 
 export function shouldMarkTemporaryAccountUnavailable(statusCode: number, errorMessage = "") {
@@ -49,6 +42,19 @@ export function shouldMarkTemporaryAccountUnavailable(statusCode: number, errorM
 }
 
 export function createAccountCheck(store: JsonStore) {
+  function grokConfiguredModels(account: TemporaryAccount) {
+    const upstreamModels = Array.from(
+      new Set(
+        store.getDb().providerApiKeyGroups
+          .filter((group) => store.isOfficialGrokSite(group.siteId))
+          .flatMap((group) => group.apiKeys.filter((apiKey) => apiKey.enabled).flatMap((apiKey) => apiKey.models))
+          .filter(Boolean)
+      )
+    ).sort();
+    if (upstreamModels.length > 0) return upstreamModels;
+    return Array.from(new Set(account.models.filter(Boolean))).sort();
+  }
+
   async function checkCodexTemporaryAccount(account: TemporaryAccount, checkedAt: string, proxyConfig?: RouteProxyConfig) {
     let tokenPatch:
       | {
@@ -190,15 +196,25 @@ export function createAccountCheck(store: JsonStore) {
           refreshToken?: string;
           idToken?: string;
           email?: string;
+          tokenExpiresAt?: string;
         }
       | undefined;
-    let attempt = await fetchGrokOAuthResponses(account, account.secret, proxyConfig);
-    if (attempt.response.status === 401 && account.refreshToken) {
+    const model = grokConfiguredModels(account)[0] || "";
+    let activeAccount = account;
+    if (grokOAuthAccessTokenNeedsRefresh(account) && account.refreshToken) {
       const refreshedTokenPatch = await refreshGrokOAuthTemporaryAccountToken(account, proxyConfig);
       if (refreshedTokenPatch) {
         tokenPatch = refreshedTokenPatch;
-        const refreshedAccount = { ...account, ...tokenPatch };
-        attempt = await fetchGrokOAuthResponses(refreshedAccount, tokenPatch.secret, proxyConfig);
+        activeAccount = { ...account, ...tokenPatch };
+      }
+    }
+    let attempt = await fetchGrokOAuthResponses(activeAccount, model, activeAccount.secret, proxyConfig);
+    if (attempt.response.status === 401 && account.refreshToken) {
+      const refreshedTokenPatch = await refreshGrokOAuthTemporaryAccountToken(activeAccount, proxyConfig);
+      if (refreshedTokenPatch) {
+        tokenPatch = refreshedTokenPatch;
+        const refreshedAccount = { ...activeAccount, ...tokenPatch };
+        attempt = await fetchGrokOAuthResponses(refreshedAccount, model, tokenPatch.secret, proxyConfig);
       }
     }
 
@@ -246,87 +262,8 @@ export function createAccountCheck(store: JsonStore) {
   }
 
   async function checkGrokTemporaryAccount(account: TemporaryAccount, checkedAt: string, proxyConfig?: RouteProxyConfig) {
-    if (isGrokOAuthTemporaryAccount(account)) return checkGrokOAuthTemporaryAccount(account, checkedAt, proxyConfig);
-    const existingQuotaStages = account.quotaStages;
-
-    const checks = await Promise.all(
-      GROK_RATE_LIMIT_MODES.map(async (mode) => {
-        try {
-          const { response, text } = await fetchTemporaryAccountCheckText(GROK_RATE_LIMITS_URL, {
-            method: "POST",
-            headers: grokTemporaryHeaders(account),
-            body: JSON.stringify({ modelName: mode.modelName })
-          }, proxyConfig);
-          if (looksLikeHtmlText(text)) {
-            return { mode, statusCode: response.status, ok: false, text: grokFailureMessage(response.status, text, response.headers.get("content-type") || undefined, account), stage: undefined };
-          }
-          if (!response.ok) {
-            return { mode, statusCode: response.status, ok: false, text: grokFailureMessage(response.status, text, response.headers.get("content-type") || undefined, account), stage: undefined };
-          }
-          let payload: unknown = {};
-          try {
-            payload = text ? JSON.parse(text) : {};
-          } catch {
-            return { mode, statusCode: response.status, ok: true, text: "Grok rate-limits 返回内容不是合法 JSON", stage: undefined };
-          }
-          return { mode, statusCode: response.status, ok: true, text, stage: grokQuotaStage(mode.label, payload) };
-        } catch (error) {
-          return { mode, statusCode: 599, ok: false, text: upstreamNetworkErrorMessage(error, "Grok rate-limits 检查请求失败"), stage: undefined };
-        }
-      })
-    );
-    const stages = checks.map((item) => item.stage).filter((stage): stage is TemporaryAccountQuotaStage => Boolean(stage));
-    const firstSuccess = checks.find((item) => item.ok);
-    if (stages.length > 0) {
-      const hasRemaining = stages.some((stage) => typeof stage.remaining !== "number" || stage.remaining > 0);
-      const availability = hasRemaining ? "available" as const : "unavailable" as const;
-      const errorMessage = hasRemaining ? undefined : "Grok 额度已耗尽或当前不允许请求";
-      return {
-        patch: {
-          availability,
-          quotaStages: stages,
-          lastQuotaCheckedAt: checkedAt,
-          lastCheckStatusCode: firstSuccess?.statusCode,
-          lastCheckError: errorMessage
-        },
-        result: {
-          availability,
-          status: hasRemaining ? "success" as const : "failed" as const,
-          statusCode: firstSuccess?.statusCode,
-          quotaStages: stages,
-          errorMessage,
-          checkedAt
-        }
-      };
-    }
-
-    const firstFailure = checks.find((item) => !item.ok);
-    const failureText = checks.map((item) => item.text).join("\n");
-    const statusCode = firstFailure?.statusCode;
-    const errorMessage = extractUpstreamError(failureText) || (statusCode ? `HTTP ${statusCode}` : "Grok 检查失败");
-    const invalidCredentials = checks.some((item) => [400, 401, 403].includes(item.statusCode) && grokInvalidCredentialsText(item.text));
-    const browserEnvironmentIssue = checks.some((item) => item.statusCode === 403 || grokBrowserEnvironmentIssueText(item.text));
-    const availability = invalidCredentials ? "unavailable" as const : "unknown" as const;
-    const checkErrorMessage = browserEnvironmentIssue && !invalidCredentials
-      ? `${errorMessage}；账号未判定不可用，请用导出 cf_clearance 的同一出口/防封 Docker 代理重试`
-      : errorMessage;
-    return {
-      patch: {
-        availability,
-        quotaStages: existingQuotaStages,
-        lastQuotaCheckedAt: checkedAt,
-        lastCheckStatusCode: statusCode,
-        lastCheckError: checkErrorMessage
-      },
-      result: {
-        availability,
-        status: "failed" as const,
-        statusCode,
-        quotaStages: existingQuotaStages,
-        errorMessage: checkErrorMessage,
-        checkedAt
-      }
-    };
+    if (!isGrokOAuthTemporaryAccount(account)) throw new Error("仅支持 CPA 或 grok2api 的 Grok OAuth 账号");
+    return checkGrokOAuthTemporaryAccount(account, checkedAt, proxyConfig);
   }
 
   async function checkTemporaryAccount(groupId: string, account: TemporaryAccount, proxyConfig?: RouteProxyConfig): Promise<TemporaryAccountCheckItemResult> {

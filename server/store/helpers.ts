@@ -5,9 +5,11 @@ import type {
   AppThemeId,
   GroupRouteMember,
   GroupRouteStrategy,
+  GrokOAuthFormat,
   RouteProxyConfig,
   TemporaryAccount,
   TemporaryAccountAvailability,
+  TemporaryAccountImportMode,
   TemporaryAccountProviderType,
   TemporaryAccountQuotaStage
 } from "../../shared/types.js";
@@ -16,9 +18,10 @@ export const ENDPOINTS = ["messages", "chat/completions", "responses"] as const;
 export const THEME_IDS: AppThemeId[] = ["fresh", "salt", "citrus", "rose", "midnight"];
 export const OPENAI_BASE_URL = "https://api.openai.com/v1";
 export const GROK_BASE_URL = "https://api.x.ai/v1";
-export const GROK_DEFAULT_MODELS = ["grok-4", "grok-3", "grok-3-mini", "grok-2-1212", "grok-2-vision-1212"];
 export const CHATGPT_OFFICIAL_PROVIDER_KEY_ID = "provider-key-chatgpt-official";
 export const CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL = "ChatGPT 官方";
+export const GROK_OFFICIAL_PROVIDER_KEY_ID = "provider-key-grok-official";
+export const GROK_OFFICIAL_PROVIDER_KEY_LABEL = "Grok 官方";
 export const TEMPORARY_ACCOUNT_PROVIDER_LABELS: Record<TemporaryAccountProviderType, string> = {
   gpt: "GPT",
   grok: "Grok",
@@ -430,78 +433,84 @@ type TemporaryAccountImportCandidate = {
   refreshToken?: string;
   idToken?: string;
   sessionToken?: string;
+  grokOAuthFormat?: GrokOAuthFormat;
+  oauthClientId?: string;
+  oauthTokenEndpoint?: string;
+  upstreamBaseUrl?: string;
+  tokenExpiresAt?: string;
+  grokUsingApi?: boolean;
   models: string[];
   quotaStages: TemporaryAccountQuotaStage[];
 };
 
-export function normalizeGrokAuthKey(key: string) {
-  const normalized = key.trim().toLowerCase().replace(/[\s.\-]+/g, "_");
-  if (["auth_mode", "authmode"].includes(normalized)) return "auth_mode";
-  if (["key", "access_token", "accesstoken", "token", "bearer", "authorization", "sso", "sso_token", "ssotoken"].includes(normalized)) return "access_token";
-  if (["refresh_token", "refreshtoken", "refresh"].includes(normalized)) return "refresh_token";
-  if (["id_token", "idtoken"].includes(normalized)) return "id_token";
-  if (["user_id", "userid", "sub", "principal_id", "principalid"].includes(normalized)) return "user_id";
-  if (["email", "mail", "username"].includes(normalized)) return "email";
-  if (["principal_type", "principaltype"].includes(normalized)) return "principal_type";
-  if (["create_time", "createtime", "created_at", "createdat"].includes(normalized)) return "create_time";
-  if (["expires_at", "expiresat", "expires", "expiry", "expire_at", "expireat"].includes(normalized)) return "expires_at";
-  if (["oidc_issuer", "issuer"].includes(normalized)) return "oidc_issuer";
-  if (["oidc_client_id", "client_id", "clientid"].includes(normalized)) return "oidc_client_id";
-  if (["label", "name", "remark", "备注", "名称"].includes(normalized)) return "label";
-  if (["account_id", "accountid", "chatgpt_account_id", "chatgptaccountid"].includes(normalized)) return "account_id";
-  if (["session_token", "sessiontoken", "session", "cf_clearance", "cookie", "cookies", "browser_cookie", "browsercookie", "浏览器cookie", "浏览器态"].includes(normalized)) return "session_token";
-  if (["models", "model", "模型"].includes(normalized)) return "models";
+function booleanField(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return undefined;
+  if (value.trim().toLowerCase() === "true") return true;
+  if (value.trim().toLowerCase() === "false") return false;
   return undefined;
 }
 
-export function isGrokAuthJson(value: unknown) {
-  if (!isRecord(value)) return false;
-  return Object.values(value).some((entry) => {
-    if (!isRecord(entry)) return false;
-    const mode = stringField(entry, "auth_mode");
-    const issuer = stringField(entry, "oidc_issuer");
-    const clientId = stringField(entry, "oidc_client_id");
-    return mode === "oidc" || Boolean(issuer && clientId);
-  });
+function oauthExpiry(record: Record<string, unknown>) {
+  const explicit = firstStringField([record], ["expired", "expires_at"]);
+  if (explicit && Number.isFinite(Date.parse(explicit))) return new Date(explicit).toISOString();
+  const expiresIn = typeof record.expires_in === "number" ? record.expires_in : Number(record.expires_in);
+  if (Number.isFinite(expiresIn) && expiresIn > 0) return new Date(Date.now() + expiresIn * 1000).toISOString();
+  const token = firstStringField([record], ["id_token", "access_token"]);
+  const exp = jwtPayload(token)?.exp;
+  return typeof exp === "number" && Number.isFinite(exp) ? new Date(exp * 1000).toISOString() : undefined;
 }
 
-export function grokAuthRecordFromEntry(entry: Record<string, unknown>) {
-  const normalized: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(entry)) {
-    const normalizedKey = normalizeGrokAuthKey(key);
-    if (normalizedKey && normalized[normalizedKey] == null) normalized[normalizedKey] = value;
+function grokOAuthFormat(record: Record<string, unknown>): GrokOAuthFormat | undefined {
+  const type = stringField(record, "type")?.toLowerCase();
+  const authKind = stringField(record, "auth_kind")?.toLowerCase();
+  if (type === "xai" || authKind === "oauth" || ["base_url", "token_endpoint", "last_refresh", "expired", "redirect_uri"].some((key) => key in record)) {
+    return type && type !== "xai" ? undefined : "cpa-oauth";
   }
-  return normalized;
+  const provider = stringField(record, "provider")?.toLowerCase();
+  if (provider && provider !== "grok_build") return undefined;
+  if (provider === "grok_build" || ["client_id", "name", "user_id", "principal_id", "team_id", "expires_at", "scope"].some((key) => key in record)) {
+    return "grok2api-oauth";
+  }
+  return "grok2api-oauth";
 }
 
-export function collectGrokAuthJson(value: unknown, models: string[], output: TemporaryAccountImportCandidate[]) {
-  if (!isRecord(value)) return false;
-  const records = Object.values(value).filter(isRecord).map((item) => grokAuthRecordFromEntry(item));
-  const hasAuthEntries = records.some((record) => stringField(record, "auth_mode") === "oidc" || (stringField(record, "oidc_issuer") && stringField(record, "oidc_client_id")));
-  if (!hasAuthEntries) return false;
-
-  for (const record of records) {
-    const accessToken = firstStringField([record], ["access_token"]);
-    if (!accessToken) continue;
-    const idToken = firstStringField([record], ["id_token"]);
-    const refreshToken = firstStringField([record], ["refresh_token"]);
-    const userId = firstStringField([record], ["user_id"]) || codexAccountIdFromIdToken(idToken);
-    const email = firstStringField([record], ["email"]) || emailFromIdToken(idToken);
-    const label = firstStringField([record], ["label"]) || email || userId || `账号 ${output.length + 1}`;
-    output.push({
-      label,
-      secret: accessToken,
-      accountType: userId ? "codex" : "codex",
-      accountId: userId,
-      email,
-      refreshToken,
-      idToken,
-      sessionToken: firstStringField([record], ["session_token"]),
-      models,
-      quotaStages: [],
-    });
+function parseGrokOAuthImport(content: string, models: string[], mode: TemporaryAccountImportMode) {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return [];
   }
-  return true;
+  if (!isRecord(parsed) || Array.isArray(parsed.accounts) || "sso_token" in parsed || "sso" in parsed) return [];
+  const format = grokOAuthFormat(parsed);
+  const expectedFormat = mode === "cpa" ? "cpa-oauth" : mode === "subapi" ? "grok2api-oauth" : undefined;
+  if (!format || (expectedFormat && format !== expectedFormat)) return [];
+  const tokenType = stringField(parsed, "token_type");
+  if (tokenType && tokenType.toLowerCase() !== "bearer") return [];
+  const accessToken = firstStringField([parsed], ["access_token"]);
+  const refreshToken = firstStringField([parsed], ["refresh_token"]);
+  if (!accessToken && !refreshToken) return [];
+  const idToken = firstStringField([parsed], ["id_token"]);
+  const accountId = firstStringField([parsed], ["user_id", "principal_id", "sub"]) || stringField(jwtPayload(idToken) || {}, "sub");
+  const email = firstStringField([parsed], ["email"]) || emailFromIdToken(idToken);
+  return [{
+    label: firstStringField([parsed], ["name"]) || email || accountId || (format === "cpa-oauth" ? "CPA Grok OAuth" : "grok2api OAuth"),
+    secret: accessToken || "",
+    accountId,
+    email,
+    refreshToken,
+    idToken,
+    grokOAuthFormat: format,
+    oauthClientId: firstStringField([parsed], ["client_id", "oidc_client_id"]),
+    oauthTokenEndpoint: firstStringField([parsed], ["token_endpoint"]),
+    upstreamBaseUrl: firstStringField([parsed], ["base_url"]),
+    tokenExpiresAt: oauthExpiry(parsed),
+    grokUsingApi: booleanField(parsed, "using_api"),
+    models,
+    quotaStages: []
+  }] satisfies TemporaryAccountImportCandidate[];
 }
 
 export function temporaryAccountFromRecord(
@@ -692,19 +701,31 @@ export function mergeTemporaryAccountImportCandidate(
     refreshToken: existing.refreshToken || incoming.refreshToken,
     idToken: existing.idToken || incoming.idToken,
     sessionToken: existing.sessionToken || incoming.sessionToken,
+    grokOAuthFormat: existing.grokOAuthFormat || incoming.grokOAuthFormat,
+    oauthClientId: existing.oauthClientId || incoming.oauthClientId,
+    oauthTokenEndpoint: existing.oauthTokenEndpoint || incoming.oauthTokenEndpoint,
+    upstreamBaseUrl: existing.upstreamBaseUrl || incoming.upstreamBaseUrl,
+    tokenExpiresAt: existing.tokenExpiresAt || incoming.tokenExpiresAt,
+    grokUsingApi: existing.grokUsingApi ?? incoming.grokUsingApi,
     models: existing.models.length > 0 ? existing.models : incoming.models,
     quotaStages: existing.quotaStages.length > 0 ? existing.quotaStages : incoming.quotaStages
   };
 }
 
-export function parseTemporaryAccountImport(content: string, models: string[]) {
+export function parseTemporaryAccountImport(
+  content: string,
+  models: string[],
+  providerType: TemporaryAccountProviderType = "gpt",
+  mode: TemporaryAccountImportMode = "auto"
+) {
+  if (providerType === "grok") return parseGrokOAuthImport(content.trim(), models, mode);
   const output: TemporaryAccountImportCandidate[] = [];
   const trimmed = content.trim();
   if (!trimmed) return output;
 
   try {
     const parsed = JSON.parse(trimmed);
-    if (!collectGrokAuthJson(parsed, models, output)) collectTemporaryAccounts(parsed, models, output);
+    collectTemporaryAccounts(parsed, models, output);
   } catch {
     // Fall through to line parser.
   }
@@ -714,7 +735,7 @@ export function parseTemporaryAccountImport(content: string, models: string[]) {
     if (!line || line.startsWith("#")) continue;
     try {
       const parsed = JSON.parse(line);
-      if (!collectGrokAuthJson(parsed, models, output)) collectTemporaryAccounts(parsed, models, output);
+      collectTemporaryAccounts(parsed, models, output);
       continue;
     } catch {
       // Not JSONL.
@@ -750,4 +771,3 @@ export function createEmptyDatabase(): AppDatabase {
     settings: { ...DEFAULT_SETTINGS }
   };
 }
-

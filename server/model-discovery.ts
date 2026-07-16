@@ -265,6 +265,7 @@ export function createModelDiscovery(store: JsonStore) {
     const apiKeyValue = apiKey.trim();
     const apiKeyNameValue = apiKeyName.trim();
     const isChatGptOfficial = !apiKeyValue && (kind === "chatgpt-official" || store.isOfficialOpenAiSite(siteId));
+    const isGrokOfficial = !apiKeyValue && (kind === "grok-official" || store.isOfficialGrokSite(siteId));
     if (!siteId) {
       recordModelDiscoveryLog({
         request,
@@ -280,6 +281,23 @@ export function createModelDiscovery(store: JsonStore) {
     }
     const maskedApiKey = maskSecret(apiKeyValue);
     const site = store.getDb().sites.find((item) => item.id === siteId);
+    if (isGrokOfficial) {
+      const errorMessage = "Grok 官方模型请在上游密钥的模型列表中手动填写";
+      recordModelDiscoveryLog({
+        request,
+        siteId,
+        site,
+        apiKeyValue,
+        apiKeyName: apiKeyNameValue,
+        discoveryType: "grok-official-manual",
+        status: "failed",
+        statusCode: 400,
+        startedAt: discoveryStartedAt,
+        errorMessage,
+        usesApiKey: false
+      });
+      throw new Error(errorMessage);
+    }
     if (!apiKeyValue && !isChatGptOfficial) {
       recordModelDiscoveryLog({
         request,
@@ -543,12 +561,26 @@ export function createModelDiscovery(store: JsonStore) {
           siteName: site?.name || group.groupName,
           apiKeyLabel: apiKey.label,
           secret: apiKey.secret,
-          kind: apiKey.kind || "api-key"
+          kind: apiKey.kind || "api-key",
+          models: apiKey.models
         }));
     });
     const results: ProviderModelSyncResult["results"] = [];
 
     for (const target of targets) {
+      if (target.kind === "grok-official") {
+        results.push({
+          groupId: target.groupId,
+          apiKeyId: target.apiKeyId,
+          siteId: target.siteId,
+          siteName: target.siteName,
+          apiKeyLabel: target.apiKeyLabel,
+          status: "success",
+          modelCount: target.models.length,
+          models: target.models
+        });
+        continue;
+      }
       try {
         const discovered = await discoverProviderModels(target.siteId, target.secret, target.apiKeyLabel, request, target.kind);
         const checkedAt = new Date().toISOString();

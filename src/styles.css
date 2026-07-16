@@ -1382,6 +1382,11 @@ textarea.field:focus {
   color: var(--muted-strong);
 }
 
+.account-status-checking {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
 .temp-account-quota-list {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -1479,6 +1484,33 @@ textarea.field:focus {
   font-weight: 760;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.temp-account-modal {
+  width: min(680px, 100%);
+}
+
+.temp-account-modal .form-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.temp-account-import-error {
+  display: block;
+  margin-top: 0.35rem;
+  color: var(--danger-strong);
+  font-size: 0.74rem;
+  font-weight: 760;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.temp-account-import-note {
+  border-top: 1px solid var(--line);
+  padding-top: 0.7rem;
+  color: var(--muted-strong);
+  font-size: 0.76rem;
+  font-weight: 700;
+  line-height: 1.5;
 }
 
 .route-record {
@@ -3822,6 +3854,10 @@ textarea.field:focus {
 
   .temp-account-panel {
     gap: 0.75rem;
+  }
+
+  .temp-account-modal .form-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .temp-account-head {

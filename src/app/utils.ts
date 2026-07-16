@@ -263,9 +263,16 @@ export function isOfficialOpenAiSite(site?: Site) {
   return Boolean(site?.addresses.some((address) => address.baseUrl.includes("api.openai.com")));
 }
 
+export function isOfficialGrokSite(site?: Site) {
+  return Boolean(site?.addresses.some((address) => address.baseUrl.includes("api.x.ai")));
+}
+
 export function emptyProviderApiKey(site?: Site, index = 0): ProviderApiKeyDraft {
   if (isOfficialOpenAiSite(site)) {
     return { label: "ChatGPT 官方", secret: "", kind: "chatgpt-official", enabled: true, models: [] };
+  }
+  if (isOfficialGrokSite(site)) {
+    return { label: "Grok 官方", secret: "", kind: "grok-official", enabled: true, models: [] };
   }
   return { label: `Key ${index + 1}`, secret: "", kind: "api-key", enabled: true, models: [] };
 }
@@ -284,6 +291,7 @@ export function emptyTemporaryAccountImport(): TemporaryAccountImportDraft {
     name: "GPT 临时账号",
     providerType: "gpt",
     source: "subapi",
+    mode: "auto",
     modelsText: "",
     content: "",
     contents: [],
@@ -308,7 +316,9 @@ export function temporaryAccountAvailabilityStats(accounts: TemporaryAccount[]) 
 
 export function temporaryAccountTypeLabel(account: TemporaryAccount) {
   if (account.accountType === "openai-api-key") return "OpenAI API Key";
-  if (account.providerType === "grok" && (account.refreshToken?.trim() || account.idToken?.trim() || account.secret.split(".").length === 3)) return "Grok OAuth";
+  if (account.providerType === "grok") {
+    return account.grokOAuthFormat === "grok2api-oauth" ? "Grok OAuth / grok2api" : "Grok OAuth / CPA";
+  }
   if (account.accountType === "codex" || account.accountId) return "Codex";
   return "临时账号";
 }

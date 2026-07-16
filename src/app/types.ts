@@ -8,6 +8,7 @@ import type {
   RouteProxyConfig,
   RouteType,
   TemporaryAccountImportSource,
+  TemporaryAccountImportMode,
   TemporaryAccountProviderType
 } from "../../shared/types";
 
@@ -54,6 +55,7 @@ export interface TemporaryAccountImportDraft {
   name: string;
   providerType: TemporaryAccountProviderType;
   source: TemporaryAccountImportSource;
+  mode: TemporaryAccountImportMode;
   modelsText: string;
   content: string;
   contents: string[];

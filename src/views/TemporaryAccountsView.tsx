@@ -44,6 +44,7 @@ import type {
   SwitchRoute,
   TemporaryAccount,
   TemporaryAccountGroup,
+  TemporaryAccountImportMode,
   TemporaryAccountProviderType
 } from "../../shared/types";
 import {
@@ -102,6 +103,31 @@ import {
 } from "../app/utils";
 import { ActionButton, SelectInput, TextInput } from "../components/ui";
 
+const TEMPORARY_IMPORT_FILE_LIMIT = 500;
+const TEMPORARY_IMPORT_TEXT_LIMIT = 20 * 1024 * 1024;
+const TEMPORARY_IMPORT_ARCHIVE_LIMIT = 25 * 1024 * 1024;
+const TEMPORARY_IMPORT_TEXT_FILE = /\.(?:json|jsonl|txt|csv)$/i;
+
+const temporaryImportModeHints: Record<TemporaryAccountImportMode, string> = {
+  auto: "逐个文件识别，适合不确定格式或同时导入多种来源。",
+  subapi: "按 Sub2API 来源导入，同时兼容常见账号字段。",
+  cpa: "按 CPA 来源导入，同时兼容常见账号字段。",
+  "auth-json": "适合直接导入 Codex 或 Grok 的 auth.json。",
+  zip: "解压后逐文件自动识别，支持 Sub2API、CPA 和 auth.json 混合包。"
+};
+
+function temporaryImportModeHint(providerType: TemporaryAccountProviderType, mode: TemporaryAccountImportMode) {
+  if (providerType !== "grok") return temporaryImportModeHints[mode];
+  if (mode === "cpa") return "仅导入 CLIProxyAPI / CPA 格式的单账号 xAI OAuth JSON。";
+  if (mode === "subapi") return "仅导入 grok2api 格式的单账号 Grok Build OAuth JSON。";
+  if (mode === "zip") return "ZIP 内可混合 CPA 与 grok2api OAuth JSON，每个 JSON 只包含一个账号。";
+  return "自动识别 CPA 或 grok2api 的单账号 OAuth JSON。";
+}
+
+function isTemporaryImportZip(file: File) {
+  return file.name.toLowerCase().endsWith(".zip") || ["application/zip", "application/x-zip-compressed"].includes(file.type);
+}
+
 export function TemporaryAccountsView(props: {
   snapshot: AppSnapshot;
   draft: TemporaryAccountImportDraft;
@@ -110,6 +136,7 @@ export function TemporaryAccountsView(props: {
   loading: boolean;
   error: string;
   checking: string | null;
+  checkingAccountIds: string[];
   checkProviderType: Extract<TemporaryAccountProviderType, "gpt" | "grok">;
   onCheckProviderTypeChange: (providerType: Extract<TemporaryAccountProviderType, "gpt" | "grok">) => void;
   checkProxy: RouteProxyConfig;
@@ -141,19 +168,60 @@ export function TemporaryAccountsView(props: {
   const visibleAvailabilityStats = temporaryAccountAvailabilityStats(visibleAccounts);
   const selectedVisibleAccountIds = props.selectedAccountIds.filter((id) => visibleAccountIdSet.has(id));
   const selectedAccountIdSet = new Set(selectedVisibleAccountIds);
+  const checkingAccountIdSet = new Set(props.checkingAccountIds);
   const currentTypeLabel = temporaryAccountProviderLabels[props.checkProviderType];
   const temporaryAccountStrategy = props.snapshot.settings.temporaryAccountStrategy || "sequential";
   const hasImportContent = props.draft.content.trim() || props.draft.contents.some((content) => content.trim());
+  const [importFileError, setImportFileError] = useState("");
+  useEffect(() => {
+    if (props.editorOpen) setImportFileError("");
+  }, [props.editorOpen]);
   const readImportFiles = async (files?: FileList | null) => {
     const selectedFiles = Array.from(files || []);
     if (selectedFiles.length === 0) return;
-    const contents = await Promise.all(selectedFiles.map((file) => file.text()));
-    props.onDraft({
-      ...props.draft,
-      contents,
-      fileNames: selectedFiles.map((file) => file.name),
-      name: props.draft.name || selectedFiles[0]?.name.replace(/\.[^.]+$/, "") || ""
-    });
+    setImportFileError("");
+    try {
+      const contents: string[] = [];
+      const fileNames: string[] = [];
+      let totalTextSize = 0;
+      const appendContent = (name: string, content: string) => {
+        if (!content.trim()) return;
+        totalTextSize += content.length;
+        if (totalTextSize > TEMPORARY_IMPORT_TEXT_LIMIT) throw new Error("解压后的账号数据不能超过 20 MB");
+        if (contents.length >= TEMPORARY_IMPORT_FILE_LIMIT) throw new Error(`单次最多导入 ${TEMPORARY_IMPORT_FILE_LIMIT} 个文件`);
+        contents.push(content);
+        fileNames.push(name);
+      };
+
+      for (const file of selectedFiles) {
+        const zipFile = isTemporaryImportZip(file);
+        if (props.draft.mode === "zip" && !zipFile) throw new Error("ZIP 包模式只能选择 .zip 文件");
+        if (!["auto", "zip"].includes(props.draft.mode) && zipFile) throw new Error("请切换到“自动识别”或“ZIP 混合包”后再选择 ZIP 文件");
+        if (!zipFile) {
+          appendContent(file.name, await file.text());
+          continue;
+        }
+        if (file.size > TEMPORARY_IMPORT_ARCHIVE_LIMIT) throw new Error(`${file.name} 超过 25 MB`);
+        const { default: JSZip } = await import("jszip");
+        const archive = await JSZip.loadAsync(file);
+        const entries = Object.values(archive.files).filter(
+          (entry) => !entry.dir && !entry.name.startsWith("__MACOSX/") && TEMPORARY_IMPORT_TEXT_FILE.test(entry.name)
+        );
+        if (entries.length === 0) throw new Error(`${file.name} 中没有可导入的 JSON、JSONL、TXT 或 CSV 文件`);
+        for (const entry of entries) appendContent(`${file.name} / ${entry.name}`, await entry.async("string"));
+      }
+
+      if (contents.length === 0) throw new Error("所选文件中没有可导入的账号数据");
+      props.onDraft({
+        ...props.draft,
+        contents,
+        fileNames,
+        name: props.draft.name || selectedFiles[0]?.name.replace(/\.[^.]+$/, "") || ""
+      });
+    } catch (error) {
+      setImportFileError(error instanceof Error ? error.message : "读取导入文件失败");
+      props.onDraft({ ...props.draft, contents: [], fileNames: [] });
+    }
   };
   return (
     <>
@@ -274,6 +342,7 @@ export function TemporaryAccountsView(props: {
                     <div className="temp-account-list">
                       {group.accounts.map((account) => {
                         const availability = account.availability || "unknown";
+                        const checking = checkingAccountIdSet.has(account.id);
                         return (
                           <div key={account.id} className={`temp-account-row temp-account-row-${availability}`}>
                             <div className="temp-account-row-main">
@@ -290,8 +359,8 @@ export function TemporaryAccountsView(props: {
                                   }
                                   aria-label={`选择 ${account.label}`}
                                 />
-                                <span className={`account-status account-status-${availability}`}>
-                                  {temporaryAccountAvailabilityLabels[availability]}
+                                <span className={`account-status account-status-${checking ? "checking" : availability}`}>
+                                  {checking ? "检测中" : temporaryAccountAvailabilityLabels[availability]}
                                 </span>
                                 <span className="temp-account-name">{account.label}</span>
                                 <div className="temp-account-row-actions">
@@ -302,7 +371,7 @@ export function TemporaryAccountsView(props: {
                                     onClick={() => props.onCheckAccount(account.id)}
                                     title="刷新账号"
                                   >
-                                    <RefreshCw className={`h-4 w-4 ${props.checking === account.id ? "animate-spin" : ""}`} />
+                                    <RefreshCw className={`h-4 w-4 ${checking ? "animate-spin" : ""}`} />
                                   </button>
                                   <label className="temp-account-enable" title={account.enabled ? "停用账号" : "启用账号"}>
                                     <input
@@ -377,7 +446,7 @@ export function TemporaryAccountsView(props: {
             <div className="form-head">
               <div>
                 <h2>导入临时账号</h2>
-                <div className="mt-1 text-xs font-bold text-ink/55">导入后用于官方 OpenAI 切换型路由</div>
+                <div className="mt-1 text-xs font-bold text-ink/55">选择账号平台，文件格式可自动识别</div>
               </div>
               <ActionButton type="button" tone="ghost" onClick={props.onClose} title="关闭">
                 <X className="h-4 w-4" />
@@ -385,33 +454,77 @@ export function TemporaryAccountsView(props: {
             </div>
             <div className="form-grid">
               <label>
-                账号类型
-                <SelectInput value={props.draft.providerType} onChange={(event) => props.onDraft({ ...props.draft, providerType: event.target.value as TemporaryAccountProviderType, name: `${temporaryAccountProviderLabels[event.target.value as TemporaryAccountProviderType]} 临时账号` })}>
-                  <option value="gpt">{temporaryAccountProviderLabels.gpt}</option>
+                账号平台
+                <SelectInput value={props.draft.providerType} onChange={(event) => {
+                  const providerType = event.target.value as Extract<TemporaryAccountProviderType, "gpt" | "grok">;
+                  props.onDraft({
+                    ...props.draft,
+                    providerType,
+                    mode: providerType === "grok" && props.draft.mode === "auth-json" ? "auto" : props.draft.mode,
+                    name: `${providerType === "gpt" ? "OpenAI" : "Grok"} 临时账号`
+                  });
+                }}>
+                  <option value="gpt">OpenAI</option>
                   <option value="grok">{temporaryAccountProviderLabels.grok}</option>
-                  <option value="claude">{temporaryAccountProviderLabels.claude}</option>
-                  <option value="gemini">{temporaryAccountProviderLabels.gemini}</option>
                 </SelectInput>
               </label>
               <label>
-                数据格式
-                <TextInput value="自动识别 CPA / Sub2API / Codex auth / Grok auth / Grok2API / Cookie / JSONL / 纯 token" disabled />
-                <span className="field-hint">无需手动选择，导入时会自动解析支持的账号格式。</span>
+                导入方式
+                <SelectInput value={props.draft.mode} onChange={(event) => {
+                  const mode = event.target.value as TemporaryAccountImportMode;
+                  setImportFileError("");
+                  props.onDraft({
+                    ...props.draft,
+                    mode,
+                    source: mode === "cpa" ? "cpa" : "subapi",
+                    content: mode === "zip" ? "" : props.draft.content,
+                    contents: [],
+                    fileNames: []
+                  });
+                }}>
+                  <option value="auto">自动识别（推荐）</option>
+                  <option value="subapi">{props.draft.providerType === "grok" ? "grok2api OAuth JSON" : "Sub2API"}</option>
+                  <option value="cpa">{props.draft.providerType === "grok" ? "CPA OAuth JSON" : "CPA"}</option>
+                  {props.draft.providerType === "gpt" ? <option value="auth-json">纯 auth.json</option> : null}
+                  <option value="zip">ZIP 混合包</option>
+                </SelectInput>
+                <span className="field-hint">{temporaryImportModeHint(props.draft.providerType, props.draft.mode)}</span>
               </label>
               <label className="form-span-2">
                 导入文件
-                <input className="field" type="file" accept=".json,.jsonl,.txt,.csv" multiple onChange={(event) => readImportFiles(event.target.files)} />
-                {props.draft.fileNames.length > 0 ? <span className="field-hint">已选择 {props.draft.fileNames.length} 个文件：{props.draft.fileNames.join("，")}</span> : null}
-              </label>
-              <label className="form-span-2">
-                账号数据
-                <textarea
-                  className="field temp-account-textarea"
-                  value={props.draft.content}
-                  placeholder="支持 CPA/SubAPI/Codex auth/Grok auth/Grok2API JSON、JSONL、CSV、sso/cf_clearance Cookie 或每行一个 sk-/token/sso"
-                  onChange={(event) => props.onDraft({ ...props.draft, content: event.target.value })}
+                <input
+                  className="field"
+                  type="file"
+                  accept={props.draft.mode === "zip" ? ".zip,application/zip" : props.draft.mode === "auto" ? ".json,.jsonl,.txt,.csv,.zip,application/zip" : ".json,.jsonl,.txt,.csv"}
+                  multiple
+                  onChange={(event) => void readImportFiles(event.target.files)}
                 />
+                {props.draft.fileNames.length > 0 ? (
+                  <span className="field-hint">
+                    已读取 {props.draft.fileNames.length} 个数据文件：{props.draft.fileNames.slice(0, 3).join("，")}{props.draft.fileNames.length > 3 ? ` 等 ${props.draft.fileNames.length} 个` : ""}
+                  </span>
+                ) : null}
+                {importFileError ? <span className="temp-account-import-error" role="alert">{importFileError}</span> : null}
               </label>
+              {props.draft.mode === "zip" ? (
+                <div className="temp-account-import-note form-span-2">
+                  {props.draft.providerType === "grok"
+                    ? "ZIP 内可混合 CPA 与 grok2api OAuth JSON；暂不支持 SSO JSON 和 accounts 账号列表。"
+                    : "ZIP 内可以包含多条 Sub2API、CPA、auth.json，也可以混合；目录和不支持的文件会自动忽略。"}
+                </div>
+              ) : (
+                <label className="form-span-2">
+                  账号数据
+                  <textarea
+                    className="field temp-account-textarea"
+                    value={props.draft.content}
+                    placeholder={props.draft.providerType === "grok"
+                      ? "粘贴单账号 CPA 或 grok2api OAuth JSON；不支持 SSO、Cookie、纯 token 或 accounts 列表"
+                      : "也可以直接粘贴 JSON、JSONL、Cookie、token 或账号字段"}
+                    onChange={(event) => props.onDraft({ ...props.draft, content: event.target.value })}
+                  />
+                </label>
+              )}
             </div>
             <div className="mt-4 flex justify-end gap-2">
               <ActionButton type="button" tone="ghost" onClick={props.onClose}>

@@ -78,6 +78,7 @@ import {
   groupRouteMemberGroups,
   groupRouteOrderedMembers,
   groupRouteStats,
+  isOfficialGrokSite,
   isOfficialOpenAiSite,
   mergeModelOptions,
   modelMatchesRule,
@@ -121,6 +122,7 @@ export function ProviderKeysView(props: {
   const groups = props.snapshot.providerApiKeyGroups;
   const selectedSite = props.snapshot.sites.find((site) => site.id === props.draft.siteId);
   const selectedSiteIsOfficialOpenAi = isOfficialOpenAiSite(selectedSite);
+  const selectedSiteIsOfficialGrok = isOfficialGrokSite(selectedSite);
   const updateApiKey = (index: number, patch: Partial<ProviderApiKeyDraft>) => {
     props.onDraft({
       ...props.draft,
@@ -206,8 +208,10 @@ export function ProviderKeysView(props: {
 
             <div className="mt-4 space-y-3">
               {props.draft.apiKeys.map((apiKey, index) => {
-                const isOfficialKey = apiKey.kind === "chatgpt-official" || selectedSiteIsOfficialOpenAi;
-                const useApiKeyInput = selectedSiteIsOfficialOpenAi && apiKey.secret.trim().length > 0;
+                const hasApiKey = apiKey.secret.trim().length > 0;
+                const isChatGptOfficialKey = apiKey.kind === "chatgpt-official" || (selectedSiteIsOfficialOpenAi && !hasApiKey);
+                const isGrokOfficialKey = selectedSiteIsOfficialGrok || apiKey.kind === "grok-official";
+                const useOpenAiApiKeyInput = selectedSiteIsOfficialOpenAi && hasApiKey;
                 return (
                 <div key={apiKey.id || index} className="address-block">
                   <div className="address-block-head">
@@ -227,33 +231,50 @@ export function ProviderKeysView(props: {
                       名称
                       <TextInput value={apiKey.label} onChange={(event) => updateApiKey(index, { label: event.target.value })} />
                     </label>
-                    <label>
-                      API Key
-                      <TextInput
-                        type="password"
-                        value={apiKey.secret}
-                        placeholder={selectedSiteIsOfficialOpenAi ? "可留空，或填写 sk-..." : "sk-..."}
-                        onChange={(event) => updateApiKey(index, { secret: event.target.value, kind: event.target.value.trim() ? "api-key" : apiKey.kind })}
-                      />
-                      {selectedSiteIsOfficialOpenAi ? (
-                        <span className="field-hint">不填则使用 ChatGPT 官方账号池；填写 sk-... 则走 OpenAI API。</span>
-                      ) : null}
-                    </label>
+                    {selectedSiteIsOfficialGrok ? (
+                      <label>
+                        账号来源
+                        <span className="field-hint">固定使用已导入的 Grok OAuth 临时账号池；这里仅维护模型配置。</span>
+                      </label>
+                    ) : (
+                      <label>
+                        API Key
+                        <TextInput
+                          type="password"
+                          value={apiKey.secret}
+                          placeholder={selectedSiteIsOfficialOpenAi ? "可留空，或填写 sk-..." : "sk-..."}
+                          onChange={(event) => {
+                            const secret = event.target.value;
+                            const kind = secret.trim()
+                              ? "api-key"
+                              : selectedSiteIsOfficialOpenAi
+                                ? "chatgpt-official"
+                                : apiKey.kind;
+                            updateApiKey(index, { secret, kind });
+                          }}
+                        />
+                        {selectedSiteIsOfficialOpenAi ? (
+                          <span className="field-hint">不填则使用 ChatGPT 官方账号池；填写 sk-... 则走 OpenAI API。</span>
+                        ) : null}
+                      </label>
+                    )}
                   </div>
                   <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
                     <label className="toggle-row">
                       <input type="checkbox" checked={apiKey.enabled} onChange={(event) => updateApiKey(index, { enabled: event.target.checked })} />
                       启用
                     </label>
-                    <ActionButton
-                      type="button"
-                      tone="ghost"
-                      disabled={props.modelDiscoveringIndex !== null}
-                      onClick={() => props.onDiscoverModels(index)}
-                    >
-                      <RefreshCw className={`h-4 w-4 ${props.modelDiscoveringIndex === index ? "animate-spin" : ""}`} />
-                      {useApiKeyInput ? "获取 OpenAI 模型" : isOfficialKey ? "同步 ChatGPT 模型" : "获取模型"}
-                    </ActionButton>
+                    {!isGrokOfficialKey ? (
+                      <ActionButton
+                        type="button"
+                        tone="ghost"
+                        disabled={props.modelDiscoveringIndex !== null}
+                        onClick={() => props.onDiscoverModels(index)}
+                      >
+                        <RefreshCw className={`h-4 w-4 ${props.modelDiscoveringIndex === index ? "animate-spin" : ""}`} />
+                        {useOpenAiApiKeyInput ? "获取 OpenAI 模型" : isChatGptOfficialKey ? "同步 ChatGPT 模型" : "获取模型"}
+                      </ActionButton>
+                    ) : null}
                   </div>
                   {props.modelGroupOptions[index]?.length > 0 ? (
                     <div className="provider-model-group-options">
@@ -274,10 +295,16 @@ export function ProviderKeysView(props: {
                       className="field"
                       rows={Math.max(3, Math.min(8, apiKey.models.length || 3))}
                       value={serializeModelText(apiKey.models)}
-                      placeholder="自动获取失败时可手动填写，例如：\ngpt-4.1\ngpt-4.1-mini"
+                      placeholder={isGrokOfficialKey ? "手动填写，例如：\ngrok-4\ngrok-3-mini" : "自动获取失败时可手动填写，例如：\ngpt-4.1\ngpt-4.1-mini"}
                       onChange={(event) => updateApiKey(index, { models: parseModelText(event.target.value) })}
                     />
-                    <span className="field-hint">{isOfficialKey ? "从已导入的 GPT 官方临时账号同步后，模型会同步到 OpenAI 供应商供路由选择。" : "支持换行、逗号、空格分隔；保存后会同步到该供应商的可选模型。"}</span>
+                    <span className="field-hint">
+                      {isChatGptOfficialKey
+                        ? "从已导入的 GPT 官方临时账号同步后，模型会同步到 OpenAI 供应商供路由选择。"
+                        : isGrokOfficialKey
+                          ? "支持换行、逗号、空格分隔；保存后会同步到 Grok 供应商，并由 Grok 临时账号池执行。"
+                          : "支持换行、逗号、空格分隔；保存后会同步到该供应商的可选模型。"}
+                    </span>
                   </label>
                   {apiKey.models.length > 0 ? (
                     <div className="mt-3 flex flex-wrap gap-2">
@@ -359,4 +386,3 @@ function ProviderKeyGroupRecord(props: {
     </article>
   );
 }
-

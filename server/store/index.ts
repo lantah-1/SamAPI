@@ -13,6 +13,7 @@ import type {
   ProviderApiKeyEntry,
   ProviderApiKeyGroup,
   ProviderApiKeyGroupInput,
+  ProviderApiKeyKind,
   RequestLog,
   RequestLogSummary,
   RouteRecord,
@@ -31,7 +32,8 @@ import {
   CHATGPT_OFFICIAL_PROVIDER_KEY_ID,
   CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL,
   GROK_BASE_URL,
-  GROK_DEFAULT_MODELS,
+  GROK_OFFICIAL_PROVIDER_KEY_ID,
+  GROK_OFFICIAL_PROVIDER_KEY_LABEL,
   OPENAI_BASE_URL,
   TEMPORARY_ACCOUNT_PROVIDER_LABELS,
   createEmptyDatabase,
@@ -76,9 +78,12 @@ export class JsonStore {
     this.db = this.load();
     this.ensureOfficialChatGptProviderKeyGroup();
     this.ensureOfficialGrokSite();
+    this.ensureOfficialGrokProviderKeyGroup();
     const mergedTemporaryAccounts = this.mergeTemporaryAccountTypeGroups();
-    if (mergedTemporaryAccounts) this.persist();
+    const migratedGrokModels = this.migrateOfficialGrokAddressModelsToProviderKey();
+    const removedUnsupportedGrokAccounts = this.removeUnsupportedGrokAccounts();
     this.refreshGroupRouteMembers();
+    if (mergedTemporaryAccounts || migratedGrokModels || removedUnsupportedGrokAccounts) this.persist();
   }
 
   getDb() {
@@ -104,9 +109,9 @@ export class JsonStore {
         continue;
       }
       const existingIds = new Set(existing.accounts.map((account) => account.id));
-      const existingSecrets = new Set(existing.accounts.map((account) => hashSecret(account.secret)));
+      const existingSecrets = new Set(existing.accounts.map((account) => hashSecret(account.secret.trim() || account.refreshToken?.trim() || account.id)));
       const incoming = group.accounts
-        .filter((account) => !existingIds.has(account.id) && !existingSecrets.has(hashSecret(account.secret)))
+        .filter((account) => !existingIds.has(account.id) && !existingSecrets.has(hashSecret(account.secret.trim() || account.refreshToken?.trim() || account.id)))
         .map((account) => ({ ...account, providerType, enabled: true }));
       existing.accounts.push(...incoming);
       existing.updatedAt = now();
@@ -115,6 +120,29 @@ export class JsonStore {
     const nextGroups = Array.from(merged.values());
     if (nextGroups.length !== this.db.temporaryAccountGroups.length) changed = true;
     this.db.temporaryAccountGroups = nextGroups;
+    return changed;
+  }
+
+  private removeUnsupportedGrokAccounts() {
+    let changed = false;
+    for (const group of this.db.temporaryAccountGroups) {
+      if (normalizeTemporaryAccountProviderType(group.providerType || group.name.toLowerCase()) !== "grok") continue;
+      const supported = group.accounts.filter((account) => {
+        const isOAuth = Boolean(account.grokOAuthFormat || account.refreshToken?.trim() || account.idToken?.trim());
+        if (!isOAuth) changed = true;
+        return isOAuth;
+      });
+      for (const account of supported) {
+        if (!account.grokOAuthFormat) {
+          account.grokOAuthFormat = "cpa-oauth";
+          changed = true;
+        }
+      }
+      group.accounts = supported;
+    }
+    const nonEmptyGroups = this.db.temporaryAccountGroups.filter((group) => group.accounts.length > 0);
+    if (nonEmptyGroups.length !== this.db.temporaryAccountGroups.length) changed = true;
+    this.db.temporaryAccountGroups = nonEmptyGroups;
     return changed;
   }
 
@@ -275,7 +303,7 @@ export class JsonStore {
           label: "xAI 官方 API",
           baseUrl: GROK_BASE_URL,
           enabled: true,
-          models: GROK_DEFAULT_MODELS
+          models: []
         }
       ],
       createdAt: timestamp,
@@ -297,6 +325,68 @@ export class JsonStore {
         }
       })
     );
+  }
+
+  isOfficialGrokSite(siteId: string) {
+    return this.officialGrokSite()?.id === siteId;
+  }
+
+  ensureOfficialGrokProviderKeyGroup() {
+    const site = this.ensureOfficialGrokSite();
+    const existing = this.db.providerApiKeyGroups.find((group) =>
+      group.siteId === site.id && group.apiKeys.some((apiKey) => apiKey.kind === "grok-official")
+    );
+    if (existing) return this.toProviderApiKeyGroupView(existing);
+    const timestamp = now();
+    const group: ProviderApiKeyGroup = {
+      id: "provider-key-group-grok-official",
+      siteId: site.id,
+      groupName: "Grok",
+      apiKeys: [this.normalizeProviderApiKeyEntry({ kind: "grok-official", label: GROK_OFFICIAL_PROVIDER_KEY_LABEL, enabled: true }, 0)],
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    this.db.providerApiKeyGroups.unshift(group);
+    this.persist();
+    return this.toProviderApiKeyGroupView(group);
+  }
+
+  private migrateOfficialGrokAddressModelsToProviderKey() {
+    const site = this.officialGrokSite();
+    if (!site) return false;
+    const addressModels = normalizeModelList(site.addresses.flatMap((address) => address.models));
+    const group = this.db.providerApiKeyGroups.find((item) =>
+      item.siteId === site.id && item.apiKeys.some((apiKey) => apiKey.kind === "grok-official")
+    );
+    const apiKey = group?.apiKeys.find((item) => item.kind === "grok-official");
+    if (!group || !apiKey) return false;
+    const otherProviderModels = new Set(
+      this.db.providerApiKeyGroups
+        .filter((item) => item.siteId === site.id)
+        .flatMap((item) => item.apiKeys)
+        .filter((item) => item.id !== apiKey.id)
+        .flatMap((item) => item.models)
+    );
+    const legacyModels = addressModels.filter((model) => !otherProviderModels.has(model));
+    const nextModels = normalizeModelList([...apiKey.models, ...legacyModels]);
+    const modelChanged = apiKey.models.join("\n") !== nextModels.join("\n");
+    if (modelChanged) {
+      apiKey.models = nextModels;
+      group.updatedAt = now();
+    }
+    const expectedSiteModels = normalizeModelList(
+      this.db.providerApiKeyGroups
+        .filter((item) => item.siteId === site.id)
+        .flatMap((item) => item.apiKeys)
+        .filter((item) => item.enabled)
+        .flatMap((item) => item.models)
+    );
+    const siteModelsChanged = site.addresses.some(
+      (address) => normalizeModelList(address.models).join("\n") !== expectedSiteModels.join("\n")
+    );
+    if (!modelChanged && !siteModelsChanged) return false;
+    this.syncSiteModelsFromProviderKeys(site.id);
+    return true;
   }
 
   ensureOfficialChatGptProviderKeyGroup() {
@@ -322,22 +412,45 @@ export class JsonStore {
 
   importTemporaryAccounts(input: TemporaryAccountImportInput) {
     const timestamp = now();
-    const source = input.source === "cpa" ? "cpa" : "subapi";
+    const source = input.mode === "cpa" || input.source === "cpa" ? "cpa" : "subapi";
     const providerType = normalizeTemporaryAccountProviderType(input.providerType);
     const site = providerType === "grok" ? this.ensureOfficialGrokSite() : this.ensureOfficialOpenAiSite();
     const models = normalizeModelList(input.models);
-    const importContents = [input.content, ...(Array.isArray(input.contents) ? input.contents : [])].filter((content) => typeof content === "string" && content.trim());
-    const parsedAccounts = importContents.flatMap((content) => parseTemporaryAccountImport(content, models));
-    if (parsedAccounts.length === 0) throw new Error("没有解析到可用账号密钥");
+    const importItems = [
+      ...(typeof input.content === "string" && input.content.trim() ? [{ name: "粘贴内容", content: input.content }] : []),
+      ...(Array.isArray(input.contents)
+        ? input.contents.flatMap((content, index) =>
+            typeof content === "string" && content.trim()
+              ? [{ name: input.fileNames?.[index] || `文件 ${index + 1}`, content }]
+              : []
+          )
+        : [])
+    ];
+    const parsedItems = importItems.map((item) => ({
+      ...item,
+      accounts: parseTemporaryAccountImport(item.content, models, providerType, input.mode || "auto")
+    }));
+    const parsedAccounts = parsedItems.flatMap((item) => item.accounts);
+    const unrecognizedFiles = parsedItems.filter((item) => item.accounts.length === 0).map((item) => item.name);
+    if (parsedAccounts.length === 0) {
+      const names = unrecognizedFiles.length > 0 ? `：${unrecognizedFiles.slice(0, 5).join("、")}` : "";
+      throw new Error(providerType === "grok"
+        ? `没有解析到可用的 Grok OAuth 账号；仅支持单账号 CPA / grok2api OAuth JSON，暂不支持 SSO JSON 和 accounts 列表${names}`
+        : `没有解析到可用账号密钥${names}`);
+    }
     const seen = new Set<string>(
-      this.db.temporaryAccountGroups.flatMap((group) => group.accounts.map((account) => hashSecret(account.secret)))
+      this.db.temporaryAccountGroups.flatMap((group) =>
+        group.accounts.map((account) => hashSecret(account.secret.trim() || account.refreshToken?.trim() || account.id))
+      )
     );
     const group = this.ensureTemporaryAccountTypeGroup(providerType, site.id, source, timestamp);
     const accounts: TemporaryAccount[] = [];
     let skipped = 0;
     for (const account of parsedAccounts) {
       const secret = account.secret.trim();
-      const hash = hashSecret(secret);
+      const credentialIdentity = secret || account.refreshToken?.trim() || "";
+      if (!credentialIdentity) continue;
+      const hash = hashSecret(credentialIdentity);
       if (seen.has(hash)) {
         skipped += 1;
         continue;
@@ -346,7 +459,7 @@ export class JsonStore {
       accounts.push({
         id: `temp-account-${randomUUID()}`,
         label: account.label || `账号 ${group.accounts.length + accounts.length + 1}`,
-        prefix: secret.slice(0, 12),
+        prefix: secret ? secret.slice(0, 12) : "oauth-refresh",
         secret,
         accountType: providerType === "gpt" ? account.accountType : undefined,
         providerType,
@@ -355,6 +468,12 @@ export class JsonStore {
         refreshToken: account.refreshToken,
         idToken: account.idToken,
         sessionToken: account.sessionToken,
+        grokOAuthFormat: account.grokOAuthFormat,
+        oauthClientId: account.oauthClientId,
+        oauthTokenEndpoint: account.oauthTokenEndpoint,
+        upstreamBaseUrl: account.upstreamBaseUrl,
+        tokenExpiresAt: account.tokenExpiresAt,
+        grokUsingApi: account.grokUsingApi,
         enabled: true,
         models: account.models.length > 0 ? account.models : models,
         availability: providerType === "gpt" ? "unknown" : account.quotaStages?.length ? "available" : "unknown",
@@ -369,7 +488,7 @@ export class JsonStore {
     group.providerType = providerType;
     group.updatedAt = timestamp;
     this.persist();
-    return { site, group, imported: accounts.length, skipped, accountIds: accounts.map((account) => account.id) };
+    return { site, group, imported: accounts.length, skipped, unrecognizedFiles, accountIds: accounts.map((account) => account.id) };
   }
 
   private ensureTemporaryAccountTypeGroup(providerType: TemporaryAccountProviderType, siteId: string, source: TemporaryAccountImportSource, timestamp = now()) {
@@ -514,6 +633,7 @@ export class JsonStore {
       idToken?: string;
       accountId?: string;
       email?: string;
+      tokenExpiresAt?: string;
     }
   ) {
     for (const group of this.db.temporaryAccountGroups) {
@@ -532,6 +652,7 @@ export class JsonStore {
       if (typeof input.idToken === "string" && input.idToken.trim()) account.idToken = input.idToken.trim();
       if (typeof input.accountId === "string" && input.accountId.trim()) account.accountId = input.accountId.trim();
       if (typeof input.email === "string" && input.email.trim()) account.email = input.email.trim();
+      if (typeof input.tokenExpiresAt === "string" && input.tokenExpiresAt.trim()) account.tokenExpiresAt = input.tokenExpiresAt.trim();
       group.updatedAt = now();
       this.persistTemporaryAccountCheckResult(group.id, account);
       return account;
@@ -651,12 +772,14 @@ export class JsonStore {
     const site = this.db.sites.find((item) => item.id === input.siteId);
     if (!site) throw new Error("供应商不存在");
     const groupName = input.groupName?.trim() || site.name;
+    const normalizeInputKey = (key: ProviderApiKeyGroupInput["apiKeys"] extends Array<infer Entry> | undefined ? Entry : never) =>
+      this.isOfficialGrokSite(site.id) ? { ...key, kind: "grok-official" as const, secret: "" } : key;
 
     if (input.id) {
       const current = this.db.providerApiKeyGroups.find((group) => group.id === input.id);
       if (!current) throw new Error("API Key 分组不存在");
       const previousSiteId = current.siteId;
-      const apiKeys = (input.apiKeys || []).map((key, index) => this.normalizeProviderApiKeyEntry(key, index, current.apiKeys));
+      const apiKeys = (input.apiKeys || []).map((key, index) => this.normalizeProviderApiKeyEntry(normalizeInputKey(key), index, current.apiKeys));
       if (apiKeys.length === 0) throw new Error("至少需要一个 API Key");
       Object.assign(current, {
         siteId: input.siteId,
@@ -671,7 +794,7 @@ export class JsonStore {
       return this.toProviderApiKeyGroupView(current);
     }
 
-    const apiKeys = (input.apiKeys || []).map((key, index) => this.normalizeProviderApiKeyEntry(key, index));
+    const apiKeys = (input.apiKeys || []).map((key, index) => this.normalizeProviderApiKeyEntry(normalizeInputKey(key), index));
     if (apiKeys.length === 0) throw new Error("至少需要一个 API Key");
 
     const created: ProviderApiKeyGroup = {
@@ -980,7 +1103,7 @@ export class JsonStore {
       CREATE TABLE IF NOT EXISTS provider_api_keys (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'api-key', enabled INTEGER NOT NULL, models_json TEXT NOT NULL, last_checked_at TEXT, FOREIGN KEY (group_id) REFERENCES provider_api_key_groups(id) ON DELETE CASCADE);
       CREATE INDEX IF NOT EXISTS idx_provider_api_keys_group_id ON provider_api_keys(group_id);
       CREATE TABLE IF NOT EXISTS temporary_account_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, source TEXT NOT NULL, provider_type TEXT, site_id TEXT NOT NULL, strategy TEXT, enabled INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS temporary_accounts (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, account_type TEXT, provider_type TEXT, account_id TEXT, email TEXT, refresh_token TEXT, id_token TEXT, session_token TEXT, enabled INTEGER NOT NULL, models_json TEXT NOT NULL, availability TEXT, quota_stages_json TEXT NOT NULL, imported_at TEXT NOT NULL, last_quota_checked_at TEXT, last_check_status_code INTEGER, last_check_error TEXT, FOREIGN KEY (group_id) REFERENCES temporary_account_groups(id) ON DELETE CASCADE);
+      CREATE TABLE IF NOT EXISTS temporary_accounts (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, account_type TEXT, provider_type TEXT, account_id TEXT, email TEXT, refresh_token TEXT, id_token TEXT, session_token TEXT, grok_oauth_format TEXT, oauth_client_id TEXT, oauth_token_endpoint TEXT, upstream_base_url TEXT, token_expires_at TEXT, grok_using_api INTEGER, enabled INTEGER NOT NULL, models_json TEXT NOT NULL, availability TEXT, quota_stages_json TEXT NOT NULL, imported_at TEXT NOT NULL, last_quota_checked_at TEXT, last_check_status_code INTEGER, last_check_error TEXT, FOREIGN KEY (group_id) REFERENCES temporary_account_groups(id) ON DELETE CASCADE);
       CREATE INDEX IF NOT EXISTS idx_temporary_accounts_group_id ON temporary_accounts(group_id);
       CREATE INDEX IF NOT EXISTS idx_temporary_accounts_enabled ON temporary_accounts(enabled);
       CREATE INDEX IF NOT EXISTS idx_temporary_accounts_availability ON temporary_accounts(availability);
@@ -991,6 +1114,12 @@ export class JsonStore {
     `);
     this.ensureSqliteColumn("temporary_account_groups", "provider_type", "TEXT");
     this.ensureSqliteColumn("temporary_accounts", "provider_type", "TEXT");
+    this.ensureSqliteColumn("temporary_accounts", "grok_oauth_format", "TEXT");
+    this.ensureSqliteColumn("temporary_accounts", "oauth_client_id", "TEXT");
+    this.ensureSqliteColumn("temporary_accounts", "oauth_token_endpoint", "TEXT");
+    this.ensureSqliteColumn("temporary_accounts", "upstream_base_url", "TEXT");
+    this.ensureSqliteColumn("temporary_accounts", "token_expires_at", "TEXT");
+    this.ensureSqliteColumn("temporary_accounts", "grok_using_api", "INTEGER");
     this.ensureSqliteColumn("provider_api_keys", "kind", "TEXT NOT NULL DEFAULT 'api-key'");
     this.ensureSqliteColumn("api_keys", "models_json", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureSqliteColumn("sites", "enabled", "INTEGER NOT NULL DEFAULT 1");
@@ -1062,16 +1191,20 @@ export class JsonStore {
       lastUsedAt: row.last_used_at == null ? undefined : String(row.last_used_at)
     }));
     const providerApiKeyGroups = (this.sqlite.prepare("SELECT * FROM provider_api_key_groups ORDER BY created_at DESC").all() as Array<Record<string, unknown>>).map((row) => {
-      const apiKeys = (this.sqlite.prepare("SELECT * FROM provider_api_keys WHERE group_id = ? ORDER BY rowid").all(row.id) as Array<Record<string, unknown>>).map((apiKey) => ({
-        id: String(apiKey.id),
-        label: String(apiKey.label),
-        prefix: String(apiKey.prefix),
-        secret: String(apiKey.secret),
-        kind: apiKey.kind === "chatgpt-official" ? "chatgpt-official" as const : "api-key" as const,
-        enabled: Boolean(apiKey.enabled),
-        models: normalizeModelList(JSON.parse(String(apiKey.models_json))),
-        lastCheckedAt: apiKey.last_checked_at == null ? undefined : String(apiKey.last_checked_at)
-      }));
+      const apiKeys = (this.sqlite.prepare("SELECT * FROM provider_api_keys WHERE group_id = ? ORDER BY rowid").all(row.id) as Array<Record<string, unknown>>).map((apiKey) => {
+        const kind: ProviderApiKeyKind =
+          apiKey.kind === "chatgpt-official" || apiKey.kind === "grok-official" ? apiKey.kind : "api-key";
+        return {
+          id: String(apiKey.id),
+          label: String(apiKey.label),
+          prefix: String(apiKey.prefix),
+          secret: String(apiKey.secret),
+          kind,
+          enabled: Boolean(apiKey.enabled),
+          models: normalizeModelList(JSON.parse(String(apiKey.models_json))),
+          lastCheckedAt: apiKey.last_checked_at == null ? undefined : String(apiKey.last_checked_at)
+        };
+      });
       return { id: String(row.id), siteId: String(row.site_id), groupName: String(row.group_name), apiKeys, createdAt: String(row.created_at), updatedAt: String(row.updated_at) };
     });
     const temporaryAccountGroups = (this.sqlite.prepare("SELECT * FROM temporary_account_groups ORDER BY created_at DESC").all() as Array<Record<string, unknown>>).map((row) => {
@@ -1087,6 +1220,12 @@ export class JsonStore {
         refreshToken: account.refresh_token == null ? undefined : String(account.refresh_token),
         idToken: account.id_token == null ? undefined : String(account.id_token),
         sessionToken: account.session_token == null ? undefined : String(account.session_token),
+        grokOAuthFormat: account.grok_oauth_format === "grok2api-oauth" ? "grok2api-oauth" as const : account.grok_oauth_format === "cpa-oauth" ? "cpa-oauth" as const : undefined,
+        oauthClientId: account.oauth_client_id == null ? undefined : String(account.oauth_client_id),
+        oauthTokenEndpoint: account.oauth_token_endpoint == null ? undefined : String(account.oauth_token_endpoint),
+        upstreamBaseUrl: account.upstream_base_url == null ? undefined : String(account.upstream_base_url),
+        tokenExpiresAt: account.token_expires_at == null ? undefined : String(account.token_expires_at),
+        grokUsingApi: account.grok_using_api == null ? undefined : Boolean(account.grok_using_api),
         enabled: Boolean(account.enabled),
         models: normalizeModelList(JSON.parse(String(account.models_json))),
         availability: normalizeTemporaryAccountAvailability(account.availability),
@@ -1189,11 +1328,11 @@ export class JsonStore {
       for (const apiKey of group.apiKeys) insertProviderKey.run(apiKey.id, group.id, apiKey.label, apiKey.prefix, apiKey.secret, apiKey.kind || "api-key", apiKey.enabled ? 1 : 0, JSON.stringify(apiKey.models), apiKey.lastCheckedAt || null);
     }
     const insertTemporaryGroup = this.sqlite.prepare("INSERT INTO temporary_account_groups (id, name, source, provider_type, site_id, strategy, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    const insertTemporaryAccount = this.sqlite.prepare("INSERT INTO temporary_accounts (id, group_id, label, prefix, secret, account_type, provider_type, account_id, email, refresh_token, id_token, session_token, enabled, models_json, availability, quota_stages_json, imported_at, last_quota_checked_at, last_check_status_code, last_check_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    const insertTemporaryAccount = this.sqlite.prepare("INSERT INTO temporary_accounts (id, group_id, label, prefix, secret, account_type, provider_type, account_id, email, refresh_token, id_token, session_token, grok_oauth_format, oauth_client_id, oauth_token_endpoint, upstream_base_url, token_expires_at, grok_using_api, enabled, models_json, availability, quota_stages_json, imported_at, last_quota_checked_at, last_check_status_code, last_check_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     for (const group of db.temporaryAccountGroups) {
       const providerType = normalizeTemporaryAccountProviderType(group.providerType || group.name.toLowerCase());
       insertTemporaryGroup.run(group.id, TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType], group.source, providerType, group.siteId, group.strategy || null, 1, group.createdAt, group.updatedAt);
-      for (const account of group.accounts) insertTemporaryAccount.run(account.id, group.id, account.label, account.prefix, account.secret, account.accountType || null, account.providerType || providerType, account.accountId || null, account.email || null, account.refreshToken || null, account.idToken || null, account.sessionToken || null, 1, JSON.stringify(account.models), account.availability || "unknown", JSON.stringify(account.quotaStages || []), account.importedAt, account.lastQuotaCheckedAt || null, account.lastCheckStatusCode ?? null, account.lastCheckError || null);
+      for (const account of group.accounts) insertTemporaryAccount.run(account.id, group.id, account.label, account.prefix, account.secret, account.accountType || null, account.providerType || providerType, account.accountId || null, account.email || null, account.refreshToken || null, account.idToken || null, account.sessionToken || null, account.grokOAuthFormat || null, account.oauthClientId || null, account.oauthTokenEndpoint || null, account.upstreamBaseUrl || null, account.tokenExpiresAt || null, account.grokUsingApi == null ? null : account.grokUsingApi ? 1 : 0, 1, JSON.stringify(account.models), account.availability || "unknown", JSON.stringify(account.quotaStages || []), account.importedAt, account.lastQuotaCheckedAt || null, account.lastCheckStatusCode ?? null, account.lastCheckError || null);
     }
     const insertHeader = this.sqlite.prepare("INSERT INTO header_templates (id, name, headers_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
     for (const template of db.headerTemplates) insertHeader.run(template.id, template.name, template.headersText, template.createdAt, template.updatedAt);
@@ -1219,9 +1358,9 @@ export class JsonStore {
   private persistTemporaryAccountCheckResult(groupId: string, account: TemporaryAccount) {
     this.sqlite.prepare(`
       UPDATE temporary_accounts
-      SET label = ?, prefix = ?, secret = ?, account_type = ?, provider_type = ?, account_id = ?, email = ?, refresh_token = ?, id_token = ?, session_token = ?, enabled = ?, models_json = ?, availability = ?, quota_stages_json = ?, imported_at = ?, last_quota_checked_at = ?, last_check_status_code = ?, last_check_error = ?
+      SET label = ?, prefix = ?, secret = ?, account_type = ?, provider_type = ?, account_id = ?, email = ?, refresh_token = ?, id_token = ?, session_token = ?, grok_oauth_format = ?, oauth_client_id = ?, oauth_token_endpoint = ?, upstream_base_url = ?, token_expires_at = ?, grok_using_api = ?, enabled = ?, models_json = ?, availability = ?, quota_stages_json = ?, imported_at = ?, last_quota_checked_at = ?, last_check_status_code = ?, last_check_error = ?
       WHERE id = ?
-    `).run(account.label, account.prefix, account.secret, account.accountType || null, account.providerType || "gpt", account.accountId || null, account.email || null, account.refreshToken || null, account.idToken || null, account.sessionToken || null, 1, JSON.stringify(account.models), account.availability || "unknown", JSON.stringify(account.quotaStages || []), account.importedAt, account.lastQuotaCheckedAt || null, account.lastCheckStatusCode ?? null, account.lastCheckError || null, account.id);
+    `).run(account.label, account.prefix, account.secret, account.accountType || null, account.providerType || "gpt", account.accountId || null, account.email || null, account.refreshToken || null, account.idToken || null, account.sessionToken || null, account.grokOAuthFormat || null, account.oauthClientId || null, account.oauthTokenEndpoint || null, account.upstreamBaseUrl || null, account.tokenExpiresAt || null, account.grokUsingApi == null ? null : account.grokUsingApi ? 1 : 0, 1, JSON.stringify(account.models), account.availability || "unknown", JSON.stringify(account.quotaStages || []), account.importedAt, account.lastQuotaCheckedAt || null, account.lastCheckStatusCode ?? null, account.lastCheckError || null, account.id);
     this.sqlite.prepare("UPDATE temporary_account_groups SET updated_at = ? WHERE id = ?").run(now(), groupId);
   }
 
@@ -1236,17 +1375,18 @@ export class JsonStore {
 
   private normalizeProviderApiKeyEntry(input: Partial<ProviderApiKeyEntry>, index: number, existingKeys: ProviderApiKeyEntry[] = []): ProviderApiKeyEntry {
     const existing = input.id ? existingKeys.find((key) => key.id === input.id) : undefined;
-    const kind = input.kind === "chatgpt-official" ? "chatgpt-official" : existing?.kind || "api-key";
-    const resolvedSecret = kind === "chatgpt-official" ? "" : input.secret?.trim() || existing?.secret;
-    if (kind !== "chatgpt-official" && !resolvedSecret) throw new Error(`第 ${index + 1} 个 API Key 不能为空`);
+    const kind = input.kind === "chatgpt-official" || input.kind === "grok-official" ? input.kind : existing?.kind || "api-key";
+    const isOfficialKey = kind === "chatgpt-official" || kind === "grok-official";
+    const resolvedSecret = isOfficialKey ? "" : input.secret?.trim() || existing?.secret;
+    if (!isOfficialKey && !resolvedSecret) throw new Error(`第 ${index + 1} 个 API Key 不能为空`);
     const secret = resolvedSecret || "";
     const models = Array.isArray(input.models)
       ? Array.from(new Set(input.models.map((model) => String(model).trim()).filter(Boolean))).sort()
       : [];
     return {
-      id: input.id || (kind === "chatgpt-official" ? CHATGPT_OFFICIAL_PROVIDER_KEY_ID : `provider-key-${randomUUID()}`),
-      label: input.label?.trim() || (kind === "chatgpt-official" ? CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL : `Key ${index + 1}`),
-      prefix: kind === "chatgpt-official" ? "chatgpt" : secret.slice(0, 10),
+      id: input.id || (kind === "chatgpt-official" ? CHATGPT_OFFICIAL_PROVIDER_KEY_ID : kind === "grok-official" ? GROK_OFFICIAL_PROVIDER_KEY_ID : `provider-key-${randomUUID()}`),
+      label: input.label?.trim() || (kind === "chatgpt-official" ? CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL : kind === "grok-official" ? GROK_OFFICIAL_PROVIDER_KEY_LABEL : `Key ${index + 1}`),
+      prefix: kind === "chatgpt-official" ? "chatgpt" : kind === "grok-official" ? "grok" : secret.slice(0, 10),
       secret,
       kind,
       enabled: input.enabled ?? true,

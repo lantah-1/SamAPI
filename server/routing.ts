@@ -1,6 +1,5 @@
 import type { JsonStore } from "./store.js";
 import { shouldMarkTemporaryAccountUnavailable } from "./account-check.js";
-import { grokBrowserEnvironmentIssueText, grokInvalidCredentialsText, isGrokWebTemporaryAccount } from "./providers/grok.js";
 import type {
   GroupRoute,
   HeaderTemplate,
@@ -44,27 +43,6 @@ export function createRouting(store: JsonStore) {
       });
       return;
     }
-    if (account.providerType === "grok") {
-      const message = errorMessage || `HTTP ${statusCode}`;
-      if (statusCode === 401 || grokInvalidCredentialsText(message)) {
-        store.updateTemporaryAccountCheckResult(account.id, {
-          availability: "unavailable",
-          lastQuotaCheckedAt: checkedAt,
-          lastCheckStatusCode: statusCode,
-          lastCheckError: message
-        });
-        return;
-      }
-      if (statusCode === 403 || grokBrowserEnvironmentIssueText(message)) {
-        store.updateTemporaryAccountCheckResult(account.id, {
-          availability: "unknown",
-          lastQuotaCheckedAt: checkedAt,
-          lastCheckStatusCode: statusCode,
-          lastCheckError: `${message}；账号未判定不可用，请用导出 cf_clearance 的同一出口/防封 Docker 代理重试`
-        });
-        return;
-      }
-    }
     if (!shouldMarkTemporaryAccountUnavailable(statusCode, errorMessage)) return;
     store.updateTemporaryAccountCheckResult(account.id, {
       availability: "unavailable",
@@ -85,7 +63,7 @@ export function createRouting(store: JsonStore) {
   }
 
   function candidateKey(candidate: ProxyExecutionCandidate) {
-    return `${candidate.site.id}::${candidate.providerApiKey?.id || candidate.temporaryAccount?.id || ""}::${candidate.model}`;
+    return `${candidate.site.id}::${candidate.providerApiKey?.id || candidate.temporaryAccount?.id || candidate.temporaryApiKeyAccount?.id || ""}::${candidate.model}`;
   }
 
   function candidateLogKey(candidate: ProxyExecutionCandidate) {
@@ -171,17 +149,21 @@ export function createRouting(store: JsonStore) {
       if (!site || addresses.length === 0) throw new Error("路由绑定的供应商地址不可用");
       const officialProviderApiKey = store.resolveProviderApiKey(site.id, route.model);
       const useChatGptOfficial = officialProviderApiKey?.kind === "chatgpt-official";
+      const useGrokOfficial = officialProviderApiKey?.kind === "grok-official";
       const temporaryAccounts = useChatGptOfficial || store.isOfficialOpenAiSite(site.id)
         ? store.resolveTemporaryOpenAiAccounts(route.model)
+        : useGrokOfficial
+          ? store.resolveTemporaryProviderAccounts("grok", route.model)
         : resolveTemporaryProviderAccountsForRoute(site, route.model);
       if (temporaryAccounts.length > 0) {
         const candidates: ProxyExecutionCandidate[] = temporaryAccounts.map((temporaryAccount, index) => {
           const temporaryAccountIsCodex = isCodexTemporaryAccount(temporaryAccount);
+          const temporaryAccountIsGrok = temporaryAccount.providerType === "grok";
           return {
             site,
             addresses,
             model: route.model,
-            providerApiKey: temporaryAccountIsCodex || isGrokWebTemporaryAccount(temporaryAccount) ? undefined : temporaryAccount,
+            providerApiKey: temporaryAccountIsCodex || temporaryAccountIsGrok ? undefined : temporaryAccount,
             temporaryAccount: temporaryAccountIsCodex ? temporaryAccount : undefined,
             temporaryApiKeyAccount: temporaryAccountIsCodex ? undefined : temporaryAccount,
             headerTemplate: routeHeaderTemplate(route),
@@ -198,7 +180,7 @@ export function createRouting(store: JsonStore) {
           site,
           addresses,
           model: route.model,
-          providerApiKey: officialProviderApiKey,
+          providerApiKey: useChatGptOfficial || useGrokOfficial ? undefined : officialProviderApiKey,
           headerTemplate: routeHeaderTemplate(route),
           index: 0
         }
@@ -240,7 +222,7 @@ export function createRouting(store: JsonStore) {
             site,
             addresses,
             model: member.model,
-            providerApiKey: temporaryAccountIsCodex || isGrokWebTemporaryAccount(temporaryAccount) ? undefined : temporaryAccount,
+            providerApiKey: temporaryAccountIsCodex ? undefined : temporaryAccount,
             temporaryAccount: temporaryAccountIsCodex ? temporaryAccount : undefined,
             temporaryApiKeyAccount: temporaryAccountIsCodex ? undefined : temporaryAccount,
             headerTemplate,
@@ -249,6 +231,25 @@ export function createRouting(store: JsonStore) {
         }
         continue;
       }
+      const grokTemporaryAccounts =
+        temporaryAccountProviderTypeForSite(site) === "grok"
+          ? store.resolveTemporaryProviderAccounts("grok", member.model)
+          : [];
+      if (grokTemporaryAccounts.length > 0) {
+        for (const temporaryAccount of grokTemporaryAccounts) {
+          candidates.push({
+            site,
+            addresses,
+            model: member.model,
+            providerApiKey: undefined,
+            temporaryApiKeyAccount: temporaryAccount,
+            headerTemplate,
+            index: candidates.length
+          });
+        }
+        continue;
+      }
+      if (apiKey.kind === "grok-official") continue;
       candidates.push({
         site,
         addresses,

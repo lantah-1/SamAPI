@@ -19,6 +19,7 @@
     "@zenmux/rosetta-ai": "^1.0.1",
     "better-sqlite3": "^12.11.1",
     "concurrently": "^9.2.0",
+    "jszip": "^3.10.1",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

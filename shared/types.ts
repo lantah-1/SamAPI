@@ -17,9 +17,13 @@ export type AppThemeId = "fresh" | "salt" | "citrus" | "rose" | "midnight";
 
 export type TemporaryAccountImportSource = "cpa" | "subapi";
 
+export type TemporaryAccountImportMode = "auto" | "subapi" | "cpa" | "auth-json" | "zip";
+
 export type TemporaryAccountProviderType = "gpt" | "grok" | "claude" | "gemini";
 
 export type TemporaryAccountAvailability = "unknown" | "available" | "unavailable";
+
+export type GrokOAuthFormat = "cpa-oauth" | "grok2api-oauth";
 
 export interface SiteAddress {
   id: string;
@@ -56,7 +60,7 @@ export interface ApiKeyCreated extends ApiKeyRecord {
   plainTextKey: string;
 }
 
-export type ProviderApiKeyKind = "api-key" | "chatgpt-official";
+export type ProviderApiKeyKind = "api-key" | "chatgpt-official" | "grok-official";
 
 export interface ProviderApiKeyEntry {
   id: string;
@@ -146,6 +150,12 @@ export interface TemporaryAccount {
   refreshToken?: string;
   idToken?: string;
   sessionToken?: string;
+  grokOAuthFormat?: GrokOAuthFormat;
+  oauthClientId?: string;
+  oauthTokenEndpoint?: string;
+  upstreamBaseUrl?: string;
+  tokenExpiresAt?: string;
+  grokUsingApi?: boolean;
   enabled: boolean;
   models: string[];
   availability?: TemporaryAccountAvailability;
@@ -181,9 +191,11 @@ export interface TemporaryAccountGroup {
 export interface TemporaryAccountImportInput {
   name?: string;
   source?: TemporaryAccountImportSource;
+  mode?: TemporaryAccountImportMode;
   providerType?: TemporaryAccountProviderType;
   content: string;
   contents?: string[];
+  fileNames?: string[];
   models?: string[];
   checkProxy?: RouteProxyConfig;
 }
@@ -193,6 +205,7 @@ export interface TemporaryAccountImportResult {
   group: TemporaryAccountGroup;
   imported: number;
   skipped: number;
+  unrecognizedFiles?: string[];
   accountIds?: string[];
   checkResult?: TemporaryAccountCheckResult;
 }

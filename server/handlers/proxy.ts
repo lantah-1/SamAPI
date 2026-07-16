@@ -37,20 +37,14 @@ import {
 } from "../convert/stream.js";
 import { fetchWithRouteProxy, requestLogProxyForRoute } from "../proxy.js";
 import { parseHeaderTemplate } from "../store.js";
-import {
-  CODEX_BACKEND_RESPONSES_URL,
-  CODEX_USER_AGENT,
-  GROK_CONVERSATIONS_NEW_URL
-} from "../providers/constants.js";
+import { CODEX_BACKEND_RESPONSES_URL, CODEX_USER_AGENT } from "../providers/constants.js";
 import { codexTemporaryHeaders, codexTemporaryRequestBody, collectCodexResponsesBody } from "../providers/codex.js";
 import {
-  adaptGrokWebResponseText,
-  collectGrokWebStreamBody,
-  grokCookieDiagnosticText,
-  grokFailureMessage,
-  grokTemporaryHeaders,
-  grokWebRequestBody,
-  isGrokWebTemporaryAccount
+  grokOAuthAccessTokenNeedsRefresh,
+  grokOAuthBaseUrl,
+  grokOAuthHeaders,
+  isGrokOAuthTemporaryAccount,
+  refreshGrokOAuthTemporaryAccountToken
 } from "../providers/grok.js";
 import type { ProxyExecutionCandidate } from "../routing.js";
 import type { RequestLog, RequestLogStatus, RouteRecord, SiteAddress } from "../../shared/types.js";
@@ -331,6 +325,33 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
           throw new Error(`未找到支持模型 ${candidate.model} 的上游 API Key`);
         }
         if (candidate.providerApiKey) setHeader(headers, "Authorization", `Bearer ${candidate.providerApiKey.secret}`);
+        let grokAccount = isGrokOAuthTemporaryAccount(candidate.temporaryApiKeyAccount)
+          ? candidate.temporaryApiKeyAccount
+          : undefined;
+        if (grokAccount && grokOAuthAccessTokenNeedsRefresh(grokAccount)) {
+          try {
+            const tokenPatch = await refreshGrokOAuthTemporaryAccountToken(grokAccount, route.proxy);
+            if (!tokenPatch) throw new Error("Grok OAuth 账号缺少可用 access_token 和 refresh_token");
+            store.updateTemporaryAccountCheckResult(grokAccount.id, tokenPatch);
+            grokAccount = { ...grokAccount, ...tokenPatch };
+          } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : "刷新 Grok OAuth token 失败";
+            markTemporaryAccountAttempt(candidate, 401, errorMessage);
+            errors.push(`${candidate.temporaryApiKeyAccount?.label || "Grok OAuth"}：${errorMessage}`);
+            continue;
+          }
+        }
+        if (grokAccount) Object.assign(headers, grokOAuthHeaders(grokAccount, grokAccount.secret, downstreamStream, undefined, candidate.model));
+        const executionEndpoint: RouteEndpointKind = grokAccount ? "responses" : route.endpoint;
+        const executionAddresses = grokAccount
+          ? [{
+              id: `grok-oauth-${grokAccount.id}`,
+              label: grokAccount.grokOAuthFormat === "grok2api-oauth" ? "Grok Build (grok2api)" : "Grok OAuth (CPA)",
+              baseUrl: grokOAuthBaseUrl(grokAccount),
+              enabled: true,
+              models: [candidate.model]
+            }]
+          : candidate.addresses;
         const routeUa = headerValue(headers, "User-Agent") || "fetch default";
         const routeTargetLog = {
           routeName: route.name,
@@ -352,162 +373,21 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
           : candidate.temporaryApiKeyAccount
             ? {
                 "upstream-api-key": candidate.temporaryApiKeyAccount.label,
-                "upstream-authorization": candidate.temporaryApiKeyAccount.providerType === "grok" ? "Grok Web SSO Cookie" : `Bearer ${maskSecret(candidate.temporaryApiKeyAccount.secret)}`
+                "upstream-authorization": `Bearer ${maskSecret(candidate.temporaryApiKeyAccount.secret)}`,
+                ...(grokAccount ? { "upstream-auth-format": grokAccount.grokOAuthFormat || "cpa-oauth" } : {})
               }
           : {
               "upstream-authorization": "Header 模版已提供"
         };
-        const converted = convertedRouteRequestBody(body, candidate.model, route.endpoint, proxyInfo.kind);
+        const converted = convertedRouteRequestBody(body, candidate.model, executionEndpoint, proxyInfo.kind);
         const responseConverter = converted.converter;
-        const sanitizedBody = sanitizeOpenAiCompatibleResponsesBody(converted.body, route.endpoint);
+        const sanitizedBody = sanitizeOpenAiCompatibleResponsesBody(converted.body, executionEndpoint);
         const forwardedBody = downstreamStream ? applyStreamingFlag(sanitizedBody, true) : sanitizedBody;
         const upstreamRequestHeaders = {
           ...maskedStringHeaders(headers),
           ...upstreamAuthLog
         };
         lastAttemptContext = { candidate, routeUa, routeTargetLog, upstreamAuthLog };
-
-        if (isGrokWebTemporaryAccount(candidate.temporaryApiKeyAccount)) {
-          const grokAccount = candidate.temporaryApiKeyAccount;
-          const grokHeaders = grokTemporaryHeaders(grokAccount, headers);
-          const grokRouteUa = headerValue(grokHeaders, "User-Agent") || "Grok Web";
-          const grokRouteTargetLog = {
-            ...routeTargetLog,
-            userAgent: grokRouteUa
-          };
-          const grokAuthLog: Record<string, string> = {
-            "upstream-api-key": grokAccount.label,
-            "upstream-authorization": "Grok Web SSO Cookie"
-          };
-          lastAttemptContext = { candidate, routeUa: grokRouteUa, routeTargetLog: grokRouteTargetLog, upstreamAuthLog: grokAuthLog };
-          const convertedForGrok = convertedRouteRequestBody(body, candidate.model, "chat/completions", proxyInfo.kind);
-          const grokForwardedBody = grokWebRequestBody(convertedForGrok.body, candidate.model);
-          const grokUpstreamRequestHeaders = {
-            ...maskedStringHeaders(grokHeaders),
-            ...grokAuthLog,
-            "grok-cookie-state": grokCookieDiagnosticText(grokAccount)
-          };
-          const attemptStartedAt = Date.now();
-          try {
-            const { response: upstream, proxy: attemptProxy } = await fetchWithRouteProxy(GROK_CONVERSATIONS_NEW_URL, {
-              method: "POST",
-              headers: grokHeaders,
-              body: JSON.stringify(grokForwardedBody),
-              signal: clientAbort.signal
-            }, route.proxy);
-            const contentType = upstream.headers.get("content-type") || undefined;
-            const text = upstream.body ? await collectGrokWebStreamBody(upstream.body) : await upstream.text();
-
-            if (upstream.ok && !looksLikeHtml(contentType, text)) {
-              const adapted = adaptGrokWebResponseText(text, proxyInfo.kind, candidate.model, convertedForGrok.converter, downstreamStream);
-              upstreamAttempts.push({
-                addressLabel: "Grok Web",
-                upstreamUrl: GROK_CONVERSATIONS_NEW_URL,
-                method: "POST",
-                model: candidate.model,
-                endpoint: "chat/completions",
-                userAgent: grokRouteUa,
-                requestHeaders: grokUpstreamRequestHeaders,
-                requestBody: grokForwardedBody,
-                status: "success",
-                statusCode: upstream.status,
-                durationMs: Date.now() - attemptStartedAt,
-                contentType,
-                responsePreview: responsePreview(adapted.text || text)
-              });
-              store.recordRequestLog({
-                ...requestLogBase,
-                routeId: route.id,
-                routeName: route.name,
-                endpoint: route.endpoint,
-                providerName: candidate.site.name,
-                providerId: candidate.site.id,
-                addressLabel: "Grok Web",
-                model: candidate.model,
-                requestBody: body,
-                status: "success",
-                statusCode: upstream.status,
-                durationMs: Date.now() - startedAt,
-                requestHeaders: {
-                  ...requestLogBase.requestHeaders,
-                  ...grokAuthLog
-                },
-                upstreamUrl: GROK_CONVERSATIONS_NEW_URL,
-                upstreamContentType: contentType,
-                responsePreview: responsePreview(adapted.text || text),
-                downstream: downstreamLog,
-                routeTarget: grokRouteTargetLog,
-                upstreamAttempts,
-                proxy: attemptProxy,
-                summary: chainSummary({
-                  downstreamModel: downstreamLog.model,
-                  downstreamEndpoint,
-                  downstreamUa,
-                  routeModel: candidate.model,
-                  routeEndpoint: route.endpoint,
-                  routeUa: grokRouteUa,
-                  status: "success"
-                })
-              });
-              markTemporaryAccountAttempt(candidate, upstream.status);
-              markCandidateSuccess(route, candidate);
-              response.writeHead(upstream.status, {
-                "Content-Type": adapted.contentType || "application/json; charset=utf-8",
-                "Access-Control-Allow-Origin": "*"
-              });
-              response.end(adapted.text);
-              return;
-            }
-
-            const errorMessage = grokFailureMessage(upstream.status, text, contentType, grokAccount);
-            markTemporaryAccountAttempt(candidate, upstream.status, errorMessage);
-            errors.push(`Grok Web：${upstream.status} ${errorMessage}`);
-            upstreamAttempts.push({
-              addressLabel: "Grok Web",
-              upstreamUrl: GROK_CONVERSATIONS_NEW_URL,
-              method: "POST",
-              model: candidate.model,
-              endpoint: "chat/completions",
-              userAgent: grokRouteUa,
-              requestHeaders: grokUpstreamRequestHeaders,
-              requestBody: grokForwardedBody,
-              status: "failed",
-              statusCode: upstream.status,
-              durationMs: Date.now() - attemptStartedAt,
-              contentType,
-              responsePreview: responsePreview(text),
-              errorMessage
-            });
-            lastFailure = {
-              address: candidate.addresses[0],
-              target: GROK_CONVERSATIONS_NEW_URL,
-              statusCode: upstream.status,
-              text,
-              contentType
-            };
-          } catch (error) {
-            if (clientAbort.signal.aborted || (error as { name?: string } | undefined)?.name === "AbortError") throw error;
-            const errorMessage = error instanceof Error ? error.message : "请求 Grok Web 上游失败";
-            markTemporaryAccountAttempt(candidate, 599, errorMessage);
-            errors.push(`Grok Web：${errorMessage}`);
-            upstreamAttempts.push({
-              addressLabel: "Grok Web",
-              upstreamUrl: GROK_CONVERSATIONS_NEW_URL,
-              method: "POST",
-              model: candidate.model,
-              endpoint: "chat/completions",
-              userAgent: grokRouteUa,
-              requestHeaders: grokUpstreamRequestHeaders,
-              requestBody: grokForwardedBody,
-              status: "failed",
-              statusCode: 599,
-              durationMs: Date.now() - attemptStartedAt,
-              responsePreview: responsePreview(JSON.stringify({ error: errorMessage })),
-              errorMessage
-            });
-          }
-          continue;
-        }
 
         if (candidate.temporaryAccount) {
           const codexHeaders = codexTemporaryHeaders(candidate.temporaryAccount, headers, true);
@@ -594,7 +474,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                           requestBody: codexForwardedBody,
                           converter: convertedForCodex.converter
                         })
-                      : await streamRawResponse({ upstreamBody: upstream.body, response });
+                      : await streamRawResponse({ upstreamBody: upstream.body, response, proxyKind: proxyInfo.kind });
                   response.end();
                   upstreamAttempts.push({
                     addressLabel: "Codex Backend",
@@ -830,8 +710,8 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
           continue;
         }
 
-        for (const address of candidate.addresses) {
-        for (const target of proxyEndpointCandidates(address.baseUrl, route.endpoint)) {
+        for (const address of executionAddresses) {
+        for (const target of proxyEndpointCandidates(address.baseUrl, executionEndpoint)) {
           const attemptStartedAt = Date.now();
           try {
             const { response: upstream, proxy: attemptProxy } = await fetchWithRouteProxy(target, {
@@ -893,12 +773,12 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                           upstreamBody: upstream.body,
                           response,
                           proxyKind: proxyInfo.kind,
-                          routeEndpoint: route.endpoint,
+                          routeEndpoint: executionEndpoint,
                           routeModel: candidate.model,
                           requestBody: forwardedBody,
                           converter: responseConverter
                         })
-                      : await streamRawResponse({ upstreamBody: upstream.body, response });
+                      : await streamRawResponse({ upstreamBody: upstream.body, response, proxyKind: proxyInfo.kind });
                   response.end();
                   upstreamAttempts.push({
                     addressLabel: address.label,
