@@ -1135,6 +1135,7 @@ export default function App() {
                 onSubmit={saveSite}
                 onClose={() => setSiteEditorOpen(false)}
                 onEdit={openEditSite}
+                onToggle={(id, enabled) => mutate(async () => api.saveSite({ id, enabled }), enabled ? "站点已启用" : "站点已停用")}
                 onDelete={(id) => mutate(async () => api.deleteSite(id), "站点已删除")}
               />
             )}
@@ -1245,6 +1246,7 @@ export default function App() {
                 onCloseLog={closeLogDetail}
                 onDelete={deleteLog}
                 onClear={clearLogs}
+                onCopy={copyText}
               />
             )}
             {section === "settings" && (

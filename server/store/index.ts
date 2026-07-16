@@ -225,6 +225,7 @@ export class JsonStore {
       id: `site-${randomUUID()}`,
       name: "OpenAI",
       siteType: "unknown",
+      enabled: true,
       addresses: [
         {
           id: `addr-${randomUUID()}`,
@@ -267,6 +268,7 @@ export class JsonStore {
       id: `site-${randomUUID()}`,
       name: "Grok",
       siteType: "unknown",
+      enabled: true,
       addresses: [
         {
           id: `addr-${randomUUID()}`,
@@ -549,20 +551,24 @@ export class JsonStore {
 
   upsertSite(input: Partial<Site>) {
     const timestamp = now();
-    const addresses = (input.addresses || []).map((address) => this.normalizeAddress(address));
-    if (!input.name?.trim()) {
+    const current = input.id ? this.db.sites.find((site) => site.id === input.id) : undefined;
+    if (input.id && !current) throw new Error("站点不存在");
+    const name = input.name ?? current?.name ?? "";
+    const siteType = input.siteType ?? current?.siteType;
+    const addressesInput = input.addresses ?? current?.addresses ?? [];
+    const addresses = addressesInput.map((address) => this.normalizeAddress(address));
+    if (!name.trim()) {
       throw new Error("站点名称不能为空");
     }
     if (addresses.length === 0) {
       throw new Error("至少需要一个地址");
     }
 
-    if (input.id) {
-      const current = this.db.sites.find((site) => site.id === input.id);
-      if (!current) throw new Error("站点不存在");
+    if (current) {
       Object.assign(current, {
-        name: input.name.trim(),
-        siteType: normalizeSiteType(input.siteType),
+        name: name.trim(),
+        siteType: normalizeSiteType(siteType),
+        enabled: input.enabled ?? current.enabled ?? true,
         addresses,
         updatedAt: timestamp
       });
@@ -572,8 +578,9 @@ export class JsonStore {
 
     const created: Site = {
       id: `site-${randomUUID()}`,
-      name: input.name.trim(),
-      siteType: normalizeSiteType(input.siteType),
+      name: name.trim(),
+      siteType: normalizeSiteType(siteType),
+      enabled: input.enabled ?? true,
       addresses,
       createdAt: timestamp,
       updatedAt: timestamp
@@ -828,10 +835,10 @@ export class JsonStore {
     const current = input.id ? this.db.routes.find((route) => route.id === input.id) : undefined;
     const currentGroup = current?.type === "group" ? current : undefined;
     const strategy = normalizeGroupStrategy(input.strategy ?? currentGroup?.strategy);
-    const matchRule = normalizeMatchRule(input.matchRule ?? currentGroup?.matchRule ?? input.modelGroupId ?? input.name);
+    const matchRule = normalizeMatchRule(input.matchRule ?? currentGroup?.matchRule ?? "");
     const members = this.normalizeGroupRouteMembers(
       input.members ?? currentGroup?.members ?? [],
-      input.modelGroupId ?? currentGroup?.modelGroupId
+      matchRule ? input.modelGroupId ?? currentGroup?.modelGroupId : undefined
     );
     if (members.length === 0) throw new Error("请至少选择一个组内模型");
 
@@ -887,7 +894,7 @@ export class JsonStore {
       throw new Error("切换型路由不存在或已停用");
     }
     const site = this.db.sites.find((item) => item.id === route.siteId);
-    const addresses = site?.addresses.filter((address) => address.enabled) || [];
+    const addresses = site?.enabled === false ? [] : site?.addresses.filter((address) => address.enabled) || [];
     if (!site || addresses.length === 0) throw new Error("路由绑定的供应商地址不可用");
     const headerTemplate = route.headerTemplateId
       ? this.db.headerTemplates.find((item) => item.id === route.headerTemplateId)
@@ -929,8 +936,9 @@ export class JsonStore {
   private refreshGroupRouteMembers() {
     this.db.routes = this.db.routes.map((route) => {
       if (route.type !== "group") return route;
-      const matchRule = normalizeMatchRule(route.matchRule || route.modelGroupId || route.name);
-      const members = this.normalizeGroupRouteMembers(route.members || [], route.modelGroupId);
+      const matchRule = normalizeMatchRule(route.matchRule || "");
+      if (!matchRule) return route;
+      const members = this.normalizeGroupRouteMembers(route.members || [], matchRule ? route.modelGroupId : undefined);
       const oldKeys = (route.members || []).map(groupMemberKey).sort().join("\n");
       const newKeys = members.map(groupMemberKey).sort().join("\n");
       if (matchRule === route.matchRule && oldKeys === newKeys) return route;
@@ -966,7 +974,7 @@ export class JsonStore {
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS auth (id INTEGER PRIMARY KEY CHECK (id = 1), admin_password_hash TEXT);
-      CREATE TABLE IF NOT EXISTS sites (id TEXT PRIMARY KEY, name TEXT NOT NULL, site_type TEXT NOT NULL, addresses_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS sites (id TEXT PRIMARY KEY, name TEXT NOT NULL, site_type TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, addresses_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, prefix TEXT NOT NULL, key_hash TEXT NOT NULL, plain_text_key TEXT, enabled INTEGER NOT NULL, models_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_used_at TEXT);
       CREATE TABLE IF NOT EXISTS provider_api_key_groups (id TEXT PRIMARY KEY, site_id TEXT NOT NULL, group_name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS provider_api_keys (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'api-key', enabled INTEGER NOT NULL, models_json TEXT NOT NULL, last_checked_at TEXT, FOREIGN KEY (group_id) REFERENCES provider_api_key_groups(id) ON DELETE CASCADE);
@@ -985,6 +993,7 @@ export class JsonStore {
     this.ensureSqliteColumn("temporary_accounts", "provider_type", "TEXT");
     this.ensureSqliteColumn("provider_api_keys", "kind", "TEXT NOT NULL DEFAULT 'api-key'");
     this.ensureSqliteColumn("api_keys", "models_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureSqliteColumn("sites", "enabled", "INTEGER NOT NULL DEFAULT 1");
   }
 
   private ensureSqliteColumn(table: string, column: string, definition: string) {
@@ -1016,7 +1025,7 @@ export class JsonStore {
     this.requestLogs = this.loadRequestLogs(settings.maxRequestLogs, legacyRequestLogs);
     const legacyTemporaryAccountGroups = parsed.temporaryAccountGroups || [];
     return {
-      sites: (parsed.sites || []).map((site) => ({ ...site, siteType: normalizeSiteType(site.siteType) })),
+      sites: (parsed.sites || []).map((site) => ({ ...site, enabled: site.enabled ?? true, siteType: normalizeSiteType(site.siteType) })),
       apiKeys: (parsed.apiKeys || []).map((key) => ({ ...key, models: normalizeModelList(key.models) })),
       providerApiKeyGroups: parsed.providerApiKeyGroups || [],
       temporaryAccountGroups: this.loadTemporaryAccountGroups(legacyTemporaryAccountGroups),
@@ -1035,6 +1044,7 @@ export class JsonStore {
       id: String(row.id),
       name: String(row.name),
       siteType: normalizeSiteType(row.site_type),
+      enabled: row.enabled == null ? true : Boolean(row.enabled),
       addresses: JSON.parse(String(row.addresses_json)) as SiteAddress[],
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at)
@@ -1168,8 +1178,8 @@ export class JsonStore {
     const insertSetting = this.sqlite.prepare("INSERT INTO settings (key, value) VALUES (?, ?)");
     for (const [key, value] of Object.entries(db.settings)) insertSetting.run(key, JSON.stringify(value));
     this.sqlite.prepare("INSERT INTO auth (id, admin_password_hash) VALUES (1, ?)").run(db.adminPasswordHash || null);
-    const insertSite = this.sqlite.prepare("INSERT INTO sites (id, name, site_type, addresses_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)");
-    for (const site of db.sites) insertSite.run(site.id, site.name, site.siteType, JSON.stringify(site.addresses), site.createdAt, site.updatedAt);
+    const insertSite = this.sqlite.prepare("INSERT INTO sites (id, name, site_type, enabled, addresses_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+    for (const site of db.sites) insertSite.run(site.id, site.name, site.siteType, site.enabled === false ? 0 : 1, JSON.stringify(site.addresses), site.createdAt, site.updatedAt);
     const insertApiKey = this.sqlite.prepare("INSERT INTO api_keys (id, name, prefix, key_hash, plain_text_key, enabled, models_json, created_at, updated_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     for (const key of db.apiKeys) insertApiKey.run(key.id, key.name, key.prefix, key.keyHash, key.plainTextKey || null, key.enabled ? 1 : 0, JSON.stringify(key.models || []), key.createdAt, key.updatedAt, key.lastUsedAt || null);
     const insertProviderGroup = this.sqlite.prepare("INSERT INTO provider_api_key_groups (id, site_id, group_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");

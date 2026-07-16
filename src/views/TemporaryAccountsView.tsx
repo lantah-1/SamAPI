@@ -172,15 +172,13 @@ export function TemporaryAccountsView(props: {
           </ActionButton>
         </div>
       ) : groups.length === 0 ? (
-        <section className="panel p-4">
-          <div className="center-empty center-empty-stack temp-account-empty-state">
-            <div className="temp-account-empty-mark"><Upload className="h-5 w-5" /></div>
-            <div>
-              <div className="center-empty-title">暂无临时账号</div>
-              <div className="center-empty-description">导入 GPT、Grok、Claude 或 Gemini 账号后，这里会展示可用状态和额度信息。</div>
-            </div>
+        <div className="center-empty center-empty-stack temp-account-empty-state">
+          <div className="temp-account-empty-mark"><Upload className="h-5 w-5" /></div>
+          <div>
+            <div className="center-empty-title">暂无临时账号</div>
+            <div className="center-empty-description">导入 GPT、Grok、Claude 或 Gemini 账号后，这里会展示可用状态和额度信息。</div>
           </div>
-        </section>
+        </div>
       ) : (
         <section className="temp-account-panel panel p-4">
           <div className="form-head temp-account-head">
@@ -430,4 +428,3 @@ export function TemporaryAccountsView(props: {
     </>
   );
 }
-

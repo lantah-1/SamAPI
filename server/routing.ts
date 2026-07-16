@@ -76,6 +76,7 @@ export function createRouting(store: JsonStore) {
 
 
   function enabledSiteAddresses(site: Site) {
+    if (site.enabled === false) return [];
     return site.addresses.filter((address) => address.enabled);
   }
 

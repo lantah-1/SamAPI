@@ -116,6 +116,7 @@ export function LogsView(props: {
   onCloseLog: () => void;
   onDelete: (id: string) => void;
   onClear: () => void;
+  onCopy: (value: string) => void;
 }) {
   const logs = props.snapshot.requestLogs;
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
@@ -166,7 +167,7 @@ export function LogsView(props: {
         <>
           <div className="site-list log-table">
             {logs.map((log) => (
-              <LogSummaryRow key={log.id} log={log} selected={props.selectedLogId === log.id} onOpen={props.onOpenLog} />
+              <LogSummaryRow key={log.id} log={log} selected={props.selectedLogId === log.id} onOpen={props.onOpenLog} onCopy={props.onCopy} />
             ))}
           </div>
           <div ref={loadMoreRef} className="logs-load-more">
@@ -184,37 +185,51 @@ function logStatusLabel(status: RequestLogSummary["status"]) {
   return "失败";
 }
 
-function LogSummaryRow(props: { log: RequestLogSummary; selected: boolean; onOpen: (id: string) => void }) {
+function LogSummaryRow(props: { log: RequestLogSummary; selected: boolean; onOpen: (id: string) => void; onCopy: (value: string) => void }) {
   const { log } = props;
   const downstream = log.downstream;
   const routeTarget = log.routeTarget;
+  const downstreamPath = downstream.path || downstream.endpoint || "-";
+  const targetProvider = routeTarget.providerName || log.providerName || "-";
+  const proxyLabel = log.proxy ? routeProxyModeLabels[log.proxy.mode] : "直连";
   return (
     <article className={`log-row ${props.selected ? "log-row-selected" : ""}`}>
+      <button type="button" className="log-copy-id" title={`复制日志 ID: ${log.id}`} aria-label="复制日志 ID" onClick={() => props.onCopy(log.id)}>
+        <Copy className="h-4 w-4" />
+      </button>
       <button type="button" className="log-summary log-summary-card" onClick={() => props.onOpen(log.id)}>
-        <span className="grid h-9 w-9 place-items-center rounded-lg bg-white/75 text-ink">
-          <ChevronRight className="h-4 w-4" />
-        </span>
-        <span className="log-summary-grid min-w-0">
-          <span className="log-summary-section">
+        <span className="log-flow-cell">
+          <span className="log-flow-block">
             <span className="summary-node-label">下游请求</span>
-            <span className="record-title block">{downstream.model || log.routeName || "-"}</span>
-            <span className="record-meta block">{downstream.endpoint || downstream.path || "-"}</span>
-            <span className="record-meta block">{downstream.userAgent || "unknown ua"}</span>
+            <span className="log-main-value" title={downstream.model || log.routeName || "-"}>
+              {downstream.model || log.routeName || "-"}
+            </span>
+            <span className="log-sub-value" title={downstreamPath}>
+              {downstreamPath}
+            </span>
           </span>
-          <span className="log-summary-section">
+          <ChevronRight className="log-flow-arrow" />
+          <span className="log-flow-block">
             <span className="summary-node-label">转发目标</span>
-            <span className="record-title block">{routeTarget.model || log.model || "-"}</span>
-            <span className="record-meta block">供应商：{routeTarget.providerName || log.providerName || "-"}</span>
-            <span className="record-meta block">请求头：{log.headerTemplateName || "未使用"}</span>
-            <span className="record-meta block">代理：{log.proxy ? routeProxyModeLabels[log.proxy.mode] : "直连"}</span>
+            <span className="log-main-value" title={routeTarget.model || log.model || "-"}>
+              {routeTarget.model || log.model || "-"}
+            </span>
+            <span className="log-sub-value" title={targetProvider}>
+              {targetProvider}
+            </span>
           </span>
         </span>
-        <span className={`status-badge status-${log.status}`}>{logStatusLabel(log.status)}</span>
-        <span className="hidden text-right text-xs font-bold text-ink/55 md:block">
-          <span className="block font-mono text-[10px] text-ink/45">ID: {log.id}</span>
-          {formatTime(log.createdAt)}
-          <br />
-          {log.statusCode} / {log.durationMs}ms
+        <span className="log-route-meta">
+          <span className="log-meta-pill" title={log.headerTemplateName || "未使用"}>
+            请求头: {log.headerTemplateName || "未使用"}
+          </span>
+          <span className="log-meta-pill" title={proxyLabel}>
+            代理: {proxyLabel}
+          </span>
+        </span>
+        <span className="log-state-cell">
+          <span className={`status-badge status-${log.status}`}>{logStatusLabel(log.status)}</span>
+          <span className="log-time-value">{formatTime(log.createdAt)}</span>
         </span>
       </button>
     </article>
@@ -229,7 +244,14 @@ export function LogDetailModal(props: { log: RequestLog | null; loading: boolean
         <div className="form-head">
           <div>
             <h2>日志详情</h2>
-            <div className="mt-1 text-xs font-bold text-ink/55">{log ? `${log.routeName} / ${formatTime(log.createdAt)}` : "正在获取完整日志"}</div>
+            {log ? (
+              <div className="log-detail-heading-meta">
+                <div className="log-detail-id" title={log.id}>ID: {log.id}</div>
+                <div className="mt-1 text-xs font-bold text-ink/55">{log.routeName} / {formatTime(log.createdAt)}</div>
+              </div>
+            ) : (
+              <div className="mt-1 text-xs font-bold text-ink/55">正在获取完整日志</div>
+            )}
           </div>
           <ActionButton type="button" tone="ghost" onClick={props.onClose} title="关闭">
             <X className="h-4 w-4" />
@@ -242,28 +264,10 @@ export function LogDetailModal(props: { log: RequestLog | null; loading: boolean
             <>
               <div className="detail-grid">
               <LogSummaryDetail log={log} />
-              <DetailBlock
-                title="下游请求"
-                value={{
-                  ...(log.downstream || { model: log.routeName, endpoint: log.path, userAgent: log.userAgent }),
-                  method: log.method,
-                  path: log.path,
-                  clientIp: log.clientIp
-                }}
-              />
+              <DownstreamHeadersDetail log={log} />
               <DetailBlock title="下游 Body" value={log.requestBody} />
-              <DetailBlock title="下游请求头" value={log.requestHeaders} />
-              <DetailBlock
-                title="路由目标"
-                value={{
-                  ...(log.routeTarget || { routeName: log.routeName, model: log.model, endpoint: log.endpoint, providerName: log.providerName }),
-                  routeId: log.routeId,
-                  upstreamUrl: log.upstreamUrl
-                }}
-              />
-              <DetailBlock title="代理" value={log.proxy || { mode: "direct" }} />
-              <DetailBlock title="上游尝试" value={upstreamAttemptsSummary(log)} />
-              <DetailBlock title="上游请求 Body" value={upstreamRequestBodies(log)} />
+              <ForwardingTargetDetail log={log} />
+              <UpstreamRequestDetail log={log} />
               <DetailBlock
                 title="上游返回"
                 value={{
@@ -567,6 +571,50 @@ function DetailBlock(props: { title: string; value: unknown }) {
       <pre>{prettyJson(props.value)}</pre>
     </div>
   );
+}
+
+function SectionedDetailBlock(props: { title: string; summary: unknown; detail: unknown }) {
+  return (
+    <div className="detail-block detail-wide sectioned-detail">
+      <div className="detail-title">{props.title}</div>
+      <section className="detail-section">
+        <div className="detail-section-title">总结</div>
+        <pre>{prettyJson(props.summary)}</pre>
+      </section>
+      <section className="detail-section">
+        <div className="detail-section-title">详细</div>
+        <pre>{prettyJson(props.detail)}</pre>
+      </section>
+    </div>
+  );
+}
+
+function DownstreamHeadersDetail(props: { log: RequestLog }) {
+  const log = props.log;
+  const summary = {
+    ...(log.downstream || { model: log.routeName, endpoint: log.path, userAgent: log.userAgent }),
+    method: log.method,
+    path: log.path,
+    clientIp: log.clientIp
+  };
+
+  return <SectionedDetailBlock title="下游请求头" summary={summary} detail={log.requestHeaders} />;
+}
+
+function ForwardingTargetDetail(props: { log: RequestLog }) {
+  const log = props.log;
+  const summary = {
+    ...(log.routeTarget || { routeName: log.routeName, model: log.model, endpoint: log.endpoint, providerName: log.providerName }),
+    routeId: log.routeId,
+    upstreamUrl: log.upstreamUrl
+  };
+
+  return <SectionedDetailBlock title="转发目标" summary={summary} detail={log.proxy || { mode: "direct" }} />;
+}
+
+function UpstreamRequestDetail(props: { log: RequestLog }) {
+  const log = props.log;
+  return <SectionedDetailBlock title="上游请求" summary={upstreamAttemptsSummary(log)} detail={upstreamRequestBodies(log)} />;
 }
 
 function UsageCopyRow(props: { label: string; value: string; note: string; onCopy: (value: string) => void }) {

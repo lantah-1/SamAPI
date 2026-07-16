@@ -2,13 +2,14 @@ import {
   Braces,
   Check,
   ChevronDown,
-  ChevronRight,
   ChevronUp,
   Copy,
   Database,
+  GripVertical,
   KeyRound,
   LockKeyhole,
   Map,
+  MoreHorizontal,
   Pencil,
   Plus,
   RefreshCw,
@@ -19,8 +20,9 @@ import {
   Wand2,
   X
 } from "lucide-react";
+import * as Popover from "@radix-ui/react-popover";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { FormEvent } from "react";
+import type { DragEvent as ReactDragEvent, FormEvent, PointerEvent as ReactPointerEvent } from "react";
 import type {
   AppSettings,
   AppSnapshot,
@@ -102,6 +104,108 @@ import {
 } from "../app/utils";
 import { ActionButton, SelectInput, TextInput } from "../components/ui";
 
+type ActionDropTarget = {
+  index: number;
+  edge: "before" | "after";
+};
+
+function priorityInsertionIndex(fromIndex: number, target: ActionDropTarget) {
+  let toIndex = target.index + (target.edge === "after" ? 1 : 0);
+  if (fromIndex < toIndex) toIndex -= 1;
+  return toIndex;
+}
+
+function priorityDropTargetForElement(element: HTMLElement, clientY: number): ActionDropTarget {
+  const index = Number(element.dataset.groupPriorityIndex);
+  const rect = element.getBoundingClientRect();
+  return {
+    index,
+    edge: clientY < rect.top + rect.height / 2 ? "before" : "after"
+  };
+}
+
+function priorityDropTargetAtPoint(clientX: number, clientY: number) {
+  const element = document.elementFromPoint(clientX, clientY)?.closest<HTMLElement>("[data-group-priority-index]");
+  return element ? priorityDropTargetForElement(element, clientY) : null;
+}
+
+function createPriorityDragPreview(item: HTMLElement) {
+  const rect = item.getBoundingClientRect();
+  const preview = item.cloneNode(true) as HTMLElement;
+  preview.classList.remove("group-priority-item-dragging", "group-priority-item-drop-before", "group-priority-item-drop-after");
+  preview.classList.add("group-priority-drag-preview");
+  preview.removeAttribute("data-group-priority-index");
+  preview.style.width = `${rect.width}px`;
+  preview.style.left = `${rect.left}px`;
+  preview.style.top = `${rect.top}px`;
+  document.body.appendChild(preview);
+  return { preview, rect };
+}
+
+function configureNativePriorityDrag(event: ReactDragEvent<HTMLButtonElement>, itemKey: string) {
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", itemKey);
+  const item = event.currentTarget.closest<HTMLElement>("[data-group-priority-index]");
+  if (!item) return;
+  const { preview, rect } = createPriorityDragPreview(item);
+  event.dataTransfer.setDragImage(
+    preview,
+    Math.max(0, event.clientX - rect.left),
+    Math.max(0, event.clientY - rect.top)
+  );
+  window.setTimeout(() => preview.remove(), 0);
+}
+
+function beginPointerPriorityDrag(
+  event: ReactPointerEvent<HTMLButtonElement>,
+  index: number,
+  handlers: {
+    onStart: (index: number) => void;
+    onTargetChange: (target: ActionDropTarget | null) => void;
+    onDrop: (target: ActionDropTarget | null) => void;
+    onCancel: () => void;
+  }
+) {
+  if (event.pointerType === "mouse") return;
+  const item = event.currentTarget.closest<HTMLElement>("[data-group-priority-index]");
+  if (!item) return;
+  event.preventDefault();
+  handlers.onStart(index);
+  const { preview, rect } = createPriorityDragPreview(item);
+  const pointerOffsetX = event.clientX - rect.left;
+  const pointerOffsetY = event.clientY - rect.top;
+  const pointerId = event.pointerId;
+  let finishPointerDrag: (upEvent: PointerEvent) => void;
+  let cancelPointerDrag: (cancelEvent: PointerEvent) => void;
+  const movePointerDrag = (moveEvent: PointerEvent) => {
+    if (moveEvent.pointerId !== pointerId) return;
+    moveEvent.preventDefault();
+    preview.style.left = `${moveEvent.clientX - pointerOffsetX}px`;
+    preview.style.top = `${moveEvent.clientY - pointerOffsetY}px`;
+    handlers.onTargetChange(priorityDropTargetAtPoint(moveEvent.clientX, moveEvent.clientY));
+  };
+  const cleanupPointerDrag = () => {
+    preview.remove();
+    window.removeEventListener("pointermove", movePointerDrag);
+    window.removeEventListener("pointerup", finishPointerDrag);
+    window.removeEventListener("pointercancel", cancelPointerDrag);
+  };
+  finishPointerDrag = (upEvent) => {
+    if (upEvent.pointerId !== pointerId) return;
+    const target = priorityDropTargetAtPoint(upEvent.clientX, upEvent.clientY);
+    cleanupPointerDrag();
+    handlers.onDrop(target);
+  };
+  cancelPointerDrag = (cancelEvent) => {
+    if (cancelEvent.pointerId !== pointerId) return;
+    cleanupPointerDrag();
+    handlers.onCancel();
+  };
+  window.addEventListener("pointermove", movePointerDrag, { passive: false });
+  window.addEventListener("pointerup", finishPointerDrag);
+  window.addEventListener("pointercancel", cancelPointerDrag);
+}
+
 export function RoutesView(props: {
   snapshot: AppSnapshot;
   draft: RouteDraft;
@@ -114,7 +218,7 @@ export function RoutesView(props: {
   onClose: () => void;
   onDelete: (id: string) => void;
   onEdit: (route: RouteRecord) => void;
-  onQuickSave: (route: Partial<SwitchRoute>) => Promise<void>;
+  onQuickSave: (route: Partial<RouteRecord>) => Promise<void>;
   onCopy: (value: string) => void;
 }) {
   const switchRoutes = props.snapshot.routes.filter((route): route is SwitchRoute => route.type === "switch");
@@ -123,9 +227,20 @@ export function RoutesView(props: {
   const modelOptions = providerModelOptions(props.snapshot);
   const enabledModelOptions = modelOptions.filter((option) => option.enabled);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [quickDrafts, setQuickDrafts] = useState<Record<string, Partial<SwitchRoute>>>({});
-  const routeDraft = (route: SwitchRoute) => ({ ...route, ...(quickDrafts[route.id] || {}) });
-  const updateRouteDraft = (route: SwitchRoute, patch: Partial<SwitchRoute>) => {
+  const [quickDrafts, setQuickDrafts] = useState<Record<string, Partial<RouteRecord>>>({});
+  const [groupModelSearch, setGroupModelSearch] = useState("");
+  const [draftDragIndex, setDraftDragIndex] = useState<number | null>(null);
+  const [draftDropTarget, setDraftDropTarget] = useState<ActionDropTarget | null>(null);
+  const [activeRouteMenuId, setActiveRouteMenuId] = useState<string | null>(null);
+  const [routeActionEditor, setRouteActionEditor] = useState<{ routeId: string; mode: "strategy" | "proxy" } | null>(null);
+  const [actionDragIndex, setActionDragIndex] = useState<number | null>(null);
+  const [actionDropTarget, setActionDropTarget] = useState<ActionDropTarget | null>(null);
+  const draftDragIndexRef = useRef<number | null>(null);
+  const draftDropTargetRef = useRef<ActionDropTarget | null>(null);
+  const actionDragIndexRef = useRef<number | null>(null);
+  const actionDropTargetRef = useRef<ActionDropTarget | null>(null);
+  const routeDraft = <T extends RouteRecord>(route: T): T => ({ ...route, ...(quickDrafts[route.id] || {}) } as T);
+  const updateRouteDraft = <T extends RouteRecord>(route: T, patch: Partial<T>) => {
     setQuickDrafts((current) => ({
       ...current,
       [route.id]: {
@@ -142,14 +257,14 @@ export function RoutesView(props: {
       model: models[0] || ""
     });
   };
-  const updateRouteProxy = (route: SwitchRoute, mode: RouteProxyConfig["mode"]) => {
+  const updateRouteProxy = (route: RouteRecord, mode: RouteProxyConfig["mode"]) => {
     const currentProxy = routeDraft(route).proxy;
     const customUrl = currentProxy?.mode === "custom" ? currentProxy.url : route.proxy?.mode === "custom" ? route.proxy.url : currentProxy?.url;
     updateRouteDraft(route, {
       proxy: mode === "custom" ? { mode, url: customUrl } : { mode }
     });
   };
-  const saveQuickRoute = async (route: SwitchRoute) => {
+  const saveQuickRoute = async (route: RouteRecord) => {
     const next = routeDraft(route);
     await props.onQuickSave(next);
     setQuickDrafts((current) => {
@@ -157,7 +272,7 @@ export function RoutesView(props: {
       return rest;
     });
   };
-  const toggleRouteEnabled = async (route: SwitchRoute) => {
+  const toggleRouteEnabled = async (route: RouteRecord) => {
     const enabled = !route.enabled;
     await props.onQuickSave({ ...route, enabled });
     setQuickDrafts((current) => {
@@ -166,6 +281,9 @@ export function RoutesView(props: {
     });
   };
   const draftType = props.draft.type || "switch";
+  useEffect(() => {
+    if (!props.editorOpen || draftType !== "group") setGroupModelSearch("");
+  }, [props.editorOpen, draftType]);
   const changeDraftType = (type: RouteType) => {
     if (type === draftType) return;
     const next = emptyRoute(props.snapshot, type);
@@ -182,13 +300,22 @@ export function RoutesView(props: {
   const draftMembers = props.draft.members || [];
   const selectedGroupKeys = new Set(draftMembers.map(groupMemberKey));
   const selectedAvailableCount = modelOptions.filter((option) => selectedGroupKeys.has(groupMemberKey(option))).length;
+  const groupModelSearchText = groupModelSearch.trim();
+  const visibleModelOptions = groupModelSearchText
+    ? modelOptions.filter(
+        (option) =>
+          smartModelMatches(option.model, groupModelSearchText) ||
+          smartModelMatches(option.siteName, groupModelSearchText) ||
+          smartModelMatches(option.apiKeyLabel, groupModelSearchText)
+      )
+    : modelOptions;
   const groupedModelOptions = props.snapshot.providerApiKeyGroups
     .map((group) => {
       const site = props.snapshot.sites.find((item) => item.id === group.siteId);
       const apiKeys = group.apiKeys
         .map((apiKey) => ({
           apiKey,
-          options: modelOptions.filter((option) => option.siteId === group.siteId && option.apiKeyId === apiKey.id)
+          options: visibleModelOptions.filter((option) => option.siteId === group.siteId && option.apiKeyId === apiKey.id)
         }))
         .filter((item) => item.options.length > 0);
       return {
@@ -206,14 +333,16 @@ export function RoutesView(props: {
     updateGroupMembers(checked ? [...draftMembers, optionToMember(option)] : draftMembers.filter((member) => groupMemberKey(member) !== optionKey));
   };
   const applyRuleSelection = () => {
-    const rule = (props.draft.matchRule || props.draft.name || "").trim();
+    const rule = (props.draft.matchRule || "").trim();
+    if (!rule) return;
     const matched = enabledModelOptions.filter((option) => modelMatchesRule(option.model, rule)).map(optionToMember);
     props.onDraft({ ...props.draft, type: "group", matchRule: rule, members: uniqueMembers([...draftMembers, ...matched]) });
   };
   const applySmartSelection = () => {
-    const query = (props.draft.matchRule || props.draft.name || "").trim();
+    const query = (props.draft.matchRule || "").trim();
+    if (!query) return;
     const matched = enabledModelOptions.filter((option) => smartModelMatches(option.model, query)).map(optionToMember);
-    props.onDraft({ ...props.draft, type: "group", matchRule: props.draft.matchRule || query, members: uniqueMembers([...draftMembers, ...matched]) });
+    props.onDraft({ ...props.draft, type: "group", matchRule: query, members: uniqueMembers([...draftMembers, ...matched]) });
   };
   const clearGroupSelection = () => updateGroupMembers([]);
   const moveGroupMember = (index: number, delta: number) => {
@@ -223,11 +352,97 @@ export function RoutesView(props: {
     [next[index], next[target]] = [next[target], next[index]];
     updateGroupMembers(next);
   };
+  const setDraftDragPosition = (index: number | null) => {
+    draftDragIndexRef.current = index;
+    setDraftDragIndex(index);
+  };
+  const setDraftDropPosition = (target: ActionDropTarget | null) => {
+    const current = draftDropTargetRef.current;
+    if (current?.index === target?.index && current?.edge === target?.edge) return;
+    draftDropTargetRef.current = target;
+    setDraftDropTarget(target);
+  };
+  const clearDraftDrag = () => {
+    setDraftDragPosition(null);
+    setDraftDropPosition(null);
+  };
+  const reorderDraftGroupMember = (fromIndex: number | null, target: ActionDropTarget | null) => {
+    if (fromIndex === null || !target) {
+      clearDraftDrag();
+      return;
+    }
+    const toIndex = priorityInsertionIndex(fromIndex, target);
+    if (fromIndex === toIndex) {
+      clearDraftDrag();
+      return;
+    }
+    const next = [...draftMembers];
+    const [moved] = next.splice(fromIndex, 1);
+    if (!moved) {
+      clearDraftDrag();
+      return;
+    }
+    next.splice(toIndex, 0, moved);
+    updateGroupMembers(next);
+    clearDraftDrag();
+  };
   const removeGroupMember = (index: number) => {
     updateGroupMembers(draftMembers.filter((_, position) => position !== index));
   };
   const memberOptionLookup = new globalThis.Map(modelOptions.map((option) => [groupMemberKey(option), option] as const));
   const canSaveRoute = draftType !== "group" || selectedAvailableCount > 0;
+  const actionRoute = routeActionEditor ? props.snapshot.routes.find((route) => route.id === routeActionEditor.routeId) : undefined;
+  const actionDraft = actionRoute ? routeDraft(actionRoute) : undefined;
+  const actionProxy = actionDraft ? normalizedRouteProxy(actionDraft.proxy) : { mode: "direct" as const };
+  const actionMembersChanged =
+    actionRoute?.type === "group" &&
+    actionDraft?.type === "group" &&
+    (actionRoute.members || []).map(groupMemberKey).join("\n") !== (actionDraft.members || []).map(groupMemberKey).join("\n");
+  const actionHasChanges = !routeActionEditor || !actionRoute || !actionDraft
+    ? false
+    : routeActionEditor.mode === "strategy"
+      ? actionRoute.type === "group" && ((actionDraft as GroupRoute).strategy !== actionRoute.strategy || actionMembersChanged)
+      : !routeProxyConfigsEqual(actionDraft.proxy, actionRoute.proxy);
+  const actionGroupMembers = actionRoute?.type === "group" && actionDraft?.type === "group" ? actionDraft.members || [] : [];
+  const moveActionGroupMember = (index: number, delta: number) => {
+    if (!actionRoute || actionRoute.type !== "group" || !actionDraft || actionDraft.type !== "group") return;
+    const next = [...actionGroupMembers];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    updateRouteDraft(actionRoute, { members: next });
+  };
+  const setActionDragPosition = (index: number | null) => {
+    actionDragIndexRef.current = index;
+    setActionDragIndex(index);
+  };
+  const setActionDropPosition = (target: ActionDropTarget | null) => {
+    const current = actionDropTargetRef.current;
+    if (current?.index === target?.index && current?.edge === target?.edge) return;
+    actionDropTargetRef.current = target;
+    setActionDropTarget(target);
+  };
+  const clearActionDrag = () => {
+    setActionDragPosition(null);
+    setActionDropPosition(null);
+  };
+  const reorderActionGroupMember = (fromIndex: number | null, target: ActionDropTarget | null) => {
+    if (fromIndex === null || !target || !actionRoute || actionRoute.type !== "group" || !actionDraft || actionDraft.type !== "group") {
+      clearActionDrag();
+      return;
+    }
+    const toIndex = priorityInsertionIndex(fromIndex, target);
+    if (fromIndex === toIndex) {
+      clearActionDrag();
+      return;
+    }
+    const next = [...actionGroupMembers];
+    const [moved] = next.splice(fromIndex, 1);
+    if (!moved) return;
+    next.splice(toIndex, 0, moved);
+    updateRouteDraft(actionRoute, { members: next });
+    clearActionDrag();
+  };
   return (
     <>
       {routeCount === 0 ? (
@@ -277,9 +492,6 @@ export function RoutesView(props: {
                   <div className="route-record-main">
                     <div className="min-w-0">
                       <div className="route-title-line">
-                        <span className="route-expand-indicator">
-                          {isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-                        </span>
                         <span className="record-title">{route.name}</span>
                       </div>
                       <div className="record-meta">
@@ -292,25 +504,16 @@ export function RoutesView(props: {
                     onClick={(event) => event.stopPropagation()}
                     onKeyDown={(event) => event.stopPropagation()}
                   >
-                    <ActionButton
-                      tone="ghost"
-                      className={`route-enable-action ${route.enabled ? "route-enable-action-on" : "route-enable-action-off"}`}
-                      aria-pressed={route.enabled}
-                      title={route.enabled ? "当前已启用，点击停用" : "当前已停用，点击启用"}
-                      onClick={() => toggleRouteEnabled(route)}
-                    >
-                      <span className="route-enable-dot" aria-hidden="true" />
-                      <span>{route.enabled ? "启用" : "停用"}</span>
-                    </ActionButton>
-                    <ActionButton tone="ghost" title="复制模型名" onClick={() => props.onCopy(route.name)}>
-                      <Copy className="h-4 w-4" />
-                    </ActionButton>
-                    <ActionButton tone="ghost" onClick={() => props.onEdit(route)} title="编辑">
-                      <Wand2 className="h-4 w-4" />
-                    </ActionButton>
-                    <ActionButton tone="danger" onClick={() => props.onDelete(route.id)} title="删除">
-                      <Trash2 className="h-4 w-4" />
-                    </ActionButton>
+                    <RouteActionMenu
+                      route={route}
+                      open={activeRouteMenuId === route.id}
+                      onOpenChange={(open) => setActiveRouteMenuId(open ? route.id : null)}
+                      onToggle={() => toggleRouteEnabled(route)}
+                      onCopy={() => props.onCopy(route.name)}
+                      onEdit={() => props.onEdit(route)}
+                      onDelete={() => props.onDelete(route.id)}
+                      onProxy={() => setRouteActionEditor({ routeId: route.id, mode: "proxy" })}
+                    />
                   </div>
                   {isOpen ? (
                     <div
@@ -324,8 +527,8 @@ export function RoutesView(props: {
                           <SelectInput value={quick.siteId || ""} onChange={(event) => updateRouteSite(route, event.target.value)}>
                             <option value="">选择供应商</option>
                             {props.snapshot.sites.map((siteOption) => (
-                              <option key={siteOption.id} value={siteOption.id}>
-                                {siteOption.name}
+                              <option key={siteOption.id} value={siteOption.id} disabled={siteOption.enabled === false}>
+                                {siteOption.name}{siteOption.enabled === false ? "（已停用）" : ""}
                               </option>
                             ))}
                           </SelectInput>
@@ -422,10 +625,8 @@ export function RoutesView(props: {
               {groupRoutes.map((route) => {
                 const stats = groupRouteStats(props.snapshot, route);
                 const memberGroups = groupRouteMemberGroups(props.snapshot, route);
-                const orderedMembers = route.strategy === "priority" ? groupRouteOrderedMembers(props.snapshot, route) : [];
-                const headerTemplate = route.headerTemplateId
-                  ? props.snapshot.headerTemplates.find((template) => template.id === route.headerTemplateId)
-                  : undefined;
+                const quick = routeDraft(route);
+                const orderedMembers = quick.strategy === "priority" ? groupRouteOrderedMembers(props.snapshot, quick) : [];
                 const isOpen = Boolean(expanded[route.id]);
                 const toggleRoute = () => setExpanded((current) => ({ ...current, [route.id]: !isOpen }));
                 return (
@@ -445,13 +646,10 @@ export function RoutesView(props: {
                     <div className="route-record-main">
                       <div className="min-w-0">
                         <div className="route-title-line">
-                          <span className="route-expand-indicator">
-                            {isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-                          </span>
                           <span className="record-title">{route.name}</span>
                         </div>
                         <div className="record-meta">
-                          关键词 {route.matchRule || "-"} / {groupStrategyLabels[route.strategy]} / {endpointLabels[route.endpoint]}
+                          关键词 {route.matchRule || "-"} / {groupStrategyLabels[quick.strategy]} / {endpointLabels[route.endpoint]}
                         </div>
                         <div className="mt-3 flex flex-wrap gap-2">
                           <span className="pill">{stats.providerCount} 个供应商</span>
@@ -459,16 +657,6 @@ export function RoutesView(props: {
                           <span className="pill">{stats.modelCount} 个模型</span>
                           <span className="pill">{route.enabled ? "已启用" : "已停用"}</span>
                         </div>
-                        {stats.models.length > 0 ? (
-                          <div className="mt-2 flex flex-wrap gap-2">
-                            {stats.models.slice(0, 6).map((model) => (
-                              <span key={model} className="pill pill-muted">
-                                {model}
-                              </span>
-                            ))}
-                            {stats.models.length > 6 ? <span className="pill pill-muted">+{stats.models.length - 6}</span> : null}
-                          </div>
-                        ) : null}
                       </div>
                     </div>
                     <div
@@ -476,15 +664,17 @@ export function RoutesView(props: {
                       onClick={(event) => event.stopPropagation()}
                       onKeyDown={(event) => event.stopPropagation()}
                     >
-                      <ActionButton tone="ghost" title="复制模型名" onClick={() => props.onCopy(route.name)}>
-                        <Copy className="h-4 w-4" />
-                      </ActionButton>
-                      <ActionButton tone="ghost" onClick={() => props.onEdit(route)} title="编辑">
-                        <Wand2 className="h-4 w-4" />
-                      </ActionButton>
-                      <ActionButton tone="danger" onClick={() => props.onDelete(route.id)} title="删除">
-                        <Trash2 className="h-4 w-4" />
-                      </ActionButton>
+                      <RouteActionMenu
+                        route={route}
+                        open={activeRouteMenuId === route.id}
+                        onOpenChange={(open) => setActiveRouteMenuId(open ? route.id : null)}
+                        onToggle={() => toggleRouteEnabled(route)}
+                        onCopy={() => props.onCopy(route.name)}
+                        onEdit={() => props.onEdit(route)}
+                        onDelete={() => props.onDelete(route.id)}
+                        onStrategy={() => setRouteActionEditor({ routeId: route.id, mode: "strategy" })}
+                        onProxy={() => setRouteActionEditor({ routeId: route.id, mode: "proxy" })}
+                      />
                     </div>
                     {isOpen ? (
                       <div
@@ -499,11 +689,11 @@ export function RoutesView(props: {
                           </div>
                           <div>
                             <span>调用策略</span>
-                            <strong>{groupStrategyLabels[route.strategy]}</strong>
+                            <strong>{groupStrategyLabels[quick.strategy]}</strong>
                           </div>
                           <div>
                             <span>请求头模板</span>
-                            <strong>{headerTemplate?.name || "不使用"}</strong>
+                            <strong>{props.snapshot.headerTemplates.find((template) => template.id === route.headerTemplateId)?.name || "不使用"}</strong>
                           </div>
                           <div>
                             <span>Endpoint</span>
@@ -519,7 +709,7 @@ export function RoutesView(props: {
                           </div>
                           {memberGroups.length === 0 ? (
                             <div className="group-route-empty">暂无可用组内模型</div>
-                          ) : route.strategy === "priority" ? (
+                          ) : quick.strategy === "priority" ? (
                             <ol className="group-route-priority-list">
                               {orderedMembers.map((member, index) => (
                                 <li key={member.key} className="group-route-priority-item">
@@ -568,6 +758,181 @@ export function RoutesView(props: {
         </div>
       )}
 
+      {routeActionEditor && actionRoute && actionDraft ? (
+        <div className="modal-backdrop" role="presentation">
+          <form
+            className="modal-panel route-action-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={routeActionEditor.mode === "strategy" ? "更改调用策略" : "切换代理"}
+            onSubmit={(event) => {
+              event.preventDefault();
+              saveQuickRoute(actionRoute).then(() => setRouteActionEditor(null));
+            }}
+          >
+            <div className="form-head route-action-modal-head">
+              <div>
+                <h2>{routeActionEditor.mode === "strategy" ? "更改调用策略" : "切换代理"}</h2>
+                <div className="mt-1 text-xs font-bold text-ink/55">{actionRoute.name}</div>
+              </div>
+              <ActionButton type="button" tone="ghost" onClick={() => setRouteActionEditor(null)} title="关闭">
+                <X className="h-4 w-4" />
+              </ActionButton>
+            </div>
+            <div className="route-action-modal-body">
+              {routeActionEditor.mode === "strategy" && actionRoute.type === "group" ? (
+                <>
+                  <label>
+                    调用策略
+                    <SelectInput
+                      value={(actionDraft as GroupRoute).strategy || "stable-first"}
+                      onChange={(event) => updateRouteDraft(actionRoute, { strategy: event.target.value as GroupRouteStrategy })}
+                    >
+                      <option value="stable-first">{groupStrategyLabels["stable-first"]}</option>
+                      <option value="sequential">{groupStrategyLabels.sequential}</option>
+                      <option value="random">{groupStrategyLabels.random}</option>
+                      <option value="priority">{groupStrategyLabels.priority}</option>
+                    </SelectInput>
+                  </label>
+                  {(actionDraft as GroupRoute).strategy === "priority" ? (
+                    <div className="route-action-priority">
+                      <div className="group-priority-head">
+                        <div>
+                          <strong>优先级顺序</strong>
+                          <span>按顺序调用，第 1 个优先</span>
+                        </div>
+                      </div>
+                      {actionGroupMembers.length === 0 ? (
+                        <div className="group-priority-empty">暂无组内模型</div>
+                      ) : (
+                        <ol
+                          className="group-priority-list"
+                          onDragLeave={(event) => {
+                            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setActionDropPosition(null);
+                          }}
+                        >
+                          {actionGroupMembers.map((member, index) => {
+                            const option = memberOptionLookup.get(groupMemberKey(member));
+                            const dropClass =
+                              actionDropTarget?.index === index ? `group-priority-item-drop-${actionDropTarget.edge}` : "";
+                            return (
+                              <li
+                                key={groupMemberKey(member)}
+                                className={`group-priority-item ${actionDragIndex === index ? "group-priority-item-dragging" : ""} ${dropClass}`}
+                                data-group-priority-index={index}
+                                onDragOver={(event) => {
+                                  event.preventDefault();
+                                  event.dataTransfer.dropEffect = "move";
+                                  setActionDropPosition(priorityDropTargetForElement(event.currentTarget, event.clientY));
+                                }}
+                                onDrop={(event) => {
+                                  event.preventDefault();
+                                  const target = priorityDropTargetForElement(event.currentTarget, event.clientY);
+                                  reorderActionGroupMember(actionDragIndexRef.current, target);
+                                }}
+                              >
+                                <button
+                                  type="button"
+                                  className="group-priority-drag-handle"
+                                  draggable
+                                  title="拖动排序"
+                                  aria-label="拖动排序"
+                                  onDragStart={(event) => {
+                                    setActionDragPosition(index);
+                                    configureNativePriorityDrag(event, groupMemberKey(member));
+                                  }}
+                                  onDragEnd={clearActionDrag}
+                                  onPointerDown={(event) =>
+                                    beginPointerPriorityDrag(event, index, {
+                                      onStart: setActionDragPosition,
+                                      onTargetChange: setActionDropPosition,
+                                      onDrop: (target) => reorderActionGroupMember(actionDragIndexRef.current, target),
+                                      onCancel: clearActionDrag
+                                    })
+                                  }
+                                >
+                                  <GripVertical className="h-4 w-4" />
+                                </button>
+                                <span className="group-priority-rank">{index + 1}</span>
+                                <div className="group-priority-info">
+                                  <strong>{option?.model || member.model}</strong>
+                                  <span>
+                                    {option?.siteName || member.siteId}
+                                    {option?.apiKeyLabel ? ` · ${option.apiKeyLabel}` : ""}
+                                    {option ? "" : "（已失效）"}
+                                  </span>
+                                </div>
+                                <div className="group-priority-actions">
+                                  <ActionButton type="button" tone="ghost" title="上移" disabled={index === 0} onClick={() => moveActionGroupMember(index, -1)}>
+                                    <ChevronUp className="h-4 w-4" />
+                                  </ActionButton>
+                                  <ActionButton
+                                    type="button"
+                                    tone="ghost"
+                                    title="下移"
+                                    disabled={index === actionGroupMembers.length - 1}
+                                    onClick={() => moveActionGroupMember(index, 1)}
+                                  >
+                                    <ChevronDown className="h-4 w-4" />
+                                  </ActionButton>
+                                </div>
+                              </li>
+                            );
+                          })}
+                        </ol>
+                      )}
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                <div className="form-grid">
+                  <label className="form-span-2">
+                    代理模式
+                    <SelectInput
+                      value={actionProxy.mode}
+                      onChange={(event) => updateRouteProxy(actionRoute, event.target.value as RouteProxyConfig["mode"])}
+                    >
+                      <option value="direct">{routeProxyModeLabels.direct}</option>
+                      <option value="system">{routeProxyModeLabels.system}</option>
+                      <option value="custom">{routeProxyModeLabels.custom}</option>
+                    </SelectInput>
+                  </label>
+                  {actionProxy.mode === "custom" ? (
+                    <label className="form-span-2">
+                      代理地址
+                      <TextInput
+                        value={actionProxy.url || ""}
+                        placeholder="http://127.0.0.1:7890"
+                        onChange={(event) => updateRouteDraft(actionRoute, { proxy: { mode: "custom", url: event.target.value } })}
+                      />
+                    </label>
+                  ) : null}
+                </div>
+              )}
+            </div>
+            <div className="route-action-modal-actions">
+              <ActionButton
+                type="button"
+                tone="ghost"
+                disabled={!actionHasChanges}
+                onClick={() => {
+                  setQuickDrafts((current) => {
+                    const { [actionRoute.id]: _discarded, ...rest } = current;
+                    return rest;
+                  });
+                }}
+              >
+                还原
+              </ActionButton>
+              <ActionButton type="submit" disabled={!actionHasChanges}>
+                <Save className="h-4 w-4" />
+                保存
+              </ActionButton>
+            </div>
+          </form>
+        </div>
+      ) : null}
+
       {props.editorOpen ? (
         <div className="modal-backdrop" role="presentation">
           <form onSubmit={props.onSubmit} className="modal-panel route-modal-panel" role="dialog" aria-modal="true" aria-label="路由编辑">
@@ -597,8 +962,8 @@ export function RoutesView(props: {
                       <SelectInput value={props.draft.siteId || ""} onChange={(event) => props.onSite(event.target.value)}>
                         <option value="">选择供应商</option>
                         {props.snapshot.sites.map((site) => (
-                          <option key={site.id} value={site.id}>
-                            {site.name}
+                          <option key={site.id} value={site.id} disabled={site.enabled === false}>
+                            {site.name}{site.enabled === false ? "（已停用）" : ""}
                           </option>
                         ))}
                       </SelectInput>
@@ -635,7 +1000,7 @@ export function RoutesView(props: {
                         <ActionButton
                           type="button"
                           tone="ghost"
-                          disabled={!(props.draft.matchRule || props.draft.name)?.trim()}
+                          disabled={!props.draft.matchRule?.trim()}
                           onClick={applySmartSelection}
                         >
                           <Wand2 className="h-4 w-4" />
@@ -655,60 +1020,6 @@ export function RoutesView(props: {
                         <option value="priority">{groupStrategyLabels.priority}</option>
                       </SelectInput>
                     </label>
-                    <div className="group-model-picker form-span-2">
-                      <div className="group-model-head">
-                        <div>
-                          <strong>组内模型</strong>
-                          <span>
-                            已选 {selectedAvailableCount} / 可用 {enabledModelOptions.length}
-                          </span>
-                        </div>
-                        <ActionButton type="button" tone="ghost" disabled={selectedAvailableCount === 0} onClick={clearGroupSelection}>
-                          清空
-                        </ActionButton>
-                      </div>
-                      {modelOptions.length === 0 ? (
-                        <div className="group-model-empty">暂无可选模型</div>
-                      ) : (
-                        <div className="group-model-list">
-                          {groupedModelOptions.map((provider) => (
-                            <div key={provider.siteId} className="group-model-provider">
-                              <div className="group-model-provider-title">{provider.siteName}</div>
-                              {provider.apiKeys.map(({ apiKey, options }) => (
-                                <div key={apiKey.id} className="group-model-key">
-                                  <div className="group-model-key-title">
-                                    <span>{apiKey.label}</span>
-                                    {!apiKey.enabled ? <span>已停用</span> : null}
-                                  </div>
-                                  <div className="group-model-options">
-                                    {options.map((option) => {
-                                      const optionKey = groupMemberKey(option);
-                                      const checked = selectedGroupKeys.has(optionKey);
-                                      return (
-                                        <label
-                                          key={optionKey}
-                                          className={`group-model-option ${checked ? "group-model-option-checked" : ""} ${
-                                            option.enabled ? "" : "group-model-option-disabled"
-                                          }`}
-                                        >
-                                          <input
-                                            type="checkbox"
-                                            checked={checked}
-                                            disabled={!option.enabled}
-                                            onChange={(event) => toggleGroupMember(option, event.target.checked)}
-                                          />
-                                          <span>{option.model}</span>
-                                        </label>
-                                      );
-                                    })}
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
                     {props.draft.strategy === "priority" ? (
                       <div className="group-priority-picker form-span-2">
                         <div className="group-priority-head">
@@ -718,13 +1029,56 @@ export function RoutesView(props: {
                           </div>
                         </div>
                         {draftMembers.length === 0 ? (
-                          <div className="group-priority-empty">请先在上方勾选组内模型</div>
+                          <div className="group-priority-empty">请先在下方勾选组内模型</div>
                         ) : (
-                          <ol className="group-priority-list">
+                          <ol
+                            className="group-priority-list"
+                            onDragLeave={(event) => {
+                              if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDraftDropPosition(null);
+                            }}
+                          >
                             {draftMembers.map((member, index) => {
                               const option = memberOptionLookup.get(groupMemberKey(member));
+                              const dropClass =
+                                draftDropTarget?.index === index ? `group-priority-item-drop-${draftDropTarget.edge}` : "";
                               return (
-                                <li key={groupMemberKey(member)} className="group-priority-item">
+                                <li
+                                  key={groupMemberKey(member)}
+                                  className={`group-priority-item ${draftDragIndex === index ? "group-priority-item-dragging" : ""} ${dropClass}`}
+                                  data-group-priority-index={index}
+                                  onDragOver={(event) => {
+                                    event.preventDefault();
+                                    event.dataTransfer.dropEffect = "move";
+                                    setDraftDropPosition(priorityDropTargetForElement(event.currentTarget, event.clientY));
+                                  }}
+                                  onDrop={(event) => {
+                                    event.preventDefault();
+                                    const target = priorityDropTargetForElement(event.currentTarget, event.clientY);
+                                    reorderDraftGroupMember(draftDragIndexRef.current, target);
+                                  }}
+                                >
+                                  <button
+                                    type="button"
+                                    className="group-priority-drag-handle"
+                                    draggable
+                                    title="拖动排序"
+                                    aria-label="拖动排序"
+                                    onDragStart={(event) => {
+                                      setDraftDragPosition(index);
+                                      configureNativePriorityDrag(event, groupMemberKey(member));
+                                    }}
+                                    onDragEnd={clearDraftDrag}
+                                    onPointerDown={(event) =>
+                                      beginPointerPriorityDrag(event, index, {
+                                        onStart: setDraftDragPosition,
+                                        onTargetChange: setDraftDropPosition,
+                                        onDrop: (target) => reorderDraftGroupMember(draftDragIndexRef.current, target),
+                                        onCancel: clearDraftDrag
+                                      })
+                                    }
+                                  >
+                                    <GripVertical className="h-4 w-4" />
+                                  </button>
                                   <span className="group-priority-rank">{index + 1}</span>
                                   <div className="group-priority-info">
                                     <strong>{option?.model || member.model}</strong>
@@ -820,6 +1174,70 @@ export function RoutesView(props: {
                     />
                   </label>
                 ) : null}
+                {draftType === "group" ? (
+                  <div className="group-model-picker form-span-2">
+                    <div className="group-model-head">
+                      <div>
+                        <strong>组内模型</strong>
+                        <span>
+                          已选 {selectedAvailableCount} / 可用 {enabledModelOptions.length}
+                        </span>
+                      </div>
+                      <ActionButton type="button" tone="ghost" disabled={selectedAvailableCount === 0} onClick={clearGroupSelection}>
+                        清空
+                      </ActionButton>
+                    </div>
+                    <TextInput
+                      className="group-model-search"
+                      value={groupModelSearch}
+                      placeholder="搜索模型、供应商或 Key"
+                      onChange={(event) => setGroupModelSearch(event.target.value)}
+                    />
+                    {modelOptions.length === 0 ? (
+                      <div className="group-model-empty">暂无可选模型</div>
+                    ) : groupedModelOptions.length === 0 ? (
+                      <div className="group-model-empty">没有匹配的模型</div>
+                    ) : (
+                      <div className="group-model-list">
+                        {groupedModelOptions.map((provider) => (
+                          <div key={provider.siteId} className="group-model-provider">
+                            <div className="group-model-provider-title">{provider.siteName}</div>
+                            {provider.apiKeys.map(({ apiKey, options }) => (
+                              <div key={apiKey.id} className="group-model-key">
+                                <div className="group-model-key-title">
+                                  <span>{apiKey.label}</span>
+                                  {!apiKey.enabled ? <span>已停用</span> : null}
+                                </div>
+                                <div className="group-model-options">
+                                  {options.map((option) => {
+                                    const optionKey = groupMemberKey(option);
+                                    const checked = selectedGroupKeys.has(optionKey);
+                                    return (
+                                      <label
+                                        key={optionKey}
+                                        className={`group-model-option ${checked ? "group-model-option-checked" : ""} ${
+                                          option.enabled ? "" : "group-model-option-disabled"
+                                        }`}
+                                      >
+                                        <input
+                                          type="checkbox"
+                                          checked={checked}
+                                          disabled={!option.enabled}
+                                          onChange={(event) => toggleGroupMember(option, event.target.checked)}
+                                        />
+                                        <span>{option.model}</span>
+                                      </label>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : null}
               </div>
               <label className="toggle-row mt-3">
                 <input
@@ -846,3 +1264,98 @@ export function RoutesView(props: {
   );
 }
 
+function RouteActionMenu(props: {
+  route: RouteRecord;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onToggle: () => void;
+  onCopy: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+  onStrategy?: () => void;
+  onProxy: () => void;
+}) {
+  const closeTimerRef = useRef<number | null>(null);
+  const supportsHoverMenu = () =>
+    typeof window !== "undefined" && window.matchMedia("(hover: hover) and (pointer: fine)").matches;
+  const openFromHover = () => {
+    if (!supportsHoverMenu()) return;
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    props.onOpenChange(true);
+  };
+  const closeFromHover = () => {
+    if (!supportsHoverMenu()) return;
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = window.setTimeout(() => {
+      props.onOpenChange(false);
+      const activeElement = document.activeElement;
+      if (activeElement instanceof HTMLElement && activeElement.classList.contains("route-more-action")) activeElement.blur();
+    }, 120);
+  };
+  const keepHoverOpen = () => {
+    if (!supportsHoverMenu()) return;
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+  };
+  useEffect(() => {
+    return () => {
+      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    };
+  }, []);
+
+  return (
+    <Popover.Root open={props.open} onOpenChange={props.onOpenChange}>
+      <Popover.Trigger asChild>
+        <ActionButton
+          type="button"
+          tone="ghost"
+          className="route-more-action"
+          title="更多操作"
+          aria-label="更多操作"
+          onMouseEnter={openFromHover}
+          onMouseLeave={closeFromHover}
+          onClick={(event) => {
+            if (supportsHoverMenu()) event.preventDefault();
+          }}
+        >
+          <MoreHorizontal className="h-4 w-4" />
+        </ActionButton>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content className="route-action-menu" align="end" sideOffset={8} onMouseEnter={keepHoverOpen} onMouseLeave={closeFromHover}>
+          <Popover.Close asChild>
+            <button type="button" onClick={props.onToggle}>
+              {props.route.enabled ? "停用路由" : "启用路由"}
+            </button>
+          </Popover.Close>
+          {props.onStrategy ? (
+            <Popover.Close asChild>
+              <button type="button" onClick={props.onStrategy}>
+                更改策略
+              </button>
+            </Popover.Close>
+          ) : null}
+          <Popover.Close asChild>
+            <button type="button" onClick={props.onProxy}>
+              切换代理
+            </button>
+          </Popover.Close>
+          <Popover.Close asChild>
+            <button type="button" onClick={props.onCopy}>
+              复制名称
+            </button>
+          </Popover.Close>
+          <Popover.Close asChild>
+            <button type="button" onClick={props.onEdit}>
+              编辑
+            </button>
+          </Popover.Close>
+          <Popover.Close asChild>
+            <button type="button" className="route-action-menu-danger" onClick={props.onDelete}>
+              删除
+            </button>
+          </Popover.Close>
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+}

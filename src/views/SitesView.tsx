@@ -110,6 +110,7 @@ export function SitesView(props: {
   onSubmit: (event: FormEvent) => void;
   onClose: () => void;
   onEdit: (site: Site) => void;
+  onToggle: (id: string, enabled: boolean) => void;
   onDelete: (id: string) => void;
 }) {
   const addresses = props.draft.addresses || [{ ...blankAddress }];
@@ -139,24 +140,36 @@ export function SitesView(props: {
             </div>
           </div>
         <div className="site-list">
-          {props.snapshot.sites.map((site) => (
-            <article key={site.id} className="record">
-              <div>
-                <div className="record-title">{site.name}</div>
-                <div className="record-meta">
-                  {siteTypeLabels[site.siteType || "unknown"]} / {site.addresses.length} 个地址
+          {props.snapshot.sites.map((site) => {
+            const enabled = site.enabled !== false;
+            return (
+              <article key={site.id} className="record">
+                <div>
+                  <div className="record-title">{site.name}</div>
+                  <div className="record-meta">
+                    {siteTypeLabels[site.siteType || "unknown"]} / {site.addresses.length} 个地址 / {enabled ? "已启用" : "已停用"}
+                  </div>
                 </div>
-              </div>
-              <div className="record-actions">
-                <ActionButton tone="ghost" onClick={() => props.onEdit(site)} title="编辑">
-                  <Wand2 className="h-4 w-4" />
-                </ActionButton>
-                <ActionButton tone="danger" onClick={() => props.onDelete(site.id)} title="删除">
-                  <Trash2 className="h-4 w-4" />
-                </ActionButton>
-              </div>
-            </article>
-          ))}
+                <div className="record-actions">
+                  <ActionButton
+                    tone="ghost"
+                    className={`site-enable-action ${enabled ? "route-enable-action-on" : "route-enable-action-off"}`}
+                    aria-pressed={enabled}
+                    onClick={() => props.onToggle(site.id, !enabled)}
+                    title={enabled ? "当前已启用，点击停用" : "当前已停用，点击启用"}
+                  >
+                    {enabled ? "启用" : "停用"}
+                  </ActionButton>
+                  <ActionButton tone="ghost" onClick={() => props.onEdit(site)} title="编辑">
+                    <Wand2 className="h-4 w-4" />
+                  </ActionButton>
+                  <ActionButton tone="danger" onClick={() => props.onDelete(site.id)} title="删除">
+                    <Trash2 className="h-4 w-4" />
+                  </ActionButton>
+                </div>
+              </article>
+            );
+          })}
         </div>
         </section>
       )}
@@ -186,6 +199,14 @@ export function SitesView(props: {
                 </SelectInput>
               </label>
             </div>
+            <label className="toggle-row mt-3">
+              <input
+                type="checkbox"
+                checked={props.draft.enabled ?? true}
+                onChange={(event) => props.onDraft({ ...props.draft, enabled: event.target.checked })}
+              />
+              启用站点
+            </label>
             <div className="mt-4 space-y-3">
               {addresses.map((address, index) => (
                 <div key={address.id || index} className="address-block">
@@ -249,4 +270,3 @@ export function SitesView(props: {
     </>
   );
 }
-

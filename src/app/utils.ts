@@ -40,7 +40,7 @@ export function providerModelOptions(snapshot?: AppSnapshot): ProviderModelOptio
           apiKeyId: apiKey.id,
           apiKeyLabel: apiKey.label,
           model,
-          enabled: Boolean(apiKey.enabled && site)
+          enabled: Boolean(apiKey.enabled && site && site.enabled !== false)
         };
         options.set(groupMemberKey(option), option);
       }
@@ -111,8 +111,7 @@ export function groupRouteStats(snapshot: AppSnapshot, route: GroupRoute) {
   return {
     providerCount: new Set(selectedOptions.map((option) => option.siteId)).size,
     keyCount: new Set(selectedOptions.map((option) => option.apiKeyId)).size,
-    modelCount: selectedOptions.length,
-    models: selectedOptions.map((option) => option.model)
+    modelCount: selectedOptions.length
   };
 }
 
@@ -223,6 +222,7 @@ export function emptySite(): Partial<Site> {
   return {
     name: "",
     siteType: "unknown",
+    enabled: true,
     addresses: [{ ...blankAddress }]
   };
 }

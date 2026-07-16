@@ -33,6 +33,7 @@ export interface Site {
   id: string;
   name: string;
   siteType: SiteType;
+  enabled: boolean;
   addresses: SiteAddress[];
   createdAt: string;
   updatedAt: string;
