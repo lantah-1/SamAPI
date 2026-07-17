@@ -1,6 +1,7 @@
 export * from "./RoutesView";
 export * from "./SitesView";
 export * from "./ProviderKeysView";
+export * from "./ModelsView";
 export * from "./TemporaryAccountsView";
 export * from "./KeysView";
 export * from "./HeadersView";

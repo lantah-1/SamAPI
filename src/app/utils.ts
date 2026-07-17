@@ -282,6 +282,7 @@ export function emptyProviderKeyGroup(snapshot?: AppSnapshot): ProviderKeyGroupD
   return {
     siteId: site?.id || "",
     groupName: site?.name || "",
+    modelManageMode: "manual",
     apiKeys: [emptyProviderApiKey(site)]
   };
 }

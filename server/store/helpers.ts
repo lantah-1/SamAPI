@@ -66,6 +66,15 @@ export function normalizeSiteType(value: unknown) {
   return value === "newapi" ? "newapi" : "unknown";
 }
 
+export function normalizeProviderModelManageMode(value: unknown): "auto" | "manual" {
+  return value === "auto" ? "auto" : "manual";
+}
+
+export function normalizeProviderModelSyncStatus(value: unknown): "success" | "failed" | "partial" | undefined {
+  if (value === "success" || value === "failed" || value === "partial") return value;
+  return undefined;
+}
+
 export function normalizeSettings(input?: Partial<AppSettings>): AppSettings {
   const maxRequestLogs = Number(input?.maxRequestLogs ?? DEFAULT_SETTINGS.maxRequestLogs);
   const adminSessionTtlMinutes = Number(input?.adminSessionTtlMinutes ?? DEFAULT_SETTINGS.adminSessionTtlMinutes);

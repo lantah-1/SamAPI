@@ -14,6 +14,8 @@ import type {
   ProviderApiKeyGroup,
   ProviderApiKeyGroupInput,
   ProviderApiKeyKind,
+  ProviderModelManageMode,
+  ProviderModelSyncStatus,
   RequestLog,
   RequestLogSummary,
   RouteRecord,
@@ -44,6 +46,8 @@ import {
   normalizeMatchRule,
   normalizeModelList,
   normalizePasswordHash,
+  normalizeProviderModelManageMode,
+  normalizeProviderModelSyncStatus,
   normalizeRouteProxy,
   normalizeSettings,
   normalizeSiteType,
@@ -342,6 +346,7 @@ export class JsonStore {
       id: "provider-key-group-grok-official",
       siteId: site.id,
       groupName: "Grok",
+      modelManageMode: "manual",
       apiKeys: [this.normalizeProviderApiKeyEntry({ kind: "grok-official", label: GROK_OFFICIAL_PROVIDER_KEY_LABEL, enabled: true }, 0)],
       createdAt: timestamp,
       updatedAt: timestamp
@@ -400,6 +405,7 @@ export class JsonStore {
       id: `provider-key-group-chatgpt-official`,
       siteId: site.id,
       groupName: "OpenAI",
+      modelManageMode: "manual",
       apiKeys: [this.normalizeProviderApiKeyEntry({ kind: "chatgpt-official", label: CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL, enabled: true }, 0)],
       createdAt: timestamp,
       updatedAt: timestamp
@@ -787,6 +793,7 @@ export class JsonStore {
       Object.assign(current, {
         siteId: input.siteId,
         groupName,
+        modelManageMode: input.modelManageMode ? normalizeProviderModelManageMode(input.modelManageMode) : current.modelManageMode || "manual",
         apiKeys,
         updatedAt: timestamp
       });
@@ -804,6 +811,7 @@ export class JsonStore {
       id: `provider-key-group-${randomUUID()}`,
       siteId: input.siteId,
       groupName,
+      modelManageMode: normalizeProviderModelManageMode(input.modelManageMode),
       apiKeys,
       createdAt: timestamp,
       updatedAt: timestamp
@@ -813,6 +821,33 @@ export class JsonStore {
     this.refreshGroupRouteMembers();
     this.persist();
     return this.toProviderApiKeyGroupView(created);
+  }
+
+  updateProviderApiKeyGroupModelManageMode(id: string, modelManageMode: ProviderModelManageMode) {
+    const current = this.db.providerApiKeyGroups.find((group) => group.id === id);
+    if (!current) throw new Error("API Key 分组不存在");
+    current.modelManageMode = normalizeProviderModelManageMode(modelManageMode);
+    current.updatedAt = now();
+    this.persist();
+    return this.toProviderApiKeyGroupView(current);
+  }
+
+  updateProviderApiKeyGroupModelSyncState(
+    id: string,
+    state: {
+      lastModelSyncAt?: string;
+      lastModelSyncStatus?: ProviderModelSyncStatus;
+      lastModelSyncMessage?: string;
+    }
+  ) {
+    const current = this.db.providerApiKeyGroups.find((group) => group.id === id);
+    if (!current) throw new Error("API Key 分组不存在");
+    if (state.lastModelSyncAt !== undefined) current.lastModelSyncAt = state.lastModelSyncAt;
+    if (state.lastModelSyncStatus !== undefined) current.lastModelSyncStatus = state.lastModelSyncStatus;
+    if (state.lastModelSyncMessage !== undefined) current.lastModelSyncMessage = state.lastModelSyncMessage;
+    current.updatedAt = now();
+    this.persist();
+    return this.toProviderApiKeyGroupView(current);
   }
 
   deleteProviderApiKeyGroup(id: string) {
@@ -1102,7 +1137,7 @@ export class JsonStore {
       CREATE TABLE IF NOT EXISTS auth (id INTEGER PRIMARY KEY CHECK (id = 1), admin_password_hash TEXT);
       CREATE TABLE IF NOT EXISTS sites (id TEXT PRIMARY KEY, name TEXT NOT NULL, site_type TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, addresses_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, prefix TEXT NOT NULL, key_hash TEXT NOT NULL, plain_text_key TEXT, enabled INTEGER NOT NULL, models_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_used_at TEXT);
-      CREATE TABLE IF NOT EXISTS provider_api_key_groups (id TEXT PRIMARY KEY, site_id TEXT NOT NULL, group_name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS provider_api_key_groups (id TEXT PRIMARY KEY, site_id TEXT NOT NULL, group_name TEXT NOT NULL, model_manage_mode TEXT NOT NULL DEFAULT 'manual', last_model_sync_at TEXT, last_model_sync_status TEXT, last_model_sync_message TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS provider_api_keys (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'api-key', enabled INTEGER NOT NULL, models_json TEXT NOT NULL, last_checked_at TEXT, FOREIGN KEY (group_id) REFERENCES provider_api_key_groups(id) ON DELETE CASCADE);
       CREATE INDEX IF NOT EXISTS idx_provider_api_keys_group_id ON provider_api_keys(group_id);
       CREATE TABLE IF NOT EXISTS temporary_account_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, source TEXT NOT NULL, provider_type TEXT, site_id TEXT NOT NULL, strategy TEXT, enabled INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -1126,6 +1161,10 @@ export class JsonStore {
     this.ensureSqliteColumn("provider_api_keys", "kind", "TEXT NOT NULL DEFAULT 'api-key'");
     this.ensureSqliteColumn("api_keys", "models_json", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureSqliteColumn("sites", "enabled", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureSqliteColumn("provider_api_key_groups", "model_manage_mode", "TEXT NOT NULL DEFAULT 'manual'");
+    this.ensureSqliteColumn("provider_api_key_groups", "last_model_sync_at", "TEXT");
+    this.ensureSqliteColumn("provider_api_key_groups", "last_model_sync_status", "TEXT");
+    this.ensureSqliteColumn("provider_api_key_groups", "last_model_sync_message", "TEXT");
   }
 
   private ensureSqliteColumn(table: string, column: string, definition: string) {
@@ -1159,7 +1198,7 @@ export class JsonStore {
     return {
       sites: (parsed.sites || []).map((site) => ({ ...site, enabled: site.enabled ?? true, siteType: normalizeSiteType(site.siteType) })),
       apiKeys: (parsed.apiKeys || []).map((key) => ({ ...key, models: normalizeModelList(key.models) })),
-      providerApiKeyGroups: parsed.providerApiKeyGroups || [],
+      providerApiKeyGroups: (parsed.providerApiKeyGroups || []).map((group) => this.normalizeProviderApiKeyGroup(group)),
       temporaryAccountGroups: this.loadTemporaryAccountGroups(legacyTemporaryAccountGroups),
       headerTemplates: parsed.headerTemplates || [],
       routes: (parsed.routes || []) as RouteRecord[],
@@ -1208,7 +1247,18 @@ export class JsonStore {
           lastCheckedAt: apiKey.last_checked_at == null ? undefined : String(apiKey.last_checked_at)
         };
       });
-      return { id: String(row.id), siteId: String(row.site_id), groupName: String(row.group_name), apiKeys, createdAt: String(row.created_at), updatedAt: String(row.updated_at) };
+      return this.normalizeProviderApiKeyGroup({
+        id: String(row.id),
+        siteId: String(row.site_id),
+        groupName: String(row.group_name),
+        modelManageMode: normalizeProviderModelManageMode(row.model_manage_mode),
+        lastModelSyncAt: row.last_model_sync_at == null ? undefined : String(row.last_model_sync_at),
+        lastModelSyncStatus: normalizeProviderModelSyncStatus(row.last_model_sync_status),
+        lastModelSyncMessage: row.last_model_sync_message == null ? undefined : String(row.last_model_sync_message),
+        apiKeys,
+        createdAt: String(row.created_at),
+        updatedAt: String(row.updated_at)
+      });
     });
     const temporaryAccountGroups = (this.sqlite.prepare("SELECT * FROM temporary_account_groups ORDER BY created_at DESC").all() as Array<Record<string, unknown>>).map((row) => {
       const accounts = (this.sqlite.prepare("SELECT * FROM temporary_accounts WHERE group_id = ? ORDER BY rowid").all(row.id) as Array<Record<string, unknown>>).map((account) => ({
@@ -1324,10 +1374,22 @@ export class JsonStore {
     for (const site of db.sites) insertSite.run(site.id, site.name, site.siteType, site.enabled === false ? 0 : 1, JSON.stringify(site.addresses), site.createdAt, site.updatedAt);
     const insertApiKey = this.sqlite.prepare("INSERT INTO api_keys (id, name, prefix, key_hash, plain_text_key, enabled, models_json, created_at, updated_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     for (const key of db.apiKeys) insertApiKey.run(key.id, key.name, key.prefix, key.keyHash, key.plainTextKey || null, key.enabled ? 1 : 0, JSON.stringify(key.models || []), key.createdAt, key.updatedAt, key.lastUsedAt || null);
-    const insertProviderGroup = this.sqlite.prepare("INSERT INTO provider_api_key_groups (id, site_id, group_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
+    const insertProviderGroup = this.sqlite.prepare(
+      "INSERT INTO provider_api_key_groups (id, site_id, group_name, model_manage_mode, last_model_sync_at, last_model_sync_status, last_model_sync_message, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    );
     const insertProviderKey = this.sqlite.prepare("INSERT INTO provider_api_keys (id, group_id, label, prefix, secret, kind, enabled, models_json, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
     for (const group of db.providerApiKeyGroups) {
-      insertProviderGroup.run(group.id, group.siteId, group.groupName, group.createdAt, group.updatedAt);
+      insertProviderGroup.run(
+        group.id,
+        group.siteId,
+        group.groupName,
+        normalizeProviderModelManageMode(group.modelManageMode),
+        group.lastModelSyncAt || null,
+        group.lastModelSyncStatus || null,
+        group.lastModelSyncMessage || null,
+        group.createdAt,
+        group.updatedAt
+      );
       for (const apiKey of group.apiKeys) insertProviderKey.run(apiKey.id, group.id, apiKey.label, apiKey.prefix, apiKey.secret, apiKey.kind || "api-key", apiKey.enabled ? 1 : 0, JSON.stringify(apiKey.models), apiKey.lastCheckedAt || null);
     }
     const insertTemporaryGroup = this.sqlite.prepare("INSERT INTO temporary_account_groups (id, name, source, provider_type, site_id, strategy, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
@@ -1398,12 +1460,28 @@ export class JsonStore {
     };
   }
 
+  private normalizeProviderApiKeyGroup(group: Partial<ProviderApiKeyGroup> & Pick<ProviderApiKeyGroup, "id" | "siteId" | "groupName" | "apiKeys" | "createdAt" | "updatedAt">): ProviderApiKeyGroup {
+    return {
+      id: group.id,
+      siteId: group.siteId,
+      groupName: group.groupName,
+      modelManageMode: normalizeProviderModelManageMode(group.modelManageMode),
+      lastModelSyncAt: group.lastModelSyncAt,
+      lastModelSyncStatus: normalizeProviderModelSyncStatus(group.lastModelSyncStatus),
+      lastModelSyncMessage: group.lastModelSyncMessage,
+      apiKeys: group.apiKeys || [],
+      createdAt: group.createdAt,
+      updatedAt: group.updatedAt
+    };
+  }
+
   private toProviderApiKeyGroupView(group: ProviderApiKeyGroup) {
     const site = this.db.sites.find((item) => item.id === group.siteId);
+    const normalized = this.normalizeProviderApiKeyGroup(group);
     return {
-      ...group,
-      groupName: group.groupName || site?.name || "API Key 分组",
-      apiKeys: group.apiKeys.map((apiKey) => ({ ...apiKey }))
+      ...normalized,
+      groupName: normalized.groupName || site?.name || "API Key 分组",
+      apiKeys: normalized.apiKeys.map((apiKey) => ({ ...apiKey }))
     };
   }
 

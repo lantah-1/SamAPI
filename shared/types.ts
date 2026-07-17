@@ -62,6 +62,10 @@ export interface ApiKeyCreated extends ApiKeyRecord {
 
 export type ProviderApiKeyKind = "api-key" | "chatgpt-official" | "grok-official";
 
+export type ProviderModelManageMode = "auto" | "manual";
+
+export type ProviderModelSyncStatus = "success" | "failed" | "partial";
+
 export interface ProviderApiKeyEntry {
   id: string;
   label: string;
@@ -89,6 +93,10 @@ export interface ProviderApiKeyGroup {
   id: string;
   siteId: string;
   groupName: string;
+  modelManageMode: ProviderModelManageMode;
+  lastModelSyncAt?: string;
+  lastModelSyncStatus?: ProviderModelSyncStatus;
+  lastModelSyncMessage?: string;
   apiKeys: ProviderApiKeyEntry[];
   createdAt: string;
   updatedAt: string;
@@ -102,7 +110,13 @@ export interface ProviderApiKeyGroupInput {
   id?: string;
   siteId?: string;
   groupName?: string;
+  modelManageMode?: ProviderModelManageMode;
   apiKeys?: ProviderApiKeyEntryInput[];
+}
+
+export interface ProviderModelSyncOptions {
+  mode?: ProviderModelManageMode | "all";
+  groupIds?: string[];
 }
 
 export interface ProviderModelSyncItemResult {

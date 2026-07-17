@@ -5,6 +5,7 @@ import { isRecord } from "../util/text.js";
 import { notFound, readJson, routeParam, sendJson } from "../http.js";
 import { ModelDiscoveryOptionsError } from "../model-discovery.js";
 import type {
+  ProviderModelSyncOptions,
   ProviderModelSyncResult,
   RouteProxyConfig,
   TemporaryAccountCheckResult,
@@ -44,7 +45,7 @@ interface ApiHandlerDeps {
   checkTemporaryAccountIds: (accountIds: string[], proxyConfig?: RouteProxyConfig, providerType?: TemporaryAccountProviderType) => Promise<TemporaryAccountCheckResult>;
   checkSingleTemporaryAccount: (accountId: string, proxyConfig?: RouteProxyConfig) => Promise<TemporaryAccountCheckResult>;
   discoverProviderModels: (siteId: string, apiKey: string, apiKeyName: string, request: http.IncomingMessage, kind?: string) => Promise<unknown>;
-  syncAllProviderModels: (request: http.IncomingMessage) => Promise<ProviderModelSyncResult>;
+  syncAllProviderModels: (request: http.IncomingMessage, options?: ProviderModelSyncOptions) => Promise<ProviderModelSyncResult>;
 }
 
 export function createApiHandler(deps: ApiHandlerDeps) {
@@ -201,7 +202,25 @@ export function createApiHandler(deps: ApiHandlerDeps) {
             await discoverProviderModels(String(body.siteId || ""), String(body.apiKey || ""), String(body.apiKeyName || ""), request, String(body.kind || "api-key"))
           );
         }
-        if (method === "POST" && parts[2] === "sync-models") return sendJson(response, 200, await syncAllProviderModels(request));
+        if (method === "POST" && parts[2] === "sync-models") {
+          const body = await readJson(request).catch(() => ({}));
+          const mode =
+            body && typeof body === "object" && "mode" in body
+              ? body.mode === "auto" || body.mode === "manual" || body.mode === "all"
+                ? body.mode
+                : "all"
+              : "all";
+          const groupIds =
+            body && typeof body === "object" && Array.isArray((body as { groupIds?: unknown }).groupIds)
+              ? (body as { groupIds: unknown[] }).groupIds.map(String)
+              : undefined;
+          return sendJson(response, 200, await syncAllProviderModels(request, { mode, groupIds }));
+        }
+        if (method === "PATCH" && parts[3] === "model-manage-mode") {
+          const body = await readJson(request);
+          const modelManageMode = body.modelManageMode === "auto" ? "auto" : "manual";
+          return sendJson(response, 200, store.updateProviderApiKeyGroupModelManageMode(routeParam(parts, 2), modelManageMode));
+        }
         if (method === "GET") return sendJson(response, 200, store.listProviderApiKeyGroups());
         if (method === "POST") return sendJson(response, 201, store.upsertProviderApiKeyGroup(await readJson(request)));
         if (method === "DELETE") {

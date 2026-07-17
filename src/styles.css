@@ -700,6 +700,37 @@ textarea {
   margin-bottom: 1rem;
 }
 
+.model-card-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.model-mode-select {
+  width: 6.5rem;
+  flex-shrink: 0;
+}
+
+.model-mode-select .select-shell {
+  width: 100%;
+  margin-top: 0;
+}
+
+.model-mode-select .select-trigger {
+  min-height: 2.35rem;
+  padding-top: 0.45rem;
+  padding-bottom: 0.45rem;
+  padding-left: 0.75rem;
+  padding-right: 2rem;
+  font-size: 0.82rem;
+}
+
+.model-mode-select .select-chevron {
+  right: 0.65rem;
+}
+
 .form-head h2 {
   font-size: 1.05rem;
   font-weight: 950;
@@ -3747,6 +3778,27 @@ textarea.field:focus {
     min-height: 0;
     align-items: stretch;
     padding: 0.62rem;
+  }
+
+  .record > .min-w-0.w-full > .form-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.6rem;
+  }
+
+  .model-card-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .model-mode-select {
+    width: auto;
+    flex: 1 1 6rem;
+  }
+
+  .model-card-actions .action {
+    flex: 1 1 auto;
+    justify-content: center;
   }
 
   .route-record {

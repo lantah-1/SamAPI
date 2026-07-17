@@ -8,6 +8,8 @@ import type {
   ProviderApiKeyGroupInput,
   ProviderApiKeyGroupView,
   ProviderModelDiscoverResult,
+  ProviderModelManageMode,
+  ProviderModelSyncOptions,
   ProviderModelSyncResult,
   RequestLog,
   RequestLogPage,
@@ -115,12 +117,21 @@ export const api = {
     }),
   listProviderKeyGroups: () => request<ProviderApiKeyGroupView[]>("/api/provider-key-groups"),
   deleteProviderKeyGroup: (id: string) => request<{ ok: true }>(`/api/provider-key-groups/${id}`, { method: "DELETE" }),
+  updateProviderModelManageMode: (id: string, modelManageMode: ProviderModelManageMode) =>
+    request<ProviderApiKeyGroupView>(`/api/provider-key-groups/${id}/model-manage-mode`, {
+      method: "PATCH",
+      body: JSON.stringify({ modelManageMode })
+    }),
   discoverProviderModels: (siteId: string, apiKey: string, apiKeyName: string, kind?: string) =>
     request<ProviderModelDiscoverResult>("/api/provider-key-groups/discover-models", {
       method: "POST",
       body: JSON.stringify({ siteId, apiKey, apiKeyName, kind })
     }),
-  syncProviderModels: () => request<ProviderModelSyncResult>("/api/provider-key-groups/sync-models", { method: "POST" }),
+  syncProviderModels: (options: ProviderModelSyncOptions = {}) =>
+    request<ProviderModelSyncResult>("/api/provider-key-groups/sync-models", {
+      method: "POST",
+      body: JSON.stringify(options)
+    }),
   listTemporaryAccountGroups: () => request<TemporaryAccountGroup[]>("/api/temporary-accounts"),
   importTemporaryAccounts: (input: TemporaryAccountImportInput) =>
     request<TemporaryAccountImportResult>("/api/temporary-accounts/import", {

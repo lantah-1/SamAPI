@@ -4,6 +4,7 @@ import { createAuth } from "./auth.js";
 import { createAccountCheck } from "./account-check.js";
 import { createRouting } from "./routing.js";
 import { createModelDiscovery } from "./model-discovery.js";
+import { startProviderModelSyncScheduler } from "./model-sync-scheduler.js";
 import { createApiHandler } from "./handlers/api.js";
 import { createProxyHandler } from "./handlers/proxy.js";
 import { ADMIN_PASSWORD_IS_DEFAULT, HOST, PORT, WEB_DIR } from "./config.js";
@@ -74,6 +75,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Database: ${store.dbPath}`);
   console.log(`Web UI: ${WEB_DIR}`);
   console.log("Fetch proxy: per-route");
+  startProviderModelSyncScheduler({ syncAllProviderModels });
   if (ADMIN_PASSWORD_IS_DEFAULT && !store.getAdminPasswordHash()) {
     console.warn("Admin password is using the local default: samapi-admin. Set SAMAPI_ADMIN_PASSWORD before exposing SamAPI publicly.");
   }

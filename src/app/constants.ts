@@ -1,5 +1,6 @@
 import {
   Activity,
+  Boxes,
   Braces,
   KeyRound,
   Map,
@@ -117,9 +118,10 @@ export const themeOptions = [
 ] satisfies Array<{ id: AppThemeId; name: string; description: string; swatches: string[] }>;
 
 export const navItems = [
-  { id: "routes", label: "模型路由", icon: Route },
-  { id: "sites", label: "上游站点", icon: Server },
-  { id: "providerKeys", label: "上游密钥", icon: KeyRound },
+  { id: "routes", label: "路由管理", icon: Route },
+  { id: "sites", label: "站点管理", icon: Server },
+  { id: "providerKeys", label: "密钥管理", icon: KeyRound },
+  { id: "models", label: "模型管理", icon: Boxes },
   { id: "temporaryAccounts", label: "临时账号", icon: Upload },
   { id: "keys", label: "客户端密钥", icon: ShieldCheck },
   { id: "headers", label: "请求头模板", icon: Braces },

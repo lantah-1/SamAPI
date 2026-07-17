@@ -11,7 +11,7 @@ import { valueToHeaderText } from "./http.js";
 import { modelEndpointCandidates, newApiPricingEndpointCandidates } from "./util/endpoints.js";
 import { CHATGPT_MODELS_URL, CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL, fetchTemporaryAccountCheckText } from "./providers/constants.js";
 import { codexQuotaHeaders, refreshCodexTemporaryAccountToken } from "./providers/codex.js";
-import type { ProviderModelSyncResult, Site, SiteAddress } from "../shared/types.js";
+import type { ProviderModelSyncOptions, ProviderModelSyncResult, ProviderModelSyncStatus, Site, SiteAddress } from "../shared/types.js";
 
 export class ModelDiscoveryOptionsError extends Error {
   readonly modelGroups: Array<{ groupName: string; models: string[] }>;
@@ -548,9 +548,22 @@ export function createModelDiscovery(store: JsonStore) {
     throw new Error(`模型列表获取失败：${errors.slice(0, 4).join("；") || "没有可用地址"}`);
   }
 
-  async function syncAllProviderModels(request: http.IncomingMessage): Promise<ProviderModelSyncResult> {
+  async function syncAllProviderModels(
+    request: http.IncomingMessage,
+    options: ProviderModelSyncOptions = {}
+  ): Promise<ProviderModelSyncResult> {
     const db = store.getDb();
-    const targets = db.providerApiKeyGroups.flatMap((group) => {
+    const mode = options.mode || "all";
+    const groupIdFilter = Array.isArray(options.groupIds)
+      ? new Set(options.groupIds.map((id) => String(id).trim()).filter(Boolean))
+      : null;
+    const groups = db.providerApiKeyGroups.filter((group) => {
+      if (groupIdFilter && !groupIdFilter.has(group.id)) return false;
+      if (mode === "auto") return (group.modelManageMode || "manual") === "auto";
+      if (mode === "manual") return (group.modelManageMode || "manual") === "manual";
+      return true;
+    });
+    const targets = groups.flatMap((group) => {
       const site = db.sites.find((item) => item.id === group.siteId);
       return group.apiKeys
         .filter((apiKey) => apiKey.enabled)
@@ -607,6 +620,44 @@ export function createModelDiscovery(store: JsonStore) {
           errorMessage: error instanceof Error ? error.message : "模型同步失败"
         });
       }
+    }
+
+    const checkedAt = new Date().toISOString();
+    const resultsByGroup = new Map<string, ProviderModelSyncResult["results"]>();
+    for (const result of results) {
+      const items = resultsByGroup.get(result.groupId) || [];
+      items.push(result);
+      resultsByGroup.set(result.groupId, items);
+    }
+    for (const group of groups) {
+      const groupResults = resultsByGroup.get(group.id) || [];
+      if (groupResults.length === 0) {
+        store.updateProviderApiKeyGroupModelSyncState(group.id, {
+          lastModelSyncAt: checkedAt,
+          lastModelSyncStatus: "success",
+          lastModelSyncMessage: "没有可同步的已启用 API Key"
+        });
+        continue;
+      }
+      const successCount = groupResults.filter((item) => item.status === "success").length;
+      const failedCount = groupResults.length - successCount;
+      const status: ProviderModelSyncStatus =
+        failedCount === 0 ? "success" : successCount === 0 ? "failed" : "partial";
+      const failedSummary = groupResults
+        .filter((item) => item.status === "failed")
+        .slice(0, 3)
+        .map((item) => `${item.apiKeyLabel}: ${item.errorMessage || "同步失败"}`)
+        .join("；");
+      store.updateProviderApiKeyGroupModelSyncState(group.id, {
+        lastModelSyncAt: checkedAt,
+        lastModelSyncStatus: status,
+        lastModelSyncMessage:
+          status === "success"
+            ? `成功同步 ${successCount} 个 Key`
+            : status === "partial"
+              ? `部分成功 ${successCount}/${groupResults.length}${failedSummary ? `；${failedSummary}` : ""}`
+              : failedSummary || "模型同步失败"
+      });
     }
 
     const success = results.filter((result) => result.status === "success").length;

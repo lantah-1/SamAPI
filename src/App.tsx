@@ -34,7 +34,8 @@ import type {
   HeaderTemplate,
   ProviderApiKeyGroupView,
   ProviderApiKeyKind,
-  ProviderModelGroupOption,
+  ProviderModelManageMode,
+  ProviderModelSyncOptions,
   RequestLog,
   RequestLogSummary,
   RouteProxyConfig,
@@ -62,6 +63,7 @@ import {
   KeysView,
   LogDetailModal,
   LogsView,
+  ModelsView,
   ProviderKeysView,
   RoutesView,
   SettingsView,
@@ -153,6 +155,8 @@ export default function App() {
   const [siteEditorOpen, setSiteEditorOpen] = useState(false);
   const [providerKeyDraft, setProviderKeyDraft] = useState<ProviderKeyGroupDraft>(emptyProviderKeyGroup());
   const [providerKeyEditorOpen, setProviderKeyEditorOpen] = useState(false);
+  const [providerModelDraft, setProviderModelDraft] = useState<ProviderKeyGroupDraft>(emptyProviderKeyGroup());
+  const [providerModelEditorOpen, setProviderModelEditorOpen] = useState(false);
   const [temporaryAccountDraft, setTemporaryAccountDraft] = useState<TemporaryAccountImportDraft>(emptyTemporaryAccountImport());
   const [temporaryAccountEditorOpen, setTemporaryAccountEditorOpen] = useState(false);
   const [headerDraft, setHeaderDraft] = useState<HeaderTemplateDraft>(emptyHeader());
@@ -175,8 +179,7 @@ export default function App() {
   const [selectedLogError, setSelectedLogError] = useState("");
   const [busy, setBusy] = useState(false);
   const [modelSyncing, setModelSyncing] = useState(false);
-  const [modelDiscoveringIndex, setModelDiscoveringIndex] = useState<number | null>(null);
-  const [providerModelGroupOptions, setProviderModelGroupOptions] = useState<Record<number, ProviderModelGroupOption[]>>({});
+  const [modelSyncingGroupId, setModelSyncingGroupId] = useState<string | null>(null);
   const [temporaryAccountChecking, setTemporaryAccountChecking] = useState<string | null>(null);
   const [temporaryAccountCheckingIds, setTemporaryAccountCheckingIds] = useState<string[]>([]);
   const [temporaryAccountCheckProviderType, setTemporaryAccountCheckProviderType] = useState<Extract<TemporaryAccountProviderType, "gpt" | "grok">>("gpt");
@@ -605,6 +608,10 @@ export default function App() {
   useEffect(() => clearAppScrollbarTimer, []);
 
   useEffect(() => {
+    appScrollRef.current?.scrollTo({ top: 0 });
+  }, [section]);
+
+  useEffect(() => {
     const scrollElement = appScrollRef.current;
     const contentElement = appScrollContentRef.current;
     if (!scrollElement || !contentElement) return;
@@ -944,6 +951,7 @@ export default function App() {
       id: group.id,
       siteId: group.siteId,
       groupName: group.groupName,
+      modelManageMode: group.modelManageMode || "manual",
       apiKeys: group.apiKeys.map((apiKey) => ({
         id: apiKey.id,
         label: apiKey.label,
@@ -957,45 +965,47 @@ export default function App() {
     setProviderKeyEditorOpen(true);
   };
 
-  const discoverProviderModels = async (index: number) => {
-    const apiKey = providerKeyDraft.apiKeys[index];
-    setModelDiscoveringIndex(index);
-    try {
-      const result = await api.discoverProviderModels(providerKeyDraft.siteId, apiKey?.secret || "", apiKey?.label || "", apiKey?.kind);
-      setProviderKeyDraft((current) => ({
-        ...current,
-        apiKeys: current.apiKeys.map((item, itemIndex) =>
-          itemIndex === index
-            ? { ...item, models: result.models, lastCheckedAt: new Date().toISOString() }
-            : item
-        )
-      }));
-      setProviderModelGroupOptions((current) => ({ ...current, [index]: [] }));
-      setToast(`已获取 ${result.models.length} 个模型`);
-    } catch (error) {
-      if (!handleUnauthorized(error)) {
-        const payload = error instanceof ApiError ? error.payload : undefined;
-        const modelGroups = payload && typeof payload === "object" && "modelGroups" in payload ? (payload as { modelGroups?: unknown }).modelGroups : undefined;
-        if (Array.isArray(modelGroups) && modelGroups.length > 0) {
-          setProviderModelGroupOptions((current) => ({ ...current, [index]: modelGroups as ProviderModelGroupOption[] }));
-          setToast("未匹配到 Key 名称，请从返回的分组中选择模型");
-        } else {
-          setToast(error instanceof Error ? error.message : "模型获取失败");
-        }
-      }
-    } finally {
-      await load().catch(() => undefined);
-      setModelDiscoveringIndex(null);
-    }
+  const providerGroupToModelDraft = (group: ProviderApiKeyGroupView): ProviderKeyGroupDraft => ({
+    id: group.id,
+    siteId: group.siteId,
+    groupName: group.groupName,
+    modelManageMode: group.modelManageMode || "manual",
+    apiKeys: group.apiKeys.map((apiKey) => ({
+      id: apiKey.id,
+      label: apiKey.label,
+      secret: apiKey.secret,
+      kind: apiKey.kind || "api-key",
+      enabled: apiKey.enabled,
+      models: apiKey.models,
+      lastCheckedAt: apiKey.lastCheckedAt
+    }))
+  });
+
+  const openEditProviderModels = (group: ProviderApiKeyGroupView) => {
+    setProviderModelDraft(providerGroupToModelDraft(group));
+    setProviderModelEditorOpen(true);
   };
 
-  const syncProviderModels = async () => {
+  const closeProviderModelEditor = () => {
+    setProviderModelEditorOpen(false);
+  };
+
+  const syncProviderModels = async (options: ProviderModelSyncOptions = {}) => {
+    const groupIds = options.groupIds || [];
     setModelSyncing(true);
+    setModelSyncingGroupId(groupIds.length === 1 ? groupIds[0] : null);
     try {
-      const result = await api.syncProviderModels();
+      const result = await api.syncProviderModels(options);
       await load();
+      if (providerModelEditorOpen) closeProviderModelEditor();
       if (result.total === 0) {
-        setToast("没有可同步的已启用 API Key");
+        setToast(
+          groupIds.length === 1
+            ? "该站点没有可同步的已启用 API Key"
+            : options.mode === "auto"
+              ? "没有可同步的自动管理供应商"
+              : "没有可同步的已启用 API Key"
+        );
         return;
       }
       const failedItems = result.results.filter((item) => item.status === "failed");
@@ -1012,7 +1022,39 @@ export default function App() {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "模型同步失败");
     } finally {
       setModelSyncing(false);
+      setModelSyncingGroupId(null);
     }
+  };
+
+  const fetchGroupModels = (groupId: string) => {
+    void syncProviderModels({ groupIds: [groupId] });
+  };
+
+  const saveProviderModels = (event: FormEvent) => {
+    event.preventDefault();
+    if (!providerModelDraft.id) {
+      setToast("上游密钥分组不存在");
+      return;
+    }
+    mutate(async () => {
+      await api.saveProviderKeyGroup({
+        id: providerModelDraft.id,
+        siteId: providerModelDraft.siteId,
+        groupName: providerModelDraft.groupName,
+        modelManageMode: providerModelDraft.modelManageMode || "manual",
+        apiKeys: providerModelDraft.apiKeys
+      });
+      closeProviderModelEditor();
+    }, "模型列表已保存");
+  };
+
+  const updateProviderModelManageMode = (groupId: string, mode: ProviderModelManageMode) => {
+    mutate(async () => {
+      await api.updateProviderModelManageMode(groupId, mode);
+      if (providerModelDraft.id === groupId) {
+        setProviderModelDraft((current) => ({ ...current, modelManageMode: mode }));
+      }
+    }, mode === "auto" ? "已切换为自动管理" : "已切换为手动管理");
   };
 
   const openNewKey = () => {
@@ -1227,17 +1269,28 @@ export default function App() {
                 snapshot={snapshot}
                 draft={providerKeyDraft}
                 editorOpen={providerKeyEditorOpen}
-                busy={busy}
-                modelSyncing={modelSyncing}
-                modelDiscoveringIndex={modelDiscoveringIndex}
-                modelGroupOptions={providerModelGroupOptions}
                 onDraft={setProviderKeyDraft}
                 onSubmit={saveProviderKeyGroup}
                 onClose={() => setProviderKeyEditorOpen(false)}
-                onDiscoverModels={discoverProviderModels}
-                onSyncModels={syncProviderModels}
                 onEdit={openEditProviderKeyGroup}
                 onDelete={(id) => mutate(async () => api.deleteProviderKeyGroup(id), "上游密钥分组已删除")}
+              />
+            )}
+            {section === "models" && (
+              <ModelsView
+                snapshot={snapshot}
+                modelDraft={providerModelDraft}
+                modelEditorOpen={providerModelEditorOpen}
+                busy={busy}
+                modelSyncing={modelSyncing}
+                modelSyncingGroupId={modelSyncingGroupId}
+                onModelDraft={setProviderModelDraft}
+                onSubmitModels={saveProviderModels}
+                onCloseModels={closeProviderModelEditor}
+                onSyncModels={syncProviderModels}
+                onFetchGroupModels={fetchGroupModels}
+                onModelManageModeChange={updateProviderModelManageMode}
+                onEditModels={openEditProviderModels}
               />
             )}
             {section === "temporaryAccounts" && (

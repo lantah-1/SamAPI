@@ -5,6 +5,7 @@ import type {
   GroupRouteStrategy,
   HeaderTemplate,
   ProviderApiKeyKind,
+  ProviderModelManageMode,
   RouteProxyConfig,
   RouteType,
   TemporaryAccountImportSource,
@@ -12,7 +13,7 @@ import type {
   TemporaryAccountProviderType
 } from "../../shared/types";
 
-export type Section = "routes" | "sites" | "providerKeys" | "temporaryAccounts" | "keys" | "headers" | "logs" | "settings" | "docs";
+export type Section = "routes" | "sites" | "providerKeys" | "models" | "temporaryAccounts" | "keys" | "headers" | "logs" | "settings" | "docs";
 export type AuthStatus = "checking" | "signed-out" | "signed-in";
 
 export interface RouteDraft {
@@ -48,6 +49,7 @@ export interface ProviderKeyGroupDraft {
   id?: string;
   siteId: string;
   groupName: string;
+  modelManageMode?: ProviderModelManageMode;
   apiKeys: ProviderApiKeyDraft[];
 }
 
