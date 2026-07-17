@@ -744,6 +744,47 @@ label {
   transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
 }
 
+.secret-field {
+  position: relative;
+  display: block;
+  width: 100%;
+  margin-top: 0.4rem;
+}
+
+.secret-field-input {
+  margin-top: 0;
+  padding-right: 2.7rem;
+}
+
+.secret-field-toggle {
+  position: absolute;
+  top: 50%;
+  right: 0.45rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: color-mix(in srgb, var(--muted) 88%, var(--ink));
+  transform: translateY(-50%);
+  cursor: pointer;
+  transition: color 140ms ease, background 140ms ease;
+}
+
+.secret-field-toggle:hover {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.secret-field-toggle:focus-visible {
+  outline: none;
+  color: var(--ink);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
 .field:focus-visible,
 input.field:focus,
 textarea.field:focus {

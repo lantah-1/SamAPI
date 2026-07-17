@@ -50,7 +50,16 @@ export async function refreshCodexTemporaryAccountToken(account: TemporaryAccoun
     },
     body
   }, proxyConfig);
-  if (!response.ok) throw new Error(`刷新 Codex token 失败：${response.status} ${extractUpstreamError(text)}`);
+  if (!response.ok) {
+    const detail = extractUpstreamError(text) || "unknown_error";
+    if (response.status === 400 && /invalid_grant/i.test(detail)) {
+      throw new Error("刷新 Codex token 失败：refresh_token 已失效（invalid_grant），请重新导入该账号");
+    }
+    if ([401, 403].includes(response.status)) {
+      throw new Error(`刷新 Codex token 失败：授权已失效（HTTP ${response.status} ${detail}），请重新导入该账号`);
+    }
+    throw new Error(`刷新 Codex token 失败：HTTP ${response.status} ${detail}`);
+  }
   const payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
   const accessToken = typeof payload.access_token === "string" ? payload.access_token.trim() : "";
   if (!accessToken) throw new Error("刷新 Codex token 失败：响应缺少 access_token");

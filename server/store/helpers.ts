@@ -513,6 +513,30 @@ function parseGrokOAuthImport(content: string, models: string[], mode: Temporary
   }] satisfies TemporaryAccountImportCandidate[];
 }
 
+function parseSub2ApiK12Import(content: string, models: string[]) {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return [];
+  }
+  if (!isRecord(parsed) || stringField(parsed, "type") !== "sub2api-data" || !Array.isArray(parsed.accounts)) return [];
+
+  const output: TemporaryAccountImportCandidate[] = [];
+  for (const item of parsed.accounts) {
+    if (!isRecord(item)) continue;
+    const credentials = isRecord(item.credentials) ? item.credentials : {};
+    const extra = isRecord(item.extra) ? item.extra : {};
+    const platform = stringField(item, "platform")?.toLowerCase();
+    const accountType = stringField(item, "type")?.toLowerCase();
+    const planType = firstStringField([credentials, extra], ["plan_type"])?.toLowerCase();
+    if (platform !== "openai" || accountType !== "oauth" || planType !== "k12") continue;
+    const account = temporaryAccountFromRecord(item, models, `K12 账号 ${output.length + 1}`);
+    if (account) output.push(account);
+  }
+  return output;
+}
+
 export function temporaryAccountFromRecord(
   record: Record<string, unknown>,
   models: string[],
@@ -722,6 +746,7 @@ export function parseTemporaryAccountImport(
   const output: TemporaryAccountImportCandidate[] = [];
   const trimmed = content.trim();
   if (!trimmed) return output;
+  if (mode === "sub2api-k12") return parseSub2ApiK12Import(trimmed, models);
 
   try {
     const parsed = JSON.parse(trimmed);

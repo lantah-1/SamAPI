@@ -165,17 +165,24 @@ export function clearProxyAgent(proxyUrl?: string) {
   proxyAgents.delete(proxyUrl);
 }
 
-function isNetworkError(error: unknown) {
+export function isNetworkError(error: unknown) {
   const message = errorText(error).toLowerCase();
   const cause = nestedErrorCause(error);
   const causeCause = nestedErrorCause(cause);
   const code = errorCode(error) || errorCode(cause) || errorCode(causeCause);
+  // Application-level errors (OAuth invalid_grant, missing model, etc.) may contain
+  // words like "timeout" in Chinese context only via explicit network codes/messages.
+  if (/invalid_grant|oauth token|access_token|请先在上游|仅支持/.test(message)) return false;
   return Boolean(
     code ||
       message.includes("fetch failed") ||
       message.includes("network") ||
       message.includes("timeout") ||
-      message.includes("socket")
+      message.includes("超时") ||
+      message.includes("socket") ||
+      message.includes("econnrefused") ||
+      message.includes("enotfound") ||
+      message.includes("etimedout")
   );
 }
 
@@ -242,6 +249,10 @@ function networkErrorReason(code: string) {
 }
 
 export function upstreamNetworkErrorMessage(error: unknown, fallback: string) {
+  const message = errorText(error).trim() || fallback;
+  // Business failures already carry a clear reason; don't dress them up as proxy issues.
+  if (!isNetworkError(error)) return message;
+
   const cause = nestedErrorCause(error);
   const causeCause = nestedErrorCause(cause);
   const detailSource = causeCause || cause || error;
@@ -250,7 +261,6 @@ export function upstreamNetworkErrorMessage(error: unknown, fallback: string) {
   const host = errorDetailValue(detailSource, "hostname") || errorDetailValue(detailSource, "host");
   const port = errorDetailValue(detailSource, "port");
   const address = errorDetailValue(detailSource, "address");
-  const message = errorText(error);
   const causeMessage = errorText(detailSource);
   const details = [
     reason,
@@ -262,7 +272,7 @@ export function upstreamNetworkErrorMessage(error: unknown, fallback: string) {
   ].filter(Boolean);
   const currentProxy = resolveSystemProxy();
   const proxyHint = currentProxy.url
-    ? `当前系统代理 ${maskedProxyUrl(currentProxy.url)}，请确认代理可访问 OpenAI/Codex`
+    ? `当前系统代理 ${maskedProxyUrl(currentProxy.url)}，请确认代理可访问目标上游`
     : "当前没有检测到系统代理，可在路由或账号检查里选择系统/自定义代理";
   return `${fallback}${details.length > 0 ? `：${details.join("，")}` : `：${message}`}。${proxyHint}`;
 }

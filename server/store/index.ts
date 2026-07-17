@@ -434,6 +434,9 @@ export class JsonStore {
     const unrecognizedFiles = parsedItems.filter((item) => item.accounts.length === 0).map((item) => item.name);
     if (parsedAccounts.length === 0) {
       const names = unrecognizedFiles.length > 0 ? `：${unrecognizedFiles.slice(0, 5).join("、")}` : "";
+      if (input.mode === "sub2api-k12") {
+        throw new Error(`没有解析到可用的 Sub2API K12 账号；需要 type 为 sub2api-data，accounts 内包含 platform=openai、type=oauth、plan_type=k12 且有 access_token 的记录${names}`);
+      }
       throw new Error(providerType === "grok"
         ? `没有解析到可用的 Grok OAuth 账号；仅支持单账号 CPA / grok2api OAuth JSON，暂不支持 SSO JSON 和 accounts 列表${names}`
         : `没有解析到可用账号密钥${names}`);

@@ -1,10 +1,36 @@
 import * as Popover from "@radix-ui/react-popover";
-import { Check, ChevronDown } from "lucide-react";
+import { Check, ChevronDown, Eye, EyeOff } from "lucide-react";
 import { Children, isValidElement, useEffect, useId, useMemo, useState } from "react";
 import { smartModelMatches } from "../app/utils";
 
 export function TextInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
   return <input {...props} className={`field ${props.className || ""}`} />;
+}
+
+export function SecretTextInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
+  const [visible, setVisible] = useState(false);
+  const { className, type: _type, ...rest } = props;
+  return (
+    <div className="secret-field">
+      <input
+        {...rest}
+        type={visible ? "text" : "password"}
+        className={`field secret-field-input ${className || ""}`}
+        autoComplete={rest.autoComplete || "off"}
+        spellCheck={rest.spellCheck ?? false}
+      />
+      <button
+        type="button"
+        className="secret-field-toggle"
+        aria-label={visible ? "隐藏密钥" : "显示密钥"}
+        title={visible ? "隐藏密钥" : "显示密钥"}
+        tabIndex={-1}
+        onClick={() => setVisible((current) => !current)}
+      >
+        {visible ? <EyeOff className="h-4 w-4" aria-hidden="true" /> : <Eye className="h-4 w-4" aria-hidden="true" />}
+      </button>
+    </div>
+  );
 }
 
 function selectOptionLabel(value: React.ReactNode): string {

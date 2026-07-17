@@ -101,7 +101,7 @@ import {
   upstreamAttemptsSummary,
   upstreamRequestBodies
 } from "../app/utils";
-import { ActionButton, SelectInput, TextInput } from "../components/ui";
+import { ActionButton, SecretTextInput, SelectInput, TextInput } from "../components/ui";
 
 export function ProviderKeysView(props: {
   snapshot: AppSnapshot;
@@ -239,8 +239,7 @@ export function ProviderKeysView(props: {
                     ) : (
                       <label>
                         API Key
-                        <TextInput
-                          type="password"
+                        <SecretTextInput
                           value={apiKey.secret}
                           placeholder={selectedSiteIsOfficialOpenAi ? "可留空，或填写 sk-..." : "sk-..."}
                           onChange={(event) => {

@@ -111,6 +111,7 @@ const TEMPORARY_IMPORT_TEXT_FILE = /\.(?:json|jsonl|txt|csv)$/i;
 const temporaryImportModeHints: Record<TemporaryAccountImportMode, string> = {
   auto: "逐个文件识别，适合不确定格式或同时导入多种来源。",
   subapi: "按 Sub2API 来源导入，同时兼容常见账号字段。",
+  "sub2api-k12": "导入 Sub2API 导出的 ChatGPT K12 OAuth 账号列表 JSON。",
   cpa: "按 CPA 来源导入，同时兼容常见账号字段。",
   "auth-json": "适合直接导入 Codex 或 Grok 的 auth.json。",
   zip: "解压后逐文件自动识别，支持 Sub2API、CPA 和 auth.json 混合包。"
@@ -460,7 +461,7 @@ export function TemporaryAccountsView(props: {
                   props.onDraft({
                     ...props.draft,
                     providerType,
-                    mode: providerType === "grok" && props.draft.mode === "auth-json" ? "auto" : props.draft.mode,
+                    mode: providerType === "grok" && ["auth-json", "sub2api-k12"].includes(props.draft.mode) ? "auto" : props.draft.mode,
                     name: `${providerType === "gpt" ? "OpenAI" : "Grok"} 临时账号`
                   });
                 }}>
@@ -484,6 +485,7 @@ export function TemporaryAccountsView(props: {
                 }}>
                   <option value="auto">自动识别（推荐）</option>
                   <option value="subapi">{props.draft.providerType === "grok" ? "grok2api OAuth JSON" : "Sub2API"}</option>
+                  {props.draft.providerType === "gpt" ? <option value="sub2api-k12">Sub2API K12 JSON</option> : null}
                   <option value="cpa">{props.draft.providerType === "grok" ? "CPA OAuth JSON" : "CPA"}</option>
                   {props.draft.providerType === "gpt" ? <option value="auth-json">纯 auth.json</option> : null}
                   <option value="zip">ZIP 混合包</option>
@@ -520,7 +522,9 @@ export function TemporaryAccountsView(props: {
                     value={props.draft.content}
                     placeholder={props.draft.providerType === "grok"
                       ? "粘贴单账号 CPA 或 grok2api OAuth JSON；不支持 SSO、Cookie、纯 token 或 accounts 列表"
-                      : "也可以直接粘贴 JSON、JSONL、Cookie、token 或账号字段"}
+                      : props.draft.mode === "sub2api-k12"
+                        ? "粘贴 type 为 sub2api-data、accounts 中包含 OpenAI K12 OAuth 账号的 JSON"
+                        : "也可以直接粘贴 JSON、JSONL、Cookie、token 或账号字段"}
                     onChange={(event) => props.onDraft({ ...props.draft, content: event.target.value })}
                   />
                 </label>

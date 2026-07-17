@@ -17,7 +17,7 @@ export type AppThemeId = "fresh" | "salt" | "citrus" | "rose" | "midnight";
 
 export type TemporaryAccountImportSource = "cpa" | "subapi";
 
-export type TemporaryAccountImportMode = "auto" | "subapi" | "cpa" | "auth-json" | "zip";
+export type TemporaryAccountImportMode = "auto" | "subapi" | "sub2api-k12" | "cpa" | "auth-json" | "zip";
 
 export type TemporaryAccountProviderType = "gpt" | "grok" | "claude" | "gemini";
 

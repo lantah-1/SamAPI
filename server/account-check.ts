@@ -41,6 +41,18 @@ export function shouldMarkTemporaryAccountUnavailable(statusCode: number, errorM
   );
 }
 
+function isTemporaryAccountAuthFailure(errorMessage = "") {
+  const normalized = errorMessage.toLowerCase();
+  return (
+    normalized.includes("invalid_grant") ||
+    normalized.includes("refresh_token 已失效") ||
+    normalized.includes("授权已失效") ||
+    normalized.includes("unauthorized") ||
+    /刷新 (?:grok oauth|codex) token 失败/.test(normalized) &&
+      (normalized.includes("401") || normalized.includes("403") || normalized.includes("400"))
+  );
+}
+
 export function createAccountCheck(store: JsonStore) {
   function grokConfiguredModels(account: TemporaryAccount) {
     const upstreamModels = Array.from(
@@ -289,14 +301,19 @@ export function createAccountCheck(store: JsonStore) {
         checkedAt
       };
     } catch (error) {
+      const rawMessage = error instanceof Error ? error.message : String(error);
       const errorMessage = upstreamNetworkErrorMessage(error, "账号检查请求上游失败");
       const providerType = account.providerType || "gpt";
-      const availability = providerType === "grok" ? "unknown" : "unavailable";
+      const authFailure = isTemporaryAccountAuthFailure(rawMessage);
+      // Grok network blips stay "unknown" so a flaky proxy doesn't permanently retire the account.
+      // Auth failures (invalid_grant / 401 / 403) are real unavailability and should be marked as such.
+      const availability = providerType === "grok" && !authFailure ? "unknown" : "unavailable";
+      const statusCode = authFailure ? 401 : 599;
       const updated = store.updateTemporaryAccountCheckResult(account.id, {
         availability,
         quotaStages: account.quotaStages,
         lastQuotaCheckedAt: checkedAt,
-        lastCheckStatusCode: 599,
+        lastCheckStatusCode: statusCode,
         lastCheckError: errorMessage
       });
       return {
@@ -305,7 +322,7 @@ export function createAccountCheck(store: JsonStore) {
         label: account.label,
         availability,
         status: "failed",
-        statusCode: 599,
+        statusCode,
         quotaStages: updated?.quotaStages || account.quotaStages,
         errorMessage,
         checkedAt
