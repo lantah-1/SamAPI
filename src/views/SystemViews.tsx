@@ -566,9 +566,9 @@ function LogSummaryDetail(props: { log: RequestLog }) {
   );
 }
 
-function DetailBlock(props: { title: string; value: unknown }) {
+function DetailBlock(props: { title: string; value: unknown; wide?: boolean }) {
   return (
-    <div className="detail-block">
+    <div className={`detail-block${props.wide ? " detail-wide" : ""}`}>
       <div className="detail-title">{props.title}</div>
       <pre>{prettyJson(props.value)}</pre>
     </div>
@@ -605,13 +605,14 @@ function DownstreamHeadersDetail(props: { log: RequestLog }) {
 
 function ForwardingTargetDetail(props: { log: RequestLog }) {
   const log = props.log;
-  const summary = {
+  const forwardingTarget = {
     ...(log.routeTarget || { routeName: log.routeName, model: log.model, endpoint: log.endpoint, providerName: log.providerName }),
     routeId: log.routeId,
-    upstreamUrl: log.upstreamUrl
+    upstreamUrl: log.upstreamUrl,
+    proxy: log.proxy || { mode: "direct" }
   };
 
-  return <SectionedDetailBlock title="转发目标" summary={summary} detail={log.proxy || { mode: "direct" }} />;
+  return <DetailBlock title="转发目标" value={forwardingTarget} wide />;
 }
 
 function UpstreamRequestDetail(props: { log: RequestLog }) {
