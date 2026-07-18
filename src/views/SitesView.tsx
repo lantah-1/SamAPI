@@ -208,42 +208,77 @@ export function SitesView(props: {
               启用站点
             </label>
             <div className="mt-4 space-y-3">
-              {addresses.map((address, index) => (
-                <div key={address.id || index} className="address-block">
-                  <div className="address-block-head">
-                    <div className="text-xs font-black text-ink/55">地址 {index + 1}</div>
-                    <ActionButton
-                      type="button"
-                      tone="danger"
-                      title="删除地址"
-                      disabled={addresses.length <= 1}
-                      onClick={() => removeAddress(index)}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </ActionButton>
-                  </div>
-                  <div className="grid gap-3 md:grid-cols-2">
-                    <label>
-                      地址名称
-                      <TextInput value={address.label} onChange={(event) => updateAddress(index, { label: event.target.value })} />
+              {addresses.map((address, index) => {
+                const addressProxy = normalizedRouteProxy(address.proxy);
+                return (
+                  <div key={address.id || index} className="address-block">
+                    <div className="address-block-head">
+                      <div className="text-xs font-black text-ink/55">地址 {index + 1}</div>
+                      <ActionButton
+                        type="button"
+                        tone="danger"
+                        title="删除地址"
+                        disabled={addresses.length <= 1}
+                        onClick={() => removeAddress(index)}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </ActionButton>
+                    </div>
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <label>
+                        地址名称
+                        <TextInput value={address.label} onChange={(event) => updateAddress(index, { label: event.target.value })} />
+                      </label>
+                      <label>
+                        Base URL
+                        <TextInput
+                          type="url"
+                          inputMode="url"
+                          placeholder="https://api.example.com/v1"
+                          value={address.baseUrl}
+                          onChange={(event) => updateAddress(index, { baseUrl: event.target.value })}
+                        />
+                      </label>
+                    </div>
+                    <div className="mt-3 grid gap-3 md:grid-cols-2">
+                      <label>
+                        代理模式
+                        <SelectInput
+                          value={addressProxy.mode}
+                          onChange={(event) => {
+                            const mode = event.target.value as RouteProxyConfig["mode"];
+                            updateAddress(index, {
+                              proxy: mode === "custom"
+                                ? { mode, url: addressProxy.mode === "custom" ? addressProxy.url : "" }
+                                : { mode }
+                            });
+                          }}
+                        >
+                          <option value="direct">{routeProxyModeLabels.direct}</option>
+                          <option value="system">{routeProxyModeLabels.system}</option>
+                          <option value="custom">{routeProxyModeLabels.custom}</option>
+                        </SelectInput>
+                      </label>
+                      {addressProxy.mode === "custom" ? (
+                        <label>
+                          代理地址
+                          <TextInput
+                            type="url"
+                            inputMode="url"
+                            placeholder="http://127.0.0.1:7890"
+                            value={addressProxy.url || ""}
+                            onChange={(event) => updateAddress(index, { proxy: { mode: "custom", url: event.target.value } })}
+                          />
+                        </label>
+                      ) : null}
+                    </div>
+                    <label className="toggle-row mt-3">
+                      <input type="checkbox" checked={address.enabled} onChange={(event) => updateAddress(index, { enabled: event.target.checked })} />
+                      启用地址
                     </label>
-                    <label>
-                      Base URL
-                      <TextInput
-                        type="url"
-                        inputMode="url"
-                        placeholder="https://api.example.com/v1"
-                        value={address.baseUrl}
-                        onChange={(event) => updateAddress(index, { baseUrl: event.target.value })}
-                      />
-                    </label>
                   </div>
-                  <label className="toggle-row mt-3">
-                    <input type="checkbox" checked={address.enabled} onChange={(event) => updateAddress(index, { enabled: event.target.checked })} />
-                    启用地址
-                  </label>
-                </div>
-              ))}
+                );
+              })}
             </div>
             <div className="mt-4 flex flex-wrap justify-between gap-2">
               <ActionButton

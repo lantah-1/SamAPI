@@ -339,8 +339,10 @@ export function isTerminalStreamEvent(proxyKind: ProxyKind, event: unknown) {
 // Raw passthrough has no parsed events, so the terminal frame has to be spotted in the forwarded
 // text. Returns the marker regex for the kind, or null when the kind has no SSE terminal frame.
 export function terminalSseMarker(proxyKind: ProxyKind): RegExp | null {
-  if (proxyKind === "responses") return /event:\s*response\.(completed|failed|incomplete)\b/;
-  if (proxyKind === "messages") return /event:\s*message_stop\b/;
+  if (proxyKind === "responses") {
+    return /event:\s*response\.(completed|failed|incomplete)\b|"type"\s*:\s*"response\.(completed|failed|incomplete)"/;
+  }
+  if (proxyKind === "messages") return /event:\s*message_stop\b|"type"\s*:\s*"message_stop"/;
   if (proxyKind === "chat-completions" || proxyKind === "generic") return /data:\s*\[DONE\]/;
   return null;
 }
@@ -409,9 +411,14 @@ export async function streamRawResponse(input: {
     if (!marker) continue;
     if (terminalFrame === null) {
       tail += chunk;
-      if (tail.length > 512) tail = tail.slice(-512);
       const match = tail.match(marker);
-      if (match && match.index !== undefined) terminalFrame = tail.slice(match.index);
+      if (match && match.index !== undefined) {
+        terminalFrame = tail.slice(match.index);
+      } else if (tail.length > 512) {
+        // Keep only a marker-sized suffix after searching the full new chunk. Truncating first
+        // drops a terminal marker at the beginning of a large response.completed frame.
+        tail = tail.slice(-512);
+      }
     } else {
       terminalFrame += chunk;
     }

@@ -19,6 +19,7 @@ import type {
   RequestLog,
   RequestLogSummary,
   RouteDisplayGroup,
+  RouteProxyConfig,
   RouteRecord,
   Site,
   SiteAddress,
@@ -81,6 +82,7 @@ export class JsonStore {
     this.sqlite = new DatabaseConstructor(this.sqlitePath);
     this.initializeSqlite();
     this.db = this.load();
+    const migratedRouteProxies = this.migrateRouteProxiesToAddresses();
     this.ensureOfficialChatGptProviderKeyGroup();
     this.ensureOfficialGrokSite();
     this.ensureOfficialGrokProviderKeyGroup();
@@ -88,7 +90,7 @@ export class JsonStore {
     const migratedGrokModels = this.migrateOfficialGrokAddressModelsToProviderKey();
     const removedUnsupportedGrokAccounts = this.removeUnsupportedGrokAccounts();
     this.refreshGroupRouteMembers();
-    if (mergedTemporaryAccounts || migratedGrokModels || removedUnsupportedGrokAccounts) this.persist();
+    if (migratedRouteProxies || mergedTemporaryAccounts || migratedGrokModels || removedUnsupportedGrokAccounts) this.persist();
   }
 
   getDb() {
@@ -959,7 +961,6 @@ export class JsonStore {
       model: input.model.trim(),
       endpoint: input.endpoint || "messages",
       headerTemplateId: input.headerTemplateId || undefined,
-      proxy: normalizeRouteProxy(input.proxy),
       enabled: input.enabled ?? true,
       updatedAt: timestamp
     };
@@ -1013,7 +1014,6 @@ export class JsonStore {
       members,
       endpoint: input.endpoint || "messages",
       headerTemplateId: input.headerTemplateId || undefined,
-      proxy: normalizeRouteProxy(input.proxy),
       enabled: input.enabled ?? true,
       updatedAt: timestamp
     };
@@ -1183,6 +1183,54 @@ export class JsonStore {
     });
   }
 
+  private migrateRouteProxiesToAddresses() {
+    const proxiesBySite = new Map<string, RouteProxyConfig[]>();
+    let changed = false;
+    for (const route of this.db.routes) {
+      const legacyRoute = route as RouteRecord & { proxy?: unknown };
+      const proxy = normalizeRouteProxy(legacyRoute.proxy);
+      if (proxy) {
+        const siteIds = route.type === "switch"
+          ? [route.siteId]
+          : Array.from(new Set((route.members || []).map((member) => member.siteId)));
+        for (const siteId of siteIds) {
+          if (!siteId) continue;
+          const current = proxiesBySite.get(siteId) || [];
+          current.push(proxy);
+          proxiesBySite.set(siteId, current);
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(legacyRoute, "proxy")) {
+        delete legacyRoute.proxy;
+        changed = true;
+      }
+    }
+
+    for (const site of this.db.sites) {
+      const legacyProxies = proxiesBySite.get(site.id) || [];
+      const distinctLegacyProxies = Array.from(
+        new Map(legacyProxies.map((proxy) => [`${proxy.mode}:${proxy.url || ""}`, proxy])).values()
+      );
+      if (distinctLegacyProxies.length > 1) {
+        console.warn(`Supplier ${site.name} had conflicting route proxy settings; migrated the most recent non-direct setting to its addresses.`);
+      }
+      const legacyProxy = distinctLegacyProxies[0];
+      const addresses = site.addresses.map((address) => {
+        const hasAddressProxy = Object.prototype.hasOwnProperty.call(address, "proxy");
+        return this.normalizeAddress({
+          ...address,
+          proxy: hasAddressProxy ? address.proxy : legacyProxy
+        });
+      });
+      if (JSON.stringify(addresses) !== JSON.stringify(site.addresses)) {
+        site.addresses = addresses;
+        site.updatedAt = now();
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
   private normalizeAddress(address: Partial<SiteAddress>): SiteAddress {
     if (!address.label?.trim()) throw new Error("地址名称不能为空");
     if (!address.baseUrl?.trim()) throw new Error("地址 URL 不能为空");
@@ -1194,7 +1242,8 @@ export class JsonStore {
       label: address.label.trim(),
       baseUrl: normalizeBaseUrl(address.baseUrl),
       enabled: address.enabled ?? true,
-      models
+      models,
+      proxy: normalizeRouteProxy(address.proxy)
     };
   }
 

@@ -11,7 +11,8 @@ import { valueToHeaderText } from "./http.js";
 import { modelEndpointCandidates, newApiPricingEndpointCandidates } from "./util/endpoints.js";
 import { CHATGPT_MODELS_URL, CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL, fetchTemporaryAccountCheckText } from "./providers/constants.js";
 import { codexQuotaHeaders, refreshCodexTemporaryAccountToken } from "./providers/codex.js";
-import type { ProviderModelSyncOptions, ProviderModelSyncResult, ProviderModelSyncStatus, Site, SiteAddress } from "../shared/types.js";
+import { fetchWithRouteProxy, requestLogProxyForRoute } from "./proxy.js";
+import type { ProviderModelSyncOptions, ProviderModelSyncResult, ProviderModelSyncStatus, RequestLogProxy, Site, SiteAddress } from "../shared/types.js";
 
 export class ModelDiscoveryOptionsError extends Error {
   readonly modelGroups: Array<{ groupName: string; models: string[] }>;
@@ -117,6 +118,7 @@ export function createModelDiscovery(store: JsonStore) {
     models?: string[];
     errorMessage?: string;
     usesApiKey?: boolean;
+    proxy?: RequestLogProxy;
   }) {
     const maskedApiKey = maskSecret(input.apiKeyValue);
     const responsePreviewText =
@@ -157,11 +159,14 @@ export function createModelDiscovery(store: JsonStore) {
       upstreamUrl: input.target,
       upstreamContentType: input.contentType,
       responsePreview: responsePreviewText ? responsePreview(responsePreviewText) : undefined,
-      errorMessage: input.errorMessage
+      errorMessage: input.errorMessage,
+      proxy: input.proxy || requestLogProxyForRoute(input.address?.proxy)
     });
   }
 
   async function discoverChatGptOfficialModels(siteId: string, site: Site, request: http.IncomingMessage, discoveryStartedAt: number) {
+    const address = site.addresses.find((item) => item.enabled) || site.addresses[0];
+    const proxyConfig = address?.proxy || { mode: "direct" as const };
     const account = store.resolveTemporaryOpenAiAccounts("")[0];
     if (!account) {
       recordModelDiscoveryLog({
@@ -183,10 +188,10 @@ export function createModelDiscovery(store: JsonStore) {
     let tokenPatch: Awaited<ReturnType<typeof refreshCodexTemporaryAccountToken>> | undefined;
     const fetchModels = () => fetchTemporaryAccountCheckText(CHATGPT_MODELS_URL, {
       headers: codexQuotaHeaders(account, accessToken)
-    });
+    }, proxyConfig);
     let attempt = await fetchModels();
     if ([401, 403].includes(attempt.response.status) && account.refreshToken) {
-      tokenPatch = await refreshCodexTemporaryAccountToken(account);
+      tokenPatch = await refreshCodexTemporaryAccountToken(account, proxyConfig);
       if (tokenPatch?.secret) {
         accessToken = tokenPatch.secret;
         attempt = await fetchModels();
@@ -201,6 +206,7 @@ export function createModelDiscovery(store: JsonStore) {
         request,
         siteId,
         site,
+        address,
         target: CHATGPT_MODELS_URL,
         apiKeyValue: "",
         apiKeyName: CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL,
@@ -225,6 +231,7 @@ export function createModelDiscovery(store: JsonStore) {
         request,
         siteId,
         site,
+        address,
         target: CHATGPT_MODELS_URL,
         apiKeyValue: "",
         apiKeyName: CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL,
@@ -245,6 +252,7 @@ export function createModelDiscovery(store: JsonStore) {
       request,
       siteId,
       site,
+      address,
       target: CHATGPT_MODELS_URL,
       apiKeyValue: "",
       apiKeyName: CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL,
@@ -257,7 +265,7 @@ export function createModelDiscovery(store: JsonStore) {
       models,
       usesApiKey: false
     });
-    return { siteId, siteName: site.name, addressId: site.addresses[0]?.id || "", addressLabel: site.addresses[0]?.label || "官方 API", models };
+    return { siteId, siteName: site.name, addressId: address?.id || "", addressLabel: address?.label || "官方 API", models };
   }
 
   async function discoverProviderModels(siteId: string, apiKey: string, apiKeyName: string, request: http.IncomingMessage, kind = "api-key") {
@@ -386,14 +394,14 @@ export function createModelDiscovery(store: JsonStore) {
         const { target } = targetEntry;
         const attemptStartedAt = Date.now();
         try {
-          const upstream = await fetch(target, {
+          const { response: upstream, proxy } = await fetchWithRouteProxy(target, {
             headers: targetEntry.usesApiKey
               ? {
                   Authorization: `Bearer ${apiKeyValue}`,
                   Accept: "application/json"
                 }
               : newApiPricingHeaders(target)
-          });
+          }, address.proxy);
           const contentType = upstream.headers.get("content-type") || "";
           const text = await upstream.text();
           if (!upstream.ok) {
@@ -419,7 +427,8 @@ export function createModelDiscovery(store: JsonStore) {
               contentType,
               responseText: text,
               errorMessage,
-              usesApiKey: targetEntry.usesApiKey
+              usesApiKey: targetEntry.usesApiKey,
+              proxy
             });
             continue;
           }
@@ -442,7 +451,8 @@ export function createModelDiscovery(store: JsonStore) {
               contentType,
               responseText: text,
               errorMessage,
-              usesApiKey: targetEntry.usesApiKey
+              usesApiKey: targetEntry.usesApiKey,
+              proxy
             });
             continue;
           }
@@ -467,7 +477,8 @@ export function createModelDiscovery(store: JsonStore) {
               contentType,
               responseText: text,
               errorMessage,
-              usesApiKey: targetEntry.usesApiKey
+              usesApiKey: targetEntry.usesApiKey,
+              proxy
             });
             continue;
           }
@@ -498,7 +509,8 @@ export function createModelDiscovery(store: JsonStore) {
               contentType,
               responseText: text,
               errorMessage,
-              usesApiKey: targetEntry.usesApiKey
+              usesApiKey: targetEntry.usesApiKey,
+              proxy
             });
             if (targetEntry.discoveryType === "newapi-pricing" && modelGroups.length > 0) {
               throw new ModelDiscoveryOptionsError(errorMessage, modelGroups);
@@ -520,7 +532,8 @@ export function createModelDiscovery(store: JsonStore) {
             contentType,
             responseText: text,
             models: resolvedModels,
-            usesApiKey: targetEntry.usesApiKey
+            usesApiKey: targetEntry.usesApiKey,
+            proxy
           });
           return { siteId, siteName: site.name, addressId: address.id, addressLabel: address.label, models: resolvedModels };
         } catch (error) {

@@ -33,6 +33,7 @@ export function createRouting(store: JsonStore) {
   function markTemporaryAccountAttempt(candidate: ProxyExecutionCandidate, statusCode: number, errorMessage?: string) {
     const account = candidate.temporaryAccount || candidate.temporaryApiKeyAccount;
     if (!account) return;
+    if (statusCode === 499 || /客户端已(?:中止|断开)|\b(?:this|the) operation was aborted\b/i.test(errorMessage || "")) return;
     const checkedAt = new Date().toISOString();
     if (statusCode >= 200 && statusCode < 300 && !errorMessage) {
       store.updateTemporaryAccountCheckResult(account.id, {

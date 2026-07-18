@@ -169,7 +169,6 @@ export function emptyRoute(snapshot?: AppSnapshot, type: RouteType = "switch"): 
       strategy: "stable-first",
       endpoint: "messages",
       headerTemplateId: snapshot?.headerTemplates[0]?.id,
-      proxy: { mode: "direct" },
       enabled: true
     };
   }

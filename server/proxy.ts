@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { URL } from "node:url";
 import { ProxyAgent } from "undici";
 import type { RequestLogProxy, RouteProxyConfig } from "../shared/types.js";
+import { positiveIntegerEnv } from "./util/text.js";
 
 export interface ResolvedProxy {
   mode: RequestLogProxy["mode"];
@@ -145,6 +146,10 @@ export function requestLogProxyForRoute(routeProxyConfig?: RouteProxyConfig, for
 const PROXY_AGENT_CONNECTIONS = 128;
 const PROXY_AGENT_CONNECT_TIMEOUT_MS = 15_000;
 const PROXY_AGENT_HEADERS_TIMEOUT_MS = 60_000;
+// Only applies until fetch receives response headers. Once streaming starts, the body can run
+// arbitrarily long without being interrupted.
+export const UPSTREAM_HEADERS_TIMEOUT_MS = positiveIntegerEnv("SAMAPI_UPSTREAM_HEADERS_TIMEOUT_MS", 30_000);
+const UPSTREAM_HEADERS_TIMEOUT_CODE = "SAMAPI_UPSTREAM_HEADERS_TIMEOUT";
 
 export function proxyAgentFor(proxyUrl: string) {
   const existing = proxyAgents.get(proxyUrl);
@@ -172,6 +177,7 @@ export function isNetworkError(error: unknown) {
   const cause = nestedErrorCause(error);
   const causeCause = nestedErrorCause(cause);
   const code = errorCode(error) || errorCode(cause) || errorCode(causeCause);
+  if (code === UPSTREAM_HEADERS_TIMEOUT_CODE) return false;
   // Application-level errors (OAuth invalid_grant, missing model, etc.) may contain
   // words like "timeout" in Chinese context only via explicit network codes/messages.
   if (/invalid_grant|oauth token|access_token|请先在上游|仅支持/.test(message)) return false;
@@ -188,20 +194,62 @@ export function isNetworkError(error: unknown) {
   );
 }
 
+export function isUpstreamHeadersTimeout(error: unknown) {
+  return errorCode(error) === UPSTREAM_HEADERS_TIMEOUT_CODE;
+}
+
+function requestHeadersTimeoutSignal(parentSignal?: AbortSignal) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const onParentAbort = () => controller.abort(parentSignal?.reason);
+  if (parentSignal) {
+    if (parentSignal.aborted) onParentAbort();
+    else parentSignal.addEventListener("abort", onParentAbort, { once: true });
+  }
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, UPSTREAM_HEADERS_TIMEOUT_MS);
+  return {
+    signal: controller.signal,
+    timedOut: () => timedOut,
+    cleanup: () => {
+      clearTimeout(timer);
+      parentSignal?.removeEventListener("abort", onParentAbort);
+    }
+  };
+}
+
 export async function fetchWithRouteProxy(target: Parameters<typeof fetch>[0], init: RequestInit, routeProxyConfig?: RouteProxyConfig) {
   let resolvedProxy = routeProxy(routeProxyConfig);
   const proxyInit = resolvedProxy.url ? { ...init, dispatcher: proxyAgentFor(resolvedProxy.url) } as RequestInit & { dispatcher: ProxyAgent } : init;
+  const run = async (requestInit: RequestInit) => {
+    const timeout = requestHeadersTimeoutSignal(requestInit.signal || undefined);
+    try {
+      return await fetch(target, { ...requestInit, signal: timeout.signal });
+    } catch (error) {
+      if (timeout.timedOut()) {
+        const timeoutError = new Error(`上游响应头超时（${Math.round(UPSTREAM_HEADERS_TIMEOUT_MS / 1000)} 秒）`);
+        Object.assign(timeoutError, { code: UPSTREAM_HEADERS_TIMEOUT_CODE, cause: error });
+        throw timeoutError;
+      }
+      throw error;
+    } finally {
+      timeout.cleanup();
+    }
+  };
   try {
-    const response = await fetch(target, proxyInit);
+    const response = await run(proxyInit);
     return { response, proxy: { ...resolvedProxy, url: maskedProxyUrlValue(resolvedProxy.url) } satisfies RequestLogProxy };
   } catch (error) {
+    if (isUpstreamHeadersTimeout(error)) throw error;
     // Do not retry aborted requests — the caller (usually the client disconnect handler) meant to cancel.
     if ((error as { name?: string } | undefined)?.name === "AbortError") throw error;
     if (!routeProxyConfig || routeProxyConfig.mode === "direct" || !isNetworkError(error)) throw error;
     clearProxyAgent(resolvedProxy.url);
     resolvedProxy = routeProxy(routeProxyConfig, true);
     const retryInit = resolvedProxy.url ? { ...init, dispatcher: proxyAgentFor(resolvedProxy.url) } as RequestInit & { dispatcher: ProxyAgent } : init;
-    const response = await fetch(target, retryInit);
+    const response = await run(retryInit);
     return { response, proxy: { ...resolvedProxy, url: maskedProxyUrlValue(resolvedProxy.url), retried: true } satisfies RequestLogProxy };
   }
 }

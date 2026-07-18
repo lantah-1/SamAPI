@@ -29,7 +29,8 @@ export const blankAddress: SiteAddress = {
   label: "主地址",
   baseUrl: "",
   enabled: true,
-  models: []
+  models: [],
+  proxy: { mode: "direct" }
 };
 
 export const blankHeaderRow: HeaderKeyValue = {

@@ -31,6 +31,7 @@ export interface SiteAddress {
   baseUrl: string;
   enabled: boolean;
   models: string[];
+  proxy?: RouteProxyConfig;
 }
 
 export interface Site {
@@ -266,7 +267,6 @@ export interface SwitchRoute {
   model: string;
   endpoint: EndpointKind;
   headerTemplateId?: string;
-  proxy?: RouteProxyConfig;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -288,7 +288,6 @@ export interface GroupRoute {
   members: GroupRouteMember[];
   endpoint: EndpointKind;
   headerTemplateId?: string;
-  proxy?: RouteProxyConfig;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -304,7 +303,7 @@ export interface RouteDisplayGroup {
   updatedAt: string;
 }
 
-export type RequestLogStatus = "pending" | "success" | "failed";
+export type RequestLogStatus = "pending" | "success" | "failed" | "cancelled";
 
 export interface RequestLogDownstream {
   model?: string;

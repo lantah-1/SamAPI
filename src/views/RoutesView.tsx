@@ -41,7 +41,6 @@ import type {
   RequestLog,
   RequestLogSummary,
   RouteDisplayGroup,
-  RouteProxyConfig,
   RouteRecord,
   RouteType,
   Site,
@@ -57,7 +56,6 @@ import {
   blankHeaderRow,
   endpointLabels,
   groupStrategyLabels,
-  routeProxyModeLabels,
   routeTypeLabels,
   siteTypeLabels,
   temporaryAccountAvailabilityLabels,
@@ -87,13 +85,11 @@ import {
   isOfficialOpenAiSite,
   mergeModelOptions,
   modelMatchesRule,
-  normalizedRouteProxy,
   optionToMember,
   parseHeaderRows,
   parseModelText,
   prettyJson,
   providerModelOptions,
-  routeProxyConfigsEqual,
   serializeHeaderRows,
   serializeModelText,
   siteModels,
@@ -251,7 +247,7 @@ export function RoutesView(props: {
   const [draftDragIndex, setDraftDragIndex] = useState<number | null>(null);
   const [draftDropTarget, setDraftDropTarget] = useState<ActionDropTarget | null>(null);
   const [activeRouteMenuId, setActiveRouteMenuId] = useState<string | null>(null);
-  const [routeActionEditor, setRouteActionEditor] = useState<{ routeId: string; mode: "strategy" | "proxy" } | null>(null);
+  const [routeActionEditor, setRouteActionEditor] = useState<{ routeId: string; mode: "strategy" } | null>(null);
   const [actionDragIndex, setActionDragIndex] = useState<number | null>(null);
   const [actionDropTarget, setActionDropTarget] = useState<ActionDropTarget | null>(null);
   const draftDragIndexRef = useRef<number | null>(null);
@@ -274,13 +270,6 @@ export function RoutesView(props: {
     updateRouteDraft(route, {
       siteId,
       model: models[0] || ""
-    });
-  };
-  const updateRouteProxy = (route: RouteRecord, mode: RouteProxyConfig["mode"]) => {
-    const currentProxy = routeDraft(route).proxy;
-    const customUrl = currentProxy?.mode === "custom" ? currentProxy.url : route.proxy?.mode === "custom" ? route.proxy.url : currentProxy?.url;
-    updateRouteDraft(route, {
-      proxy: mode === "custom" ? { mode, url: customUrl } : { mode }
     });
   };
   const saveQuickRoute = async (route: RouteRecord) => {
@@ -412,16 +401,16 @@ export function RoutesView(props: {
   const canSaveRoute = draftType !== "group" || selectedAvailableCount > 0;
   const actionRoute = routeActionEditor ? props.snapshot.routes.find((route) => route.id === routeActionEditor.routeId) : undefined;
   const actionDraft = actionRoute ? routeDraft(actionRoute) : undefined;
-  const actionProxy = actionDraft ? normalizedRouteProxy(actionDraft.proxy) : { mode: "direct" as const };
   const actionMembersChanged =
     actionRoute?.type === "group" &&
     actionDraft?.type === "group" &&
     (actionRoute.members || []).map(groupMemberKey).join("\n") !== (actionDraft.members || []).map(groupMemberKey).join("\n");
-  const actionHasChanges = !routeActionEditor || !actionRoute || !actionDraft
-    ? false
-    : routeActionEditor.mode === "strategy"
-      ? actionRoute.type === "group" && ((actionDraft as GroupRoute).strategy !== actionRoute.strategy || actionMembersChanged)
-      : !routeProxyConfigsEqual(actionDraft.proxy, actionRoute.proxy);
+  const actionHasChanges = Boolean(
+    routeActionEditor &&
+    actionRoute?.type === "group" &&
+    actionDraft?.type === "group" &&
+    ((actionDraft as GroupRoute).strategy !== actionRoute.strategy || actionMembersChanged)
+  );
   const actionGroupMembers = actionRoute?.type === "group" && actionDraft?.type === "group" ? actionDraft.members || [] : [];
   const moveActionGroupMember = (index: number, delta: number) => {
     if (!actionRoute || actionRoute.type !== "group" || !actionDraft || actionDraft.type !== "group") return;
@@ -513,7 +502,6 @@ export function RoutesView(props: {
             onEdit={() => props.onEdit(route)}
             onDelete={() => props.onDelete(route.id)}
             onStrategy={() => setRouteActionEditor({ routeId: route.id, mode: "strategy" })}
-            onProxy={() => setRouteActionEditor({ routeId: route.id, mode: "proxy" })}
           />
         </div>
         {isOpen ? (
@@ -613,15 +601,12 @@ export function RoutesView(props: {
               const quickSite = props.snapshot.sites.find((item) => item.id === quick.siteId) || site;
               const models = siteModels(quickSite);
               const modelOptions = mergeModelOptions([quick.model], models);
-              const quickProxy = normalizedRouteProxy(quick.proxy);
-              const hasCustomProxyOption = Boolean(route.proxy?.mode === "custom" && route.proxy.url?.trim());
               const isOpen = Boolean(expanded[route.id]);
               const hasChanges =
                 quick.siteId !== route.siteId ||
                 quick.model !== route.model ||
                 quick.endpoint !== route.endpoint ||
                 quick.headerTemplateId !== route.headerTemplateId ||
-                !routeProxyConfigsEqual(quick.proxy, route.proxy) ||
                 quick.enabled !== route.enabled;
               const toggleRoute = () => setExpanded((current) => ({ ...current, [route.id]: !isOpen }));
               return (
@@ -661,7 +646,6 @@ export function RoutesView(props: {
                       onCopy={() => props.onCopy(route.name)}
                       onEdit={() => props.onEdit(route)}
                       onDelete={() => props.onDelete(route.id)}
-                      onProxy={() => setRouteActionEditor({ routeId: route.id, mode: "proxy" })}
                     />
                   </div>
                   {isOpen ? (
@@ -695,17 +679,6 @@ export function RoutesView(props: {
                                 {model}
                               </option>
                             ))}
-                          </SelectInput>
-                        </label>
-                        <label className="route-quick-control">
-                          <span className="route-quick-label">代理模式</span>
-                          <SelectInput
-                            value={quickProxy.mode}
-                            onChange={(event) => updateRouteProxy(route, event.target.value as RouteProxyConfig["mode"])}
-                          >
-                            <option value="direct">{routeProxyModeLabels.direct}</option>
-                            <option value="system">{routeProxyModeLabels.system}</option>
-                            {hasCustomProxyOption ? <option value="custom">{routeProxyModeLabels.custom}</option> : null}
                           </SelectInput>
                         </label>
                         <label className="route-quick-control">
@@ -855,7 +828,7 @@ export function RoutesView(props: {
             className="modal-panel route-action-modal"
             role="dialog"
             aria-modal="true"
-            aria-label={routeActionEditor.mode === "strategy" ? "更改调用策略" : "切换代理"}
+            aria-label="更改调用策略"
             onSubmit={(event) => {
               event.preventDefault();
               saveQuickRoute(actionRoute).then(() => setRouteActionEditor(null));
@@ -863,7 +836,7 @@ export function RoutesView(props: {
           >
             <div className="form-head route-action-modal-head">
               <div>
-                <h2>{routeActionEditor.mode === "strategy" ? "更改调用策略" : "切换代理"}</h2>
+                <h2>更改调用策略</h2>
                 <div className="mt-1 text-xs font-bold text-ink/55">{actionRoute.name}</div>
               </div>
               <ActionButton type="button" tone="ghost" onClick={() => setRouteActionEditor(null)} title="关闭">
@@ -871,7 +844,7 @@ export function RoutesView(props: {
               </ActionButton>
             </div>
             <div className="route-action-modal-body">
-              {routeActionEditor.mode === "strategy" && actionRoute.type === "group" ? (
+              {actionRoute.type === "group" ? (
                 <>
                   <label>
                     调用策略
@@ -975,31 +948,7 @@ export function RoutesView(props: {
                     </div>
                   ) : null}
                 </>
-              ) : (
-                <div className="form-grid">
-                  <label className="form-span-2">
-                    代理模式
-                    <SelectInput
-                      value={actionProxy.mode}
-                      onChange={(event) => updateRouteProxy(actionRoute, event.target.value as RouteProxyConfig["mode"])}
-                    >
-                      <option value="direct">{routeProxyModeLabels.direct}</option>
-                      <option value="system">{routeProxyModeLabels.system}</option>
-                      <option value="custom">{routeProxyModeLabels.custom}</option>
-                    </SelectInput>
-                  </label>
-                  {actionProxy.mode === "custom" ? (
-                    <label className="form-span-2">
-                      代理地址
-                      <TextInput
-                        value={actionProxy.url || ""}
-                        placeholder="http://127.0.0.1:7890"
-                        onChange={(event) => updateRouteDraft(actionRoute, { proxy: { mode: "custom", url: event.target.value } })}
-                      />
-                    </label>
-                  ) : null}
-                </div>
-              )}
+              ) : null}
             </div>
             <div className="route-action-modal-actions">
               <ActionButton
@@ -1238,33 +1187,6 @@ export function RoutesView(props: {
                     ))}
                   </SelectInput>
                 </label>
-                <label>
-                  代理模式
-                  <SelectInput
-                    value={props.draft.proxy?.mode || "direct"}
-                    onChange={(event) => {
-                      const mode = event.target.value as RouteProxyConfig["mode"];
-                      props.onDraft({
-                        ...props.draft,
-                        proxy: mode === "direct" ? { mode } : { mode, url: props.draft.proxy?.url }
-                      });
-                    }}
-                  >
-                    <option value="direct">{routeProxyModeLabels.direct}</option>
-                    <option value="system">{routeProxyModeLabels.system}</option>
-                    <option value="custom">{routeProxyModeLabels.custom}</option>
-                  </SelectInput>
-                </label>
-                {props.draft.proxy?.mode === "custom" ? (
-                  <label>
-                    代理地址
-                    <TextInput
-                      value={props.draft.proxy.url || ""}
-                      placeholder="http://127.0.0.1:7890"
-                      onChange={(event) => props.onDraft({ ...props.draft, proxy: { mode: "custom", url: event.target.value } })}
-                    />
-                  </label>
-                ) : null}
                 {draftType === "group" ? (
                   <div className="group-model-picker form-span-2">
                     <div className="group-model-head">
@@ -1364,7 +1286,6 @@ function RouteActionMenu(props: {
   onEdit: () => void;
   onDelete: () => void;
   onStrategy?: () => void;
-  onProxy: () => void;
 }) {
   const closeTimerRef = useRef<number | null>(null);
   const supportsHoverMenu = () =>
@@ -1425,11 +1346,6 @@ function RouteActionMenu(props: {
               </button>
             </Popover.Close>
           ) : null}
-          <Popover.Close asChild>
-            <button type="button" onClick={props.onProxy}>
-              切换代理
-            </button>
-          </Popover.Close>
           <Popover.Close asChild>
             <button type="button" onClick={props.onCopy}>
               复制名称

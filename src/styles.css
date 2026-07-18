@@ -2955,6 +2955,11 @@ textarea.field:focus {
   color: var(--muted-strong);
 }
 
+.status-cancelled {
+  background: color-mix(in srgb, var(--muted) 14%, transparent);
+  color: var(--muted-strong);
+}
+
 .log-row-selected {
   border-color: color-mix(in srgb, var(--accent) 42%, transparent);
   background: color-mix(in srgb, var(--accent) 5%, var(--record-bg));

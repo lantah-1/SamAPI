@@ -6,7 +6,6 @@ import type {
   HeaderTemplate,
   ProviderApiKeyKind,
   ProviderModelManageMode,
-  RouteProxyConfig,
   RouteType,
   TemporaryAccountImportSource,
   TemporaryAccountImportMode,
@@ -29,7 +28,6 @@ export interface RouteDraft {
   strategy?: GroupRouteStrategy;
   endpoint?: EndpointKind;
   headerTemplateId?: string;
-  proxy?: RouteProxyConfig;
   enabled?: boolean;
   createdAt?: string;
   updatedAt?: string;

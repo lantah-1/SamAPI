@@ -122,6 +122,7 @@ export function LogsView(props: {
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
   const successCount = logs.filter((log) => log.status === "success").length;
   const failedCount = logs.filter((log) => log.status === "failed").length;
+  const cancelledCount = logs.filter((log) => log.status === "cancelled").length;
   const pendingCount = logs.filter((log) => log.status === "pending").length;
   const hasMore = logs.length < props.total;
 
@@ -140,7 +141,7 @@ export function LogsView(props: {
       <div>
         <h2>请求日志</h2>
         <div className="mt-1 text-xs font-bold text-ink/55">
-          已加载 {logs.length} / 共 {props.total} 条 / 成功 {successCount} / 失败 {failedCount}{pendingCount ? ` / 请求中 ${pendingCount}` : ""} / 5 秒刷新
+          已加载 {logs.length} / 共 {props.total} 条 / 成功 {successCount} / 失败 {failedCount}{cancelledCount ? ` / 已取消 ${cancelledCount}` : ""}{pendingCount ? ` / 请求中 ${pendingCount}` : ""} / 5 秒刷新
         </div>
       </div>
       <div className="flex flex-wrap items-center justify-end gap-2">
@@ -182,6 +183,7 @@ export function LogsView(props: {
 function logStatusLabel(status: RequestLogSummary["status"]) {
   if (status === "success") return "成功";
   if (status === "pending") return "请求中";
+  if (status === "cancelled") return "已取消";
   return "失败";
 }
 

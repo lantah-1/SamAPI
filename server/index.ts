@@ -74,7 +74,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Local access: http://127.0.0.1:${PORT}`);
   console.log(`Database: ${store.dbPath}`);
   console.log(`Web UI: ${WEB_DIR}`);
-  console.log("Fetch proxy: per-route");
+  console.log("Fetch proxy: per-supplier-address");
   startProviderModelSyncScheduler({ syncAllProviderModels });
   if (ADMIN_PASSWORD_IS_DEFAULT && !store.getAdminPasswordHash()) {
     console.warn("Admin password is using the local default: samapi-admin. Set SAMAPI_ADMIN_PASSWORD before exposing SamAPI publicly.");
