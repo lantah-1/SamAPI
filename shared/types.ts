@@ -296,6 +296,14 @@ export interface GroupRoute {
 
 export type RouteRecord = SwitchRoute | GroupRoute;
 
+export interface RouteDisplayGroup {
+  id: string;
+  name: string;
+  routeIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type RequestLogStatus = "pending" | "success" | "failed";
 
 export interface RequestLogDownstream {
@@ -415,6 +423,7 @@ export interface AppDatabase {
   temporaryAccountGroups: TemporaryAccountGroup[];
   headerTemplates: HeaderTemplate[];
   routes: RouteRecord[];
+  routeDisplayGroups: RouteDisplayGroup[];
   settings: AppSettings;
   adminPasswordHash?: string;
 }

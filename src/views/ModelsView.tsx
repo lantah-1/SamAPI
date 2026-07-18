@@ -48,9 +48,6 @@ export function ModelsView(props: {
               <div className="mt-1 text-xs font-bold text-ink/55">
                 {groups.length} 个供应商 · {autoGroupCount} 个自动管理
               </div>
-              <div className="mt-2 text-xs font-bold text-ink/45">
-                列表仅预览。点「编辑」增删模型；「获取模型」拉取该站点；「立即同步」拉取全部站点。自动管理还会在每天约 8:00（随机偏移）自动执行。
-              </div>
             </div>
             <ActionButton
               type="button"
@@ -61,6 +58,9 @@ export function ModelsView(props: {
               <RefreshCw className={`h-4 w-4 ${props.modelSyncing && !props.modelSyncingGroupId ? "animate-spin" : ""}`} />
               立即同步
             </ActionButton>
+          </div>
+          <div className="mb-4 -mt-2 text-xs font-bold text-ink/45">
+            列表仅预览。点「编辑」增删模型；「获取模型」拉取该站点；「立即同步」拉取全部站点。自动管理还会在每天约 8:00（随机偏移）自动执行。
           </div>
           <div className="site-list">
             {groups.map((group) => {

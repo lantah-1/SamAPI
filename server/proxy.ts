@@ -162,6 +162,8 @@ export function proxyAgentFor(proxyUrl: string) {
 
 export function clearProxyAgent(proxyUrl?: string) {
   if (!proxyUrl) return;
+  // Only drop the cached agent. Closing it would abort other concurrent
+  // requests still using the same pool (common during batch account checks).
   proxyAgents.delete(proxyUrl);
 }
 

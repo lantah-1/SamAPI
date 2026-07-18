@@ -38,6 +38,7 @@ import type {
   ProviderModelSyncOptions,
   RequestLog,
   RequestLogSummary,
+  RouteDisplayGroup,
   RouteProxyConfig,
   RouteRecord,
   RouteType,
@@ -138,7 +139,8 @@ import {
   upstreamRequestBodies
 } from "./app/utils";
 
-const TEMPORARY_ACCOUNT_PROGRESS_CONCURRENCY = 6;
+// Keep UI progressive checks aligned with server default; high concurrency stresses local proxies.
+const TEMPORARY_ACCOUNT_PROGRESS_CONCURRENCY = 3;
 
 export default function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus>("checking");
@@ -345,7 +347,7 @@ export default function App() {
 
   const load = async (options: { includeRequestLogs?: boolean; includeTemporaryAccounts?: boolean } = {}) => {
     const currentSnapshot = snapshot;
-    const [bootstrap, settings, sites, apiKeys, providerApiKeyGroups, headerTemplates, routes, requestLogs, temporaryAccountGroups] =
+    const [bootstrap, settings, sites, apiKeys, providerApiKeyGroups, headerTemplates, routes, routeDisplayGroups, requestLogs, temporaryAccountGroups] =
       await Promise.all([
         api.bootstrap(),
         api.listSettings(),
@@ -354,6 +356,7 @@ export default function App() {
         api.listProviderKeyGroups(),
         api.listHeaders(),
         api.listRoutes(),
+        api.listRouteDisplayGroups(),
         options.includeRequestLogs
           ? api.listLogs(LOGS_PAGE_SIZE, 0).then((result) => {
               setLogsTotal(result.total);
@@ -370,6 +373,7 @@ export default function App() {
       providerApiKeyGroups,
       headerTemplates,
       routes,
+      routeDisplayGroups,
       requestLogs,
       temporaryAccountGroups
     };
@@ -693,6 +697,12 @@ export default function App() {
     }, "路由已保存");
   };
 
+  const saveRouteDisplayGroup = (group: Partial<RouteDisplayGroup>) =>
+    mutate(async () => api.saveRouteDisplayGroup(group), "展示分组已保存");
+
+  const deleteRouteDisplayGroup = (id: string) =>
+    mutate(async () => api.deleteRouteDisplayGroup(id), "展示分组已删除");
+
   const saveSite = (event: FormEvent) => {
     event.preventDefault();
     mutate(async () => {
@@ -769,11 +779,10 @@ export default function App() {
     const results = new Array<TemporaryAccountCheckItemResult | undefined>(accountIds.length);
     const errors: unknown[] = [];
     let nextIndex = 0;
-    let stopped = false;
     const workers = Array.from(
       { length: Math.min(TEMPORARY_ACCOUNT_PROGRESS_CONCURRENCY, accountIds.length) },
       async () => {
-        while (!stopped && nextIndex < accountIds.length) {
+        while (nextIndex < accountIds.length) {
           const index = nextIndex;
           nextIndex += 1;
           const accountId = accountIds[index];
@@ -784,8 +793,14 @@ export default function App() {
             results[index] = item;
             applyTemporaryAccountCheckItem(item);
           } catch (error) {
+            // Keep checking remaining accounts — one proxy blip shouldn't abort the whole batch.
+            // Auth failures still surface via toast after the run finishes.
+            if (isUnauthorizedError(error)) {
+              errors.unshift(error);
+              nextIndex = accountIds.length;
+              return;
+            }
             errors.push(error);
-            stopped = true;
           } finally {
             setTemporaryAccountCheckingIds((current) => current.filter((id) => id !== accountId));
           }
@@ -793,15 +808,18 @@ export default function App() {
       }
     );
     await Promise.all(workers);
-    if (errors.length > 0) throw errors[0];
     const completed = results.filter((item): item is TemporaryAccountCheckItemResult => Boolean(item));
+    if (completed.length === 0 && errors.length > 0) throw errors[0];
     return {
-      total: completed.length,
-      available: completed.filter((item) => item.availability === "available").length,
-      unavailable: completed.filter((item) => item.availability === "unavailable").length,
-      unknown: completed.filter((item) => item.availability === "unknown").length,
-      results: completed
-    } satisfies TemporaryAccountCheckResult;
+      result: {
+        total: completed.length,
+        available: completed.filter((item) => item.availability === "available").length,
+        unavailable: completed.filter((item) => item.availability === "unavailable").length,
+        unknown: completed.filter((item) => item.availability === "unknown").length,
+        results: completed
+      } satisfies TemporaryAccountCheckResult,
+      requestFailures: errors.length
+    };
   };
 
   const checkTemporaryAccounts = async () => {
@@ -812,12 +830,13 @@ export default function App() {
     setTemporaryAccountChecking("all");
     setTemporaryAccountCheckingIds(accountIds);
     try {
-      const result = await checkTemporaryAccountIdsProgressively(accountIds);
+      const { result, requestFailures } = await checkTemporaryAccountIdsProgressively(accountIds);
       const temporaryAccountGroups = await api.listTemporaryAccountGroups();
       setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
       setTemporaryAccountsLoaded(true);
       setTemporaryAccountsLoading(false);
-      setToast(`${temporaryAccountProviderLabels[temporaryAccountCheckProviderType]} 账号检查完成：${temporaryAccountCheckSummary(result)}`);
+      const failureHint = requestFailures > 0 ? `，${requestFailures} 个请求失败已跳过` : "";
+      setToast(`${temporaryAccountProviderLabels[temporaryAccountCheckProviderType]} 账号检查完成：${temporaryAccountCheckSummary(result)}${failureHint}`);
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号检查失败");
     } finally {
@@ -841,6 +860,33 @@ export default function App() {
       setToast(`GPT 账号刷新完成：${temporaryAccountCheckSummary(result)}`);
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号刷新失败");
+    } finally {
+      setTemporaryAccountChecking(null);
+      setTemporaryAccountCheckingIds([]);
+    }
+  };
+
+  const checkSelectedTemporaryAccounts = async () => {
+    if (temporaryAccountChecking) return;
+    const currentTypeAccountIds = new Set(
+      (snapshot?.temporaryAccountGroups || [])
+        .filter((group) => (group.providerType || "gpt") === temporaryAccountCheckProviderType)
+        .flatMap((group) => group.accounts.map((account) => account.id))
+    );
+    const accountIds = selectedTemporaryAccountIds.filter((id) => currentTypeAccountIds.has(id));
+    if (accountIds.length === 0) return;
+    setTemporaryAccountChecking("selected");
+    setTemporaryAccountCheckingIds(accountIds);
+    try {
+      const { result, requestFailures } = await checkTemporaryAccountIdsProgressively(accountIds);
+      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
+      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
+      setTemporaryAccountsLoaded(true);
+      setTemporaryAccountsLoading(false);
+      const failureHint = requestFailures > 0 ? `，${requestFailures} 个请求失败已跳过` : "";
+      setToast(`${temporaryAccountProviderLabels[temporaryAccountCheckProviderType]} 选中账号复检完成：${temporaryAccountCheckSummary(result)}${failureHint}`);
+    } catch (error) {
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号复检失败");
     } finally {
       setTemporaryAccountChecking(null);
       setTemporaryAccountCheckingIds([]);
@@ -1248,6 +1294,8 @@ export default function App() {
                 onDelete={(id) => mutate(async () => api.deleteRoute(id), "路由已删除")}
                 onEdit={openEditRoute}
                 onQuickSave={(route) => mutate(async () => api.saveRoute(route), "路由已更新")}
+                onSaveDisplayGroup={saveRouteDisplayGroup}
+                onDeleteDisplayGroup={deleteRouteDisplayGroup}
                 onCopy={copyText}
               />
             )}
@@ -1321,6 +1369,7 @@ export default function App() {
                 onRetry={loadTemporaryAccountGroups}
                 onStrategyChange={(strategy) => mutate(async () => api.updateSettings({ temporaryAccountStrategy: strategy }), "临时账号策略已更新")}
                 onCheckAccount={checkTemporaryAccount}
+                onCheckSelected={checkSelectedTemporaryAccounts}
                 onUpdateAccount={updateTemporaryAccount}
                 onDeleteAccount={deleteTemporaryAccount}
                 onDeleteSelected={deleteSelectedTemporaryAccounts}

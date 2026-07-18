@@ -153,6 +153,7 @@ export function TemporaryAccountsView(props: {
   onRetry: () => void;
   onStrategyChange: (strategy: GroupRouteStrategy) => void;
   onCheckAccount: (id: string) => void;
+  onCheckSelected: () => void;
   onUpdateAccount: (id: string, patch: Partial<TemporaryAccount>) => void;
   onDeleteAccount: (id: string) => void;
   onDeleteSelected: () => void;
@@ -169,6 +170,12 @@ export function TemporaryAccountsView(props: {
   const visibleAvailabilityStats = temporaryAccountAvailabilityStats(visibleAccounts);
   const selectedVisibleAccountIds = props.selectedAccountIds.filter((id) => visibleAccountIdSet.has(id));
   const selectedAccountIdSet = new Set(selectedVisibleAccountIds);
+  const unavailableAccountIds = visibleAccounts
+    .filter((account) => (account.availability || "unknown") === "unavailable")
+    .map((account) => account.id);
+  const uncheckedAccountIds = visibleAccounts
+    .filter((account) => (account.availability || "unknown") === "unknown")
+    .map((account) => account.id);
   const checkingAccountIdSet = new Set(props.checkingAccountIds);
   const currentTypeLabel = temporaryAccountProviderLabels[props.checkProviderType];
   const temporaryAccountStrategy = props.snapshot.settings.temporaryAccountStrategy || "sequential";
@@ -264,57 +271,73 @@ export function TemporaryAccountsView(props: {
             </div>
           </div>
           <div className="temp-account-toolbar">
-            <label className="temp-account-check-provider">
-              <span>检查账号</span>
-              <SelectInput value={props.checkProviderType} onChange={(event) => props.onCheckProviderTypeChange(event.target.value as Extract<TemporaryAccountProviderType, "gpt" | "grok">)}>
-                <option value="gpt">{temporaryAccountProviderLabels.gpt}</option>
-                <option value="grok">{temporaryAccountProviderLabels.grok}</option>
-              </SelectInput>
-            </label>
-            <label className="temp-account-check-proxy">
-              <span>检测代理</span>
-              <SelectInput
-                value={props.checkProxy.mode}
-                onChange={(event) => {
-                  const mode = event.target.value as RouteProxyConfig["mode"];
-                  props.onCheckProxyChange(mode === "custom" ? { mode, url: props.checkProxy.url || "http://127.0.0.1:7897" } : { mode });
-                }}
-              >
-                <option value="system">{routeProxyModeLabels.system}</option>
-                <option value="direct">{routeProxyModeLabels.direct}</option>
-                <option value="custom">防封 Docker / 自定义代理</option>
-              </SelectInput>
-            </label>
-            {props.checkProxy.mode === "custom" ? (
-              <label className="temp-account-check-proxy temp-account-check-proxy-url">
-                <span>代理地址</span>
-                <TextInput
-                  value={props.checkProxy.url || ""}
-                  placeholder="http://127.0.0.1:7897"
-                  onChange={(event) => props.onCheckProxyChange({ mode: "custom", url: event.target.value })}
-                />
+            <div className="temp-account-toolbar-filters">
+              <label className="temp-account-check-provider">
+                <span>检查账号</span>
+                <SelectInput value={props.checkProviderType} onChange={(event) => props.onCheckProviderTypeChange(event.target.value as Extract<TemporaryAccountProviderType, "gpt" | "grok">)}>
+                  <option value="gpt">{temporaryAccountProviderLabels.gpt}</option>
+                  <option value="grok">{temporaryAccountProviderLabels.grok}</option>
+                </SelectInput>
               </label>
-            ) : null}
-            <ActionButton type="button" tone="ghost" disabled={props.checking !== null || visibleAccounts.length === 0} onClick={() => props.onCheck()}>
-              <RefreshCw className={`h-4 w-4 ${props.checking === "all" ? "animate-spin" : ""}`} />
-              检查 {currentTypeLabel}
-            </ActionButton>
-            <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || visibleAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(visibleAccountIds)}>
-              <Check className="h-4 w-4" />
-              全选 {currentTypeLabel}
-            </ActionButton>
-            <ActionButton type="button" tone="danger" disabled={props.deleting !== null || selectedVisibleAccountIds.length === 0} onClick={props.onDeleteSelected}>
-              <Trash2 className="h-4 w-4" />
-              删除选中{selectedVisibleAccountIds.length > 0 ? ` ${selectedVisibleAccountIds.length}` : ""}
-            </ActionButton>
-            <label className="temp-account-strategy">
-              <span>全局复用策略</span>
-              <SelectInput value={temporaryAccountStrategy} onChange={(event) => props.onStrategyChange(event.target.value as GroupRouteStrategy)}>
-                <option value="stable-first">{groupStrategyLabels["stable-first"]}</option>
-                <option value="sequential">{groupStrategyLabels.sequential}</option>
-                <option value="random">{groupStrategyLabels.random}</option>
-              </SelectInput>
-            </label>
+              <label className="temp-account-check-proxy">
+                <span>检测代理</span>
+                <SelectInput
+                  value={props.checkProxy.mode}
+                  onChange={(event) => {
+                    const mode = event.target.value as RouteProxyConfig["mode"];
+                    props.onCheckProxyChange(mode === "custom" ? { mode, url: props.checkProxy.url || "http://127.0.0.1:7897" } : { mode });
+                  }}
+                >
+                  <option value="system">{routeProxyModeLabels.system}</option>
+                  <option value="direct">{routeProxyModeLabels.direct}</option>
+                  <option value="custom">防封 Docker / 自定义代理</option>
+                </SelectInput>
+              </label>
+              {props.checkProxy.mode === "custom" ? (
+                <label className="temp-account-check-proxy temp-account-check-proxy-url">
+                  <span>代理地址</span>
+                  <TextInput
+                    value={props.checkProxy.url || ""}
+                    placeholder="http://127.0.0.1:7897"
+                    onChange={(event) => props.onCheckProxyChange({ mode: "custom", url: event.target.value })}
+                  />
+                </label>
+              ) : null}
+              <label className="temp-account-strategy">
+                <span>全局复用策略</span>
+                <SelectInput value={temporaryAccountStrategy} onChange={(event) => props.onStrategyChange(event.target.value as GroupRouteStrategy)}>
+                  <option value="stable-first">{groupStrategyLabels["stable-first"]}</option>
+                  <option value="sequential">{groupStrategyLabels.sequential}</option>
+                  <option value="random">{groupStrategyLabels.random}</option>
+                </SelectInput>
+              </label>
+            </div>
+            <div className="temp-account-toolbar-actions">
+              <ActionButton type="button" tone="ghost" disabled={props.checking !== null || visibleAccounts.length === 0} onClick={() => props.onCheck()}>
+                <RefreshCw className={`h-4 w-4 ${props.checking === "all" ? "animate-spin" : ""}`} />
+                检查 {currentTypeLabel}
+              </ActionButton>
+              <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || visibleAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(visibleAccountIds)}>
+                <Check className="h-4 w-4" />
+                全选{visibleAccountIds.length > 0 ? ` ${visibleAccountIds.length}` : ""}
+              </ActionButton>
+              <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || unavailableAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(unavailableAccountIds)}>
+                <Check className="h-4 w-4" />
+                选中不可用{unavailableAccountIds.length > 0 ? ` ${unavailableAccountIds.length}` : ""}
+              </ActionButton>
+              <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || uncheckedAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(uncheckedAccountIds)}>
+                <Check className="h-4 w-4" />
+                选中未检查{uncheckedAccountIds.length > 0 ? ` ${uncheckedAccountIds.length}` : ""}
+              </ActionButton>
+              <ActionButton type="button" disabled={props.checking !== null || props.deleting !== null || selectedVisibleAccountIds.length === 0} onClick={props.onCheckSelected}>
+                <RefreshCw className={`h-4 w-4 ${props.checking === "selected" ? "animate-spin" : ""}`} />
+                复检选中{selectedVisibleAccountIds.length > 0 ? ` ${selectedVisibleAccountIds.length}` : ""}
+              </ActionButton>
+              <ActionButton type="button" tone="danger" disabled={props.deleting !== null || selectedVisibleAccountIds.length === 0} onClick={props.onDeleteSelected}>
+                <Trash2 className="h-4 w-4" />
+                删除选中{selectedVisibleAccountIds.length > 0 ? ` ${selectedVisibleAccountIds.length}` : ""}
+              </ActionButton>
+            </div>
           </div>
           <div className="temp-account-groups">
             {visibleGroups.length === 0 ? (

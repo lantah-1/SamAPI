@@ -279,6 +279,16 @@ export function createApiHandler(deps: ApiHandlerDeps) {
         }
       }
 
+      if (parts[1] === "route-display-groups") {
+        if (method === "GET") return sendJson(response, 200, store.getDb().routeDisplayGroups);
+        if (method === "POST") return sendJson(response, 201, store.upsertRouteDisplayGroup(await readJson(request)));
+        if (method === "PATCH") return sendJson(response, 200, store.upsertRouteDisplayGroup({ ...(await readJson(request)), id: routeParam(parts, 2) }));
+        if (method === "DELETE") {
+          store.deleteRouteDisplayGroup(routeParam(parts, 2));
+          return sendJson(response, 200, { ok: true });
+        }
+      }
+
       if (parts[1] === "routes") {
         if (method === "GET") return sendJson(response, 200, store.getDb().routes);
         if (method === "POST") return sendJson(response, 201, store.upsertRoute(await readJson(request)));

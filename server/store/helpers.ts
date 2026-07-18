@@ -802,6 +802,7 @@ export function createEmptyDatabase(): AppDatabase {
     temporaryAccountGroups: [],
     headerTemplates: [],
     routes: [],
+    routeDisplayGroups: [],
     settings: { ...DEFAULT_SETTINGS }
   };
 }

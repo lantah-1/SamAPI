@@ -5,6 +5,9 @@ import {
   ChevronUp,
   Copy,
   Database,
+  Folder,
+  FolderCog,
+  FolderOpen,
   GripVertical,
   KeyRound,
   LockKeyhole,
@@ -37,6 +40,7 @@ import type {
   ProviderModelGroupOption,
   RequestLog,
   RequestLogSummary,
+  RouteDisplayGroup,
   RouteProxyConfig,
   RouteRecord,
   RouteType,
@@ -206,6 +210,8 @@ function beginPointerPriorityDrag(
   window.addEventListener("pointercancel", cancelPointerDrag);
 }
 
+const UNGROUPED_DISPLAY_GROUP_ID = "__ungrouped__";
+
 export function RoutesView(props: {
   snapshot: AppSnapshot;
   draft: RouteDraft;
@@ -219,10 +225,23 @@ export function RoutesView(props: {
   onDelete: (id: string) => void;
   onEdit: (route: RouteRecord) => void;
   onQuickSave: (route: Partial<RouteRecord>) => Promise<void>;
+  onSaveDisplayGroup: (group: Partial<RouteDisplayGroup>) => Promise<void>;
+  onDeleteDisplayGroup: (id: string) => Promise<void>;
   onCopy: (value: string) => void;
 }) {
   const switchRoutes = props.snapshot.routes.filter((route): route is SwitchRoute => route.type === "switch");
   const groupRoutes = props.snapshot.routes.filter((route): route is GroupRoute => route.type === "group");
+  const displayGroups = props.snapshot.routeDisplayGroups || [];
+  const [displayGroupManagerOpen, setDisplayGroupManagerOpen] = useState(false);
+  const [expandedDisplayGroupId, setExpandedDisplayGroupId] = useState<string | null>(null);
+  const toggleDisplayGroup = (id: string) => setExpandedDisplayGroupId((current) => (current === id ? null : id));
+  const groupRouteById = new globalThis.Map(groupRoutes.map((route) => [route.id, route] as const));
+  const displayGroupBuckets = displayGroups.map((group) => ({
+    group,
+    routes: group.routeIds.map((routeId) => groupRouteById.get(routeId)).filter((route): route is GroupRoute => Boolean(route))
+  }));
+  const groupedRouteIds = new Set(displayGroupBuckets.flatMap((bucket) => bucket.routes.map((route) => route.id)));
+  const ungroupedGroupRoutes = groupRoutes.filter((route) => !groupedRouteIds.has(route.id));
   const routeCount = switchRoutes.length + groupRoutes.length;
   const modelOptions = providerModelOptions(props.snapshot);
   const enabledModelOptions = modelOptions.filter((option) => option.enabled);
@@ -443,6 +462,136 @@ export function RoutesView(props: {
     updateRouteDraft(actionRoute, { members: next });
     clearActionDrag();
   };
+  const renderGroupRoute = (route: GroupRoute) => {
+    const stats = groupRouteStats(props.snapshot, route);
+    const memberGroups = groupRouteMemberGroups(props.snapshot, route);
+    const quick = routeDraft(route);
+    const orderedMembers = quick.strategy === "priority" ? groupRouteOrderedMembers(props.snapshot, quick) : [];
+    const isOpen = Boolean(expanded[route.id]);
+    const toggleRoute = () => setExpanded((current) => ({ ...current, [route.id]: !isOpen }));
+    return (
+      <article
+        key={route.id}
+        className={`record route-record group-route-record ${isOpen ? "route-record-open" : ""}`}
+        role="button"
+        tabIndex={0}
+        aria-expanded={isOpen}
+        onClick={toggleRoute}
+        onKeyDown={(event) => {
+          if (event.key !== "Enter" && event.key !== " ") return;
+          event.preventDefault();
+          toggleRoute();
+        }}
+      >
+        <div className="route-record-main">
+          <div className="min-w-0">
+            <div className="route-title-line">
+              <span className="record-title">{route.name}</span>
+            </div>
+            <div className="record-meta">
+              关键词 {route.matchRule || "-"} / {groupStrategyLabels[quick.strategy]} / {endpointLabels[route.endpoint]}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <span className="pill">{stats.providerCount} 个供应商</span>
+              <span className="pill">{stats.keyCount} 个 Key</span>
+              <span className="pill">{stats.modelCount} 个模型</span>
+              <span className="pill">{route.enabled ? "已启用" : "已停用"}</span>
+            </div>
+          </div>
+        </div>
+        <div
+          className="record-actions route-record-actions"
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+        >
+          <RouteActionMenu
+            route={route}
+            open={activeRouteMenuId === route.id}
+            onOpenChange={(open) => setActiveRouteMenuId(open ? route.id : null)}
+            onToggle={() => toggleRouteEnabled(route)}
+            onCopy={() => props.onCopy(route.name)}
+            onEdit={() => props.onEdit(route)}
+            onDelete={() => props.onDelete(route.id)}
+            onStrategy={() => setRouteActionEditor({ routeId: route.id, mode: "strategy" })}
+            onProxy={() => setRouteActionEditor({ routeId: route.id, mode: "proxy" })}
+          />
+        </div>
+        {isOpen ? (
+          <div
+            className="route-detail-panel group-route-detail"
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            <div className="group-route-summary">
+              <div>
+                <span>匹配关键词</span>
+                <strong>{route.matchRule || "-"}</strong>
+              </div>
+              <div>
+                <span>调用策略</span>
+                <strong>{groupStrategyLabels[quick.strategy]}</strong>
+              </div>
+              <div>
+                <span>请求头模板</span>
+                <strong>{props.snapshot.headerTemplates.find((template) => template.id === route.headerTemplateId)?.name || "不使用"}</strong>
+              </div>
+              <div>
+                <span>Endpoint</span>
+                <strong>{endpointLabels[route.endpoint]}</strong>
+              </div>
+            </div>
+            <div className="group-route-members">
+              <div className="group-route-members-head">
+                <strong>组内模型详情</strong>
+                <span>
+                  {stats.providerCount} 个供应商 / {stats.keyCount} 个 Key / {stats.modelCount} 个模型
+                </span>
+              </div>
+              {memberGroups.length === 0 ? (
+                <div className="group-route-empty">暂无可用组内模型</div>
+              ) : quick.strategy === "priority" ? (
+                <ol className="group-route-priority-list">
+                  {orderedMembers.map((member, index) => (
+                    <li key={member.key} className="group-route-priority-item">
+                      <span className="group-priority-rank">{index + 1}</span>
+                      <div className="group-priority-info">
+                        <strong>{member.model}</strong>
+                        <span>
+                          {member.siteName}
+                          {member.apiKeyLabel ? ` · ${member.apiKeyLabel}` : ""}
+                          {member.resolved ? "" : "（已失效）"}
+                        </span>
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              ) : (
+                <div className="group-route-member-list">
+                  {memberGroups.map((provider) => (
+                    <div key={provider.siteId} className="group-route-member-provider">
+                      <div className="group-route-provider-name">{provider.siteName}</div>
+                      {provider.apiKeys.map((apiKey) => (
+                        <div key={apiKey.apiKeyId} className="group-route-member-key">
+                          <div className="group-route-key-name">{apiKey.apiKeyLabel}</div>
+                          <div className="group-route-models">
+                            {apiKey.models.map((model) => (
+                              <span key={model} className="pill pill-muted">
+                                {model}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        ) : null}
+      </article>
+    );
+  };
   return (
     <>
       {routeCount === 0 ? (
@@ -618,145 +767,87 @@ export function RoutesView(props: {
             <div className="form-head">
               <div>
                 <h2>分组型路由</h2>
-                <div className="mt-1 text-xs font-bold text-ink/55">{groupRoutes.length} 条路由</div>
+                <div className="mt-1 text-xs font-bold text-ink/55">
+                  {groupRoutes.length} 条路由{displayGroups.length > 0 ? ` / ${displayGroups.length} 个展示分组` : ""}
+                </div>
               </div>
+              <ActionButton type="button" tone="ghost" onClick={() => setDisplayGroupManagerOpen(true)}>
+                <FolderCog className="h-4 w-4" />
+                管理分组
+              </ActionButton>
             </div>
-            <div className="site-list">
-              {groupRoutes.map((route) => {
-                const stats = groupRouteStats(props.snapshot, route);
-                const memberGroups = groupRouteMemberGroups(props.snapshot, route);
-                const quick = routeDraft(route);
-                const orderedMembers = quick.strategy === "priority" ? groupRouteOrderedMembers(props.snapshot, quick) : [];
-                const isOpen = Boolean(expanded[route.id]);
-                const toggleRoute = () => setExpanded((current) => ({ ...current, [route.id]: !isOpen }));
+            <div className="grid gap-3">
+              {displayGroupBuckets.map((bucket) => {
+                const isOpen = expandedDisplayGroupId === bucket.group.id;
                 return (
-                  <article
-                    key={route.id}
-                    className={`record route-record group-route-record ${isOpen ? "route-record-open" : ""}`}
-                    role="button"
-                    tabIndex={0}
-                    aria-expanded={isOpen}
-                    onClick={toggleRoute}
-                    onKeyDown={(event) => {
-                      if (event.key !== "Enter" && event.key !== " ") return;
-                      event.preventDefault();
-                      toggleRoute();
-                    }}
-                  >
-                    <div className="route-record-main">
-                      <div className="min-w-0">
-                        <div className="route-title-line">
-                          <span className="record-title">{route.name}</span>
-                        </div>
-                        <div className="record-meta">
-                          关键词 {route.matchRule || "-"} / {groupStrategyLabels[quick.strategy]} / {endpointLabels[route.endpoint]}
-                        </div>
-                        <div className="mt-3 flex flex-wrap gap-2">
-                          <span className="pill">{stats.providerCount} 个供应商</span>
-                          <span className="pill">{stats.keyCount} 个 Key</span>
-                          <span className="pill">{stats.modelCount} 个模型</span>
-                          <span className="pill">{route.enabled ? "已启用" : "已停用"}</span>
-                        </div>
-                      </div>
-                    </div>
-                    <div
-                      className="record-actions route-record-actions"
-                      onClick={(event) => event.stopPropagation()}
-                      onKeyDown={(event) => event.stopPropagation()}
+                  <div key={bucket.group.id} className={`route-display-group ${isOpen ? "route-display-group-open" : ""}`}>
+                    <button
+                      type="button"
+                      className="route-display-group-head"
+                      aria-expanded={isOpen}
+                      onClick={() => toggleDisplayGroup(bucket.group.id)}
                     >
-                      <RouteActionMenu
-                        route={route}
-                        open={activeRouteMenuId === route.id}
-                        onOpenChange={(open) => setActiveRouteMenuId(open ? route.id : null)}
-                        onToggle={() => toggleRouteEnabled(route)}
-                        onCopy={() => props.onCopy(route.name)}
-                        onEdit={() => props.onEdit(route)}
-                        onDelete={() => props.onDelete(route.id)}
-                        onStrategy={() => setRouteActionEditor({ routeId: route.id, mode: "strategy" })}
-                        onProxy={() => setRouteActionEditor({ routeId: route.id, mode: "proxy" })}
-                      />
-                    </div>
-                    {isOpen ? (
-                      <div
-                        className="route-detail-panel group-route-detail"
-                        onClick={(event) => event.stopPropagation()}
-                        onKeyDown={(event) => event.stopPropagation()}
-                      >
-                        <div className="group-route-summary">
-                          <div>
-                            <span>匹配关键词</span>
-                            <strong>{route.matchRule || "-"}</strong>
-                          </div>
-                          <div>
-                            <span>调用策略</span>
-                            <strong>{groupStrategyLabels[quick.strategy]}</strong>
-                          </div>
-                          <div>
-                            <span>请求头模板</span>
-                            <strong>{props.snapshot.headerTemplates.find((template) => template.id === route.headerTemplateId)?.name || "不使用"}</strong>
-                          </div>
-                          <div>
-                            <span>Endpoint</span>
-                            <strong>{endpointLabels[route.endpoint]}</strong>
-                          </div>
-                        </div>
-                        <div className="group-route-members">
-                          <div className="group-route-members-head">
-                            <strong>组内模型详情</strong>
-                            <span>
-                              {stats.providerCount} 个供应商 / {stats.keyCount} 个 Key / {stats.modelCount} 个模型
-                            </span>
-                          </div>
-                          {memberGroups.length === 0 ? (
-                            <div className="group-route-empty">暂无可用组内模型</div>
-                          ) : quick.strategy === "priority" ? (
-                            <ol className="group-route-priority-list">
-                              {orderedMembers.map((member, index) => (
-                                <li key={member.key} className="group-route-priority-item">
-                                  <span className="group-priority-rank">{index + 1}</span>
-                                  <div className="group-priority-info">
-                                    <strong>{member.model}</strong>
-                                    <span>
-                                      {member.siteName}
-                                      {member.apiKeyLabel ? ` · ${member.apiKeyLabel}` : ""}
-                                      {member.resolved ? "" : "（已失效）"}
-                                    </span>
-                                  </div>
-                                </li>
-                              ))}
-                            </ol>
-                          ) : (
-                            <div className="group-route-member-list">
-                              {memberGroups.map((provider) => (
-                                <div key={provider.siteId} className="group-route-member-provider">
-                                  <div className="group-route-provider-name">{provider.siteName}</div>
-                                  {provider.apiKeys.map((apiKey) => (
-                                    <div key={apiKey.apiKeyId} className="group-route-member-key">
-                                      <div className="group-route-key-name">{apiKey.apiKeyLabel}</div>
-                                      <div className="group-route-models">
-                                        {apiKey.models.map((model) => (
-                                          <span key={model} className="pill pill-muted">
-                                            {model}
-                                          </span>
-                                        ))}
-                                      </div>
-                                    </div>
-                                  ))}
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
+                      <div className="route-display-group-title">
+                        {isOpen ? <FolderOpen className="h-4 w-4" /> : <Folder className="h-4 w-4" />}
+                        <span>{bucket.group.name}</span>
                       </div>
+                      <span className="route-display-group-count">{bucket.routes.length} 条路由</span>
+                      <ChevronDown className={`route-display-group-chevron h-4 w-4 ${isOpen ? "route-display-group-chevron-open" : ""}`} />
+                    </button>
+                    {isOpen ? (
+                      bucket.routes.length === 0 ? (
+                        <div className="group-route-empty">该分组暂无路由</div>
+                      ) : (
+                        <div className="site-list">{bucket.routes.map((route) => renderGroupRoute(route))}</div>
+                      )
                     ) : null}
-                  </article>
+                  </div>
                 );
               })}
+              {ungroupedGroupRoutes.length > 0 ? (
+                displayGroupBuckets.length > 0 ? (
+                  (() => {
+                    const isOpen = expandedDisplayGroupId === UNGROUPED_DISPLAY_GROUP_ID;
+                    return (
+                      <div className={`route-display-group route-display-group-ungrouped ${isOpen ? "route-display-group-open" : ""}`}>
+                        <button
+                          type="button"
+                          className="route-display-group-head"
+                          aria-expanded={isOpen}
+                          onClick={() => toggleDisplayGroup(UNGROUPED_DISPLAY_GROUP_ID)}
+                        >
+                          <div className="route-display-group-title">
+                            {isOpen ? <FolderOpen className="h-4 w-4" /> : <Folder className="h-4 w-4" />}
+                            <span>未分组</span>
+                          </div>
+                          <span className="route-display-group-count">{ungroupedGroupRoutes.length} 条路由</span>
+                          <ChevronDown className={`route-display-group-chevron h-4 w-4 ${isOpen ? "route-display-group-chevron-open" : ""}`} />
+                        </button>
+                        {isOpen ? (
+                          <div className="site-list">{ungroupedGroupRoutes.map((route) => renderGroupRoute(route))}</div>
+                        ) : null}
+                      </div>
+                    );
+                  })()
+                ) : (
+                  <div className="site-list">{ungroupedGroupRoutes.map((route) => renderGroupRoute(route))}</div>
+                )
+              ) : null}
             </div>
           </section>
         ) : null}
         </div>
       )}
+
+      {displayGroupManagerOpen ? (
+        <RouteDisplayGroupManager
+          groups={displayGroups}
+          groupRoutes={groupRoutes}
+          onClose={() => setDisplayGroupManagerOpen(false)}
+          onSave={props.onSaveDisplayGroup}
+          onDelete={props.onDeleteDisplayGroup}
+        />
+      ) : null}
 
       {routeActionEditor && actionRoute && actionDraft ? (
         <div className="modal-backdrop" role="presentation">
@@ -1357,5 +1448,200 @@ function RouteActionMenu(props: {
         </Popover.Content>
       </Popover.Portal>
     </Popover.Root>
+  );
+}
+
+function RouteDisplayGroupManager(props: {
+  groups: RouteDisplayGroup[];
+  groupRoutes: GroupRoute[];
+  onClose: () => void;
+  onSave: (group: Partial<RouteDisplayGroup>) => Promise<void>;
+  onDelete: (id: string) => Promise<void>;
+}) {
+  const [newName, setNewName] = useState("");
+  const [newRouteIds, setNewRouteIds] = useState<string[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, { name: string; routeIds: string[] }>>({});
+  const [busy, setBusy] = useState(false);
+
+  const groupDraft = (group: RouteDisplayGroup) => drafts[group.id] || { name: group.name, routeIds: group.routeIds };
+  const setGroupDraft = (group: RouteDisplayGroup, patch: Partial<{ name: string; routeIds: string[] }>) => {
+    setDrafts((current) => ({
+      ...current,
+      [group.id]: { ...groupDraft(group), ...patch }
+    }));
+  };
+  const claimedByOther = (excludeGroupId: string | null) => {
+    const claimed = new globalThis.Map<string, string>();
+    for (const group of props.groups) {
+      if (group.id === excludeGroupId) continue;
+      const ids = drafts[group.id]?.routeIds || group.routeIds;
+      for (const routeId of ids) claimed.set(routeId, group.name);
+    }
+    return claimed;
+  };
+  const toggleId = (ids: string[], routeId: string, checked: boolean) =>
+    checked ? [...ids, routeId] : ids.filter((id) => id !== routeId);
+
+  const createGroup = async () => {
+    if (!newName.trim() || busy) return;
+    setBusy(true);
+    try {
+      await props.onSave({ name: newName.trim(), routeIds: newRouteIds });
+      setNewName("");
+      setNewRouteIds([]);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const saveGroup = async (group: RouteDisplayGroup) => {
+    if (busy) return;
+    const draft = groupDraft(group);
+    if (!draft.name.trim()) return;
+    setBusy(true);
+    try {
+      await props.onSave({ id: group.id, name: draft.name.trim(), routeIds: draft.routeIds });
+      setDrafts((current) => {
+        const { [group.id]: _saved, ...rest } = current;
+        return rest;
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+  const deleteGroup = async (id: string) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await props.onDelete(id);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const newClaimed = claimedByOther(null);
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div className="modal-panel route-display-group-modal" role="dialog" aria-modal="true" aria-label="管理展示分组">
+        <div className="form-head route-display-group-modal-head">
+          <div>
+            <h2>管理展示分组</h2>
+            <div className="mt-1 text-xs font-bold text-ink/55">分组仅用于展示，不影响下游请求返回的模型</div>
+          </div>
+          <ActionButton type="button" tone="ghost" onClick={props.onClose} title="关闭">
+            <X className="h-4 w-4" />
+          </ActionButton>
+        </div>
+        <div className="route-display-group-modal-body">
+          <div className="route-display-group-editor">
+            <div className="route-display-group-editor-head">
+              <strong>新增分组</strong>
+            </div>
+            <TextInput
+              value={newName}
+              placeholder="分组名称，例如 openAi"
+              onChange={(event) => setNewName(event.target.value)}
+            />
+            {props.groupRoutes.length === 0 ? (
+              <div className="group-route-empty">暂无分组型路由</div>
+            ) : (
+              <div className="route-display-group-route-picker">
+                {props.groupRoutes.map((route) => {
+                  const owner = newClaimed.get(route.id);
+                  const checked = newRouteIds.includes(route.id);
+                  const disabled = Boolean(owner) && !checked;
+                  return (
+                    <label
+                      key={route.id}
+                      className={`route-display-group-route-option ${checked ? "route-display-group-route-option-checked" : ""} ${disabled ? "route-display-group-route-option-disabled" : ""}`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={disabled}
+                        onChange={(event) => setNewRouteIds((ids) => toggleId(ids, route.id, event.target.checked))}
+                      />
+                      <span>{route.name}</span>
+                      {disabled ? <span className="route-display-group-route-owner">已在「{owner}」</span> : null}
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+            <div className="route-display-group-editor-actions">
+              <ActionButton type="button" disabled={!newName.trim() || busy} onClick={createGroup}>
+                <Plus className="h-4 w-4" />
+                创建分组
+              </ActionButton>
+            </div>
+          </div>
+
+          {props.groups.length === 0 ? (
+            <div className="group-route-empty">暂无展示分组</div>
+          ) : (
+            props.groups.map((group) => {
+              const draft = groupDraft(group);
+              const claimed = claimedByOther(group.id);
+              const changed = draft.name !== group.name || draft.routeIds.join("\n") !== group.routeIds.join("\n");
+              return (
+                <div key={group.id} className="route-display-group-editor">
+                  <div className="route-display-group-editor-head">
+                    <TextInput value={draft.name} onChange={(event) => setGroupDraft(group, { name: event.target.value })} />
+                    <ActionButton type="button" tone="danger" title="删除分组" disabled={busy} onClick={() => deleteGroup(group.id)}>
+                      <Trash2 className="h-4 w-4" />
+                    </ActionButton>
+                  </div>
+                  {props.groupRoutes.length === 0 ? (
+                    <div className="group-route-empty">暂无分组型路由</div>
+                  ) : (
+                    <div className="route-display-group-route-picker">
+                      {props.groupRoutes.map((route) => {
+                        const owner = claimed.get(route.id);
+                        const checked = draft.routeIds.includes(route.id);
+                        const disabled = Boolean(owner) && !checked;
+                        return (
+                          <label
+                            key={route.id}
+                            className={`route-display-group-route-option ${checked ? "route-display-group-route-option-checked" : ""} ${disabled ? "route-display-group-route-option-disabled" : ""}`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              disabled={disabled}
+                              onChange={(event) => setGroupDraft(group, { routeIds: toggleId(draft.routeIds, route.id, event.target.checked) })}
+                            />
+                            <span>{route.name}</span>
+                            {disabled ? <span className="route-display-group-route-owner">已在「{owner}」</span> : null}
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                  <div className="route-display-group-editor-actions">
+                    <ActionButton
+                      type="button"
+                      tone="ghost"
+                      disabled={!changed || busy}
+                      onClick={() =>
+                        setDrafts((current) => {
+                          const { [group.id]: _discarded, ...rest } = current;
+                          return rest;
+                        })
+                      }
+                    >
+                      还原
+                    </ActionButton>
+                    <ActionButton type="button" disabled={!changed || !draft.name.trim() || busy} onClick={() => saveGroup(group)}>
+                      <Save className="h-4 w-4" />
+                      保存
+                    </ActionButton>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+    </div>
   );
 }

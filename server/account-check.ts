@@ -1,6 +1,6 @@
 import type { JsonStore } from "./store.js";
 import { extractUpstreamError, mapWithConcurrency } from "./util/text.js";
-import { upstreamNetworkErrorMessage } from "./proxy.js";
+import { isNetworkError, upstreamNetworkErrorMessage } from "./proxy.js";
 import {
   OPENAI_MODELS_URL,
   TEMPORARY_ACCOUNT_CHECK_CONCURRENCY,
@@ -303,11 +303,13 @@ export function createAccountCheck(store: JsonStore) {
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error);
       const errorMessage = upstreamNetworkErrorMessage(error, "账号检查请求上游失败");
-      const providerType = account.providerType || "gpt";
       const authFailure = isTemporaryAccountAuthFailure(rawMessage);
-      // Grok network blips stay "unknown" so a flaky proxy doesn't permanently retire the account.
+      // Network/proxy blips stay "unknown" for every provider so a flaky local proxy
+      // (especially under concurrent batch checks) doesn't permanently retire the account.
       // Auth failures (invalid_grant / 401 / 403) are real unavailability and should be marked as such.
-      const availability = providerType === "grok" && !authFailure ? "unknown" : "unavailable";
+      const availability = authFailure ? "unavailable" as const : isNetworkError(error) || /超时|代理|fetch failed|network/i.test(rawMessage)
+        ? "unknown" as const
+        : "unavailable" as const;
       const statusCode = authFailure ? 401 : 599;
       const updated = store.updateTemporaryAccountCheckResult(account.id, {
         availability,

@@ -13,6 +13,7 @@ import type {
   ProviderModelSyncResult,
   RequestLog,
   RequestLogPage,
+  RouteDisplayGroup,
   RouteRecord,
   Site,
   TemporaryAccountGroup,
@@ -179,6 +180,13 @@ export const api = {
       body: JSON.stringify(route)
     }),
   deleteRoute: (id: string) => request<{ ok: true }>(`/api/routes/${id}`, { method: "DELETE" }),
+  listRouteDisplayGroups: () => request<RouteDisplayGroup[]>("/api/route-display-groups"),
+  saveRouteDisplayGroup: (group: Partial<RouteDisplayGroup>) =>
+    request<RouteDisplayGroup>(group.id ? `/api/route-display-groups/${group.id}` : "/api/route-display-groups", {
+      method: group.id ? "PATCH" : "POST",
+      body: JSON.stringify(group)
+    }),
+  deleteRouteDisplayGroup: (id: string) => request<{ ok: true }>(`/api/route-display-groups/${id}`, { method: "DELETE" }),
   listLogs: (limit = 3, offset = 0) =>
     request<RequestLogPage>(`/api/logs?limit=${encodeURIComponent(String(limit))}&offset=${encodeURIComponent(String(offset))}`),
   listNewLogs: (since: string, limit = 25) =>

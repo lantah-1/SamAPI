@@ -18,6 +18,7 @@ import type {
   ProviderModelSyncStatus,
   RequestLog,
   RequestLogSummary,
+  RouteDisplayGroup,
   RouteRecord,
   Site,
   SiteAddress,
@@ -1046,7 +1047,77 @@ export class JsonStore {
 
   deleteRoute(id: string) {
     this.db.routes = this.db.routes.filter((route) => route.id !== id);
+    this.pruneRouteDisplayGroups();
     this.persist();
+  }
+
+  listRouteDisplayGroups() {
+    return this.db.routeDisplayGroups;
+  }
+
+  upsertRouteDisplayGroup(input: Partial<RouteDisplayGroup>) {
+    const timestamp = now();
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    if (!name) throw new Error("分组名称不能为空");
+    const routeIds = this.normalizeDisplayGroupRouteIds(input.routeIds, input.id);
+
+    if (input.id) {
+      const current = this.db.routeDisplayGroups.find((group) => group.id === input.id);
+      if (!current) throw new Error("展示分组不存在");
+      current.name = name;
+      current.routeIds = routeIds;
+      current.updatedAt = timestamp;
+      this.persist();
+      return current;
+    }
+
+    const created: RouteDisplayGroup = {
+      id: `route-display-group-${randomUUID()}`,
+      name,
+      routeIds,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    this.db.routeDisplayGroups.unshift(created);
+    this.persist();
+    return created;
+  }
+
+  deleteRouteDisplayGroup(id: string) {
+    this.db.routeDisplayGroups = this.db.routeDisplayGroups.filter((group) => group.id !== id);
+    this.persist();
+  }
+
+  private normalizeDisplayGroupRouteIds(routeIds: unknown, currentGroupId?: string) {
+    const groupRouteIds = new Set(this.db.routes.filter((route) => route.type === "group").map((route) => route.id));
+    const claimedElsewhere = new Set(
+      this.db.routeDisplayGroups
+        .filter((group) => group.id !== currentGroupId)
+        .flatMap((group) => group.routeIds)
+    );
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const value of Array.isArray(routeIds) ? routeIds : []) {
+      const routeId = String(value);
+      if (!groupRouteIds.has(routeId) || claimedElsewhere.has(routeId) || seen.has(routeId)) continue;
+      seen.add(routeId);
+      result.push(routeId);
+    }
+    return result;
+  }
+
+  private pruneRouteDisplayGroups() {
+    const groupRouteIds = new Set(this.db.routes.filter((route) => route.type === "group").map((route) => route.id));
+    let changed = false;
+    for (const group of this.db.routeDisplayGroups) {
+      const filtered = group.routeIds.filter((routeId) => groupRouteIds.has(routeId));
+      if (filtered.length !== group.routeIds.length) {
+        group.routeIds = filtered;
+        group.updatedAt = now();
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   resolveRoute(routeNameOrId: string) {
@@ -1147,6 +1218,7 @@ export class JsonStore {
       CREATE INDEX IF NOT EXISTS idx_temporary_accounts_availability ON temporary_accounts(availability);
       CREATE TABLE IF NOT EXISTS header_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, headers_text TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS routes (id TEXT PRIMARY KEY, type TEXT NOT NULL, data_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS route_display_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, route_ids_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS request_logs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, data_json TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at);
     `);
@@ -1202,6 +1274,7 @@ export class JsonStore {
       temporaryAccountGroups: this.loadTemporaryAccountGroups(legacyTemporaryAccountGroups),
       headerTemplates: parsed.headerTemplates || [],
       routes: (parsed.routes || []) as RouteRecord[],
+      routeDisplayGroups: this.normalizeRouteDisplayGroups(parsed.routeDisplayGroups),
       settings,
       adminPasswordHash: normalizePasswordHash(parsed.adminPasswordHash)
     };
@@ -1299,7 +1372,16 @@ export class JsonStore {
       updatedAt: String(row.updated_at)
     }));
     const routes = (this.sqlite.prepare("SELECT data_json FROM routes ORDER BY created_at DESC").all() as Array<{ data_json: string }>).map((row) => JSON.parse(row.data_json) as RouteRecord);
-    return { sites, apiKeys, providerApiKeyGroups, temporaryAccountGroups, headerTemplates, routes, settings: normalizeSettings(rawSettings), adminPasswordHash: normalizePasswordHash(auth?.admin_password_hash) };
+    const routeDisplayGroups = this.normalizeRouteDisplayGroups(
+      (this.sqlite.prepare("SELECT * FROM route_display_groups ORDER BY created_at DESC").all() as Array<Record<string, unknown>>).map((row) => ({
+        id: String(row.id),
+        name: String(row.name),
+        routeIds: JSON.parse(String(row.route_ids_json || "[]")),
+        createdAt: String(row.created_at),
+        updatedAt: String(row.updated_at)
+      }))
+    );
+    return { sites, apiKeys, providerApiKeyGroups, temporaryAccountGroups, headerTemplates, routes, routeDisplayGroups, settings: normalizeSettings(rawSettings), adminPasswordHash: normalizePasswordHash(auth?.admin_password_hash) };
   }
 
   private loadTemporaryAccountGroups(fallback: TemporaryAccountGroup[] = []) {
@@ -1349,6 +1431,7 @@ export class JsonStore {
   private replaceSqliteDatabase(db: AppDatabase, requestLogs = this.requestLogs) {
     const replace = this.sqlite.transaction(() => {
       this.sqlite.prepare("DELETE FROM request_logs").run();
+      this.sqlite.prepare("DELETE FROM route_display_groups").run();
       this.sqlite.prepare("DELETE FROM routes").run();
       this.sqlite.prepare("DELETE FROM header_templates").run();
       this.sqlite.prepare("DELETE FROM temporary_accounts").run();
@@ -1403,6 +1486,8 @@ export class JsonStore {
     for (const template of db.headerTemplates) insertHeader.run(template.id, template.name, template.headersText, template.createdAt, template.updatedAt);
     const insertRoute = this.sqlite.prepare("INSERT INTO routes (id, type, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
     for (const route of db.routes) insertRoute.run(route.id, route.type, JSON.stringify(route), route.createdAt, route.updatedAt);
+    const insertRouteDisplayGroup = this.sqlite.prepare("INSERT INTO route_display_groups (id, name, route_ids_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
+    for (const group of db.routeDisplayGroups) insertRouteDisplayGroup.run(group.id, group.name, JSON.stringify(group.routeIds || []), group.createdAt, group.updatedAt);
     const insertLog = this.sqlite.prepare("INSERT INTO request_logs (id, created_at, data_json) VALUES (?, ?, ?)");
     for (const log of requestLogs.slice().reverse()) insertLog.run(log.id, log.createdAt, JSON.stringify(log));
   }
@@ -1458,6 +1543,34 @@ export class JsonStore {
       models,
       lastCheckedAt: input.lastCheckedAt
     };
+  }
+
+  private normalizeRouteDisplayGroups(input: unknown): RouteDisplayGroup[] {
+    if (!Array.isArray(input)) return [];
+    const timestamp = now();
+    const claimed = new Set<string>();
+    const groups: RouteDisplayGroup[] = [];
+    for (const raw of input) {
+      if (!raw || typeof raw !== "object") continue;
+      const record = raw as Partial<RouteDisplayGroup>;
+      const name = typeof record.name === "string" ? record.name.trim() : "";
+      if (!record.id || !name) continue;
+      const routeIds: string[] = [];
+      for (const value of Array.isArray(record.routeIds) ? record.routeIds : []) {
+        const routeId = String(value);
+        if (claimed.has(routeId)) continue;
+        claimed.add(routeId);
+        routeIds.push(routeId);
+      }
+      groups.push({
+        id: String(record.id),
+        name,
+        routeIds,
+        createdAt: record.createdAt || timestamp,
+        updatedAt: record.updatedAt || timestamp
+      });
+    }
+    return groups;
   }
 
   private normalizeProviderApiKeyGroup(group: Partial<ProviderApiKeyGroup> & Pick<ProviderApiKeyGroup, "id" | "siteId" | "groupName" | "apiKeys" | "createdAt" | "updatedAt">): ProviderApiKeyGroup {

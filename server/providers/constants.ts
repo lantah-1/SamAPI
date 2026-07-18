@@ -1,5 +1,5 @@
 import type { ProxyAgent } from "undici";
-import { proxyAgentFor, routeProxy } from "../proxy.js";
+import { clearProxyAgent, isNetworkError, proxyAgentFor, routeProxy } from "../proxy.js";
 import { positiveIntegerEnv } from "../util/text.js";
 import type { RouteProxyConfig } from "../../shared/types.js";
 
@@ -17,36 +17,53 @@ export const XAI_CLI_CHAT_PROXY_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
 export const CHATGPT_MODELS_URL = "https://chatgpt.com/backend-api/models";
 export const CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL = "ChatGPT 官方";
 export const TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS = positiveIntegerEnv("SAMAPI_TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS", 15_000);
-export const TEMPORARY_ACCOUNT_CHECK_CONCURRENCY = positiveIntegerEnv("SAMAPI_TEMPORARY_ACCOUNT_CHECK_CONCURRENCY", 6);
+// Keep batch checks gentle on local proxies — concurrent OAuth + usage probes amplify load quickly.
+export const TEMPORARY_ACCOUNT_CHECK_CONCURRENCY = positiveIntegerEnv("SAMAPI_TEMPORARY_ACCOUNT_CHECK_CONCURRENCY", 3);
 
 export async function fetchTemporaryAccountCheckText(input: Parameters<typeof fetch>[0], init: RequestInit = {}, proxyConfig: RouteProxyConfig = { mode: "system" }) {
-  const controller = new AbortController();
-  let timedOut = false;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS);
+  const run = async (forceSystemRefresh = false) => {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS);
+
+    try {
+      const resolvedProxy = routeProxy(proxyConfig, forceSystemRefresh);
+      const proxyInit = resolvedProxy.url
+        ? { ...init, dispatcher: proxyAgentFor(resolvedProxy.url) } as RequestInit & { dispatcher: ProxyAgent }
+        : init;
+      const response = await fetch(input, {
+        ...proxyInit,
+        signal: controller.signal
+      });
+      return {
+        response,
+        text: await response.text(),
+        proxyUrl: resolvedProxy.url
+      };
+    } catch (error) {
+      if (timedOut) {
+        throw new Error(`账号检查请求超时（${Math.round(TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS / 1000)} 秒）`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
 
   try {
-    const resolvedProxy = routeProxy(proxyConfig);
-    const proxyInit = resolvedProxy.url
-      ? { ...init, dispatcher: proxyAgentFor(resolvedProxy.url) } as RequestInit & { dispatcher: ProxyAgent }
-      : init;
-    const response = await fetch(input, {
-      ...proxyInit,
-      signal: controller.signal
-    });
-    return {
-      response,
-      text: await response.text()
-    };
+    const result = await run(false);
+    return { response: result.response, text: result.text };
   } catch (error) {
-    if (timedOut) {
-      throw new Error(`账号检查请求超时（${Math.round(TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS / 1000)} 秒）`);
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
+    // Match fetchWithRouteProxy: concurrent checks can poison a pooled ProxyAgent.
+    // Clear it and retry once so a transient proxy blip doesn't fail the whole batch.
+    if (proxyConfig.mode === "direct" || !isNetworkError(error)) throw error;
+    const failedProxy = routeProxy(proxyConfig);
+    clearProxyAgent(failedProxy.url);
+    const result = await run(true);
+    return { response: result.response, text: result.text };
   }
 }
 
