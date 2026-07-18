@@ -18,6 +18,7 @@ import type {
   ProviderModelSyncStatus,
   RequestLog,
   RequestLogSummary,
+  RequestLogUpstreamRequest,
   RouteDisplayGroup,
   RouteProxyConfig,
   RouteRecord,
@@ -60,6 +61,14 @@ import {
   smartModelMatches,
   temporaryAccountCanBeUsed
 } from "./helpers.js";
+
+function normalizeRequestLogShape(log: RequestLog): RequestLog {
+  const legacy = log as RequestLog & { upstreamAttempts?: RequestLogUpstreamRequest[] };
+  if (log.upstreamRequest || !Array.isArray(legacy.upstreamAttempts)) return log;
+  const upstreamRequest = legacy.upstreamAttempts.at(-1);
+  const { upstreamAttempts: _upstreamAttempts, ...rest } = legacy;
+  return upstreamRequest ? { ...rest, upstreamRequest } : rest;
+}
 
 export class JsonStore {
   readonly dataDir: string;
@@ -1457,7 +1466,7 @@ export class JsonStore {
     for (const line of lines) {
       try {
         const parsed = JSON.parse(line) as RequestLog;
-        if (parsed.id && parsed.createdAt) logs.push(parsed);
+        if (parsed.id && parsed.createdAt) logs.push(normalizeRequestLogShape(parsed));
       } catch {
         // Ignore malformed log lines so one bad append does not break startup.
       }
@@ -1466,7 +1475,7 @@ export class JsonStore {
   }
 
   private loadRequestLogsFromSqlite(limit: number) {
-    return (this.sqlite.prepare("SELECT data_json FROM request_logs ORDER BY created_at DESC LIMIT ?").all(limit) as Array<{ data_json: string }>).map((row) => JSON.parse(row.data_json) as RequestLog);
+    return (this.sqlite.prepare("SELECT data_json FROM request_logs ORDER BY created_at DESC LIMIT ?").all(limit) as Array<{ data_json: string }>).map((row) => normalizeRequestLogShape(JSON.parse(row.data_json) as RequestLog));
   }
 
   private rewriteRequestLogFile() {

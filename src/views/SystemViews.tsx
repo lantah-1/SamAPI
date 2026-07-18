@@ -97,8 +97,8 @@ import {
   temporaryAccountQuotaText,
   temporaryAccountTypeLabel,
   uniqueMembers,
-  upstreamAttemptsSummary,
-  upstreamRequestBodies
+  upstreamRequestSummary,
+  upstreamRequestBody
 } from "../app/utils";
 import { ActionButton, SelectInput, TextInput } from "../components/ui";
 
@@ -616,7 +616,7 @@ function ForwardingTargetDetail(props: { log: RequestLog }) {
 
 function UpstreamRequestDetail(props: { log: RequestLog }) {
   const log = props.log;
-  return <SectionedDetailBlock title="上游请求" summary={upstreamAttemptsSummary(log)} detail={upstreamRequestBodies(log)} />;
+  return <SectionedDetailBlock title="上游请求" summary={upstreamRequestSummary(log)} detail={upstreamRequestBody(log)} />;
 }
 
 function UsageCopyRow(props: { label: string; value: string; note: string; onCopy: (value: string) => void }) {

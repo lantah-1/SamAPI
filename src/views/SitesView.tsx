@@ -97,8 +97,8 @@ import {
   temporaryAccountQuotaText,
   temporaryAccountTypeLabel,
   uniqueMembers,
-  upstreamAttemptsSummary,
-  upstreamRequestBodies
+  upstreamRequestSummary,
+  upstreamRequestBody
 } from "../app/utils";
 import { ActionButton, SelectInput, TextInput } from "../components/ui";
 

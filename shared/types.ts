@@ -328,7 +328,7 @@ export interface RequestLogProxy {
   retried?: boolean;
 }
 
-export interface RequestLogUpstreamAttempt {
+export interface RequestLogUpstreamRequest {
   addressLabel?: string;
   upstreamUrl: string;
   method: string;
@@ -370,7 +370,7 @@ export interface RequestLog {
   errorMessage?: string;
   downstream?: RequestLogDownstream;
   routeTarget?: RequestLogRouteTarget;
-  upstreamAttempts?: RequestLogUpstreamAttempt[];
+  upstreamRequest?: RequestLogUpstreamRequest;
   proxy?: RequestLogProxy;
   summary?: string;
 }

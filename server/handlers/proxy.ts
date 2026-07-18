@@ -47,7 +47,7 @@ import {
   refreshGrokOAuthTemporaryAccountToken
 } from "../providers/grok.js";
 import type { ProxyExecutionCandidate } from "../routing.js";
-import type { RequestLog, RequestLogStatus, RouteRecord, SiteAddress } from "../../shared/types.js";
+import type { RequestLog, RequestLogStatus, RequestLogUpstreamRequest, RouteRecord, SiteAddress } from "../../shared/types.js";
 
 function chainSummary(input: {
   downstreamModel?: string;
@@ -327,8 +327,8 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
             upstreamAuthLog: Record<string, string>;
           }
         | undefined;
-      const upstreamAttempts: NonNullable<RequestLog["upstreamAttempts"]> = [];
-      type UpstreamAttempt = NonNullable<RequestLog["upstreamAttempts"]>[number];
+      const upstreamAttempts: RequestLogUpstreamRequest[] = [];
+      type UpstreamAttempt = RequestLogUpstreamRequest;
       const recordAttemptLog = (input: {
         candidate: ProxyExecutionCandidate;
         attempt: UpstreamAttempt;
@@ -360,7 +360,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
         errorMessage: input.attempt.errorMessage,
         downstream: downstreamLog,
         routeTarget: input.routeTargetLog,
-        upstreamAttempts: [input.attempt],
+        upstreamRequest: input.attempt,
         proxy: input.proxy || requestLogProxyForRoute(input.proxyConfig),
         summary: chainSummary({
           downstreamModel: downstreamLog.model,
@@ -509,7 +509,6 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                   upstreamContentType: contentType,
                   downstream: downstreamLog,
                   routeTarget: codexRouteTargetLog,
-                  upstreamAttempts: [],
                   proxy: attemptProxy,
                   summary: chainSummary({
                     downstreamModel: downstreamLog.model,
@@ -572,7 +571,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                     responsePreview: responsePreview(streamPreviewText),
                     downstream: downstreamLog,
                     routeTarget: codexRouteTargetLog,
-                    upstreamAttempts: [upstreamAttempts[upstreamAttempts.length - 1]],
+                    upstreamRequest: upstreamAttempts[upstreamAttempts.length - 1],
                     proxy: attemptProxy,
                     summary: chainSummary({
                       downstreamModel: downstreamLog.model,
@@ -640,7 +639,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                     errorMessage,
                     downstream: downstreamLog,
                     routeTarget: codexRouteTargetLog,
-                    upstreamAttempts: [upstreamAttempts[upstreamAttempts.length - 1]],
+                    upstreamRequest: upstreamAttempts[upstreamAttempts.length - 1],
                     proxy: attemptProxy,
                     summary: chainSummary({
                       downstreamModel: downstreamLog.model,
@@ -706,7 +705,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                 responsePreview: responsePreview(adapted.text || codexCollected.preview),
                 downstream: downstreamLog,
                 routeTarget: codexRouteTargetLog,
-                upstreamAttempts: [upstreamAttempts[upstreamAttempts.length - 1]],
+                upstreamRequest: upstreamAttempts[upstreamAttempts.length - 1],
                 proxy: attemptProxy,
                 summary: chainSummary({
                   downstreamModel: downstreamLog.model,
@@ -841,7 +840,6 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                   upstreamContentType: contentType,
                   downstream: downstreamLog,
                   routeTarget: routeTargetLog,
-                  upstreamAttempts: [],
                   proxy: attemptProxy,
                   summary: chainSummary({
                     downstreamModel: downstreamLog.model,
@@ -904,7 +902,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                     responsePreview: responsePreview(streamPreviewText),
                     downstream: downstreamLog,
                     routeTarget: routeTargetLog,
-                    upstreamAttempts: [upstreamAttempts[upstreamAttempts.length - 1]],
+                    upstreamRequest: upstreamAttempts[upstreamAttempts.length - 1],
                     proxy: attemptProxy,
                     summary: chainSummary({
                       downstreamModel: downstreamLog.model,
@@ -971,7 +969,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                     errorMessage,
                     downstream: downstreamLog,
                     routeTarget: routeTargetLog,
-                    upstreamAttempts: [upstreamAttempts[upstreamAttempts.length - 1]],
+                    upstreamRequest: upstreamAttempts[upstreamAttempts.length - 1],
                     proxy: attemptProxy,
                     summary: chainSummary({
                       downstreamModel: downstreamLog.model,
@@ -1074,7 +1072,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                 responsePreview: responsePreview(adapted.text),
                 downstream: downstreamLog,
                 routeTarget: routeTargetLog,
-                upstreamAttempts: [upstreamAttempts[upstreamAttempts.length - 1]],
+                upstreamRequest: upstreamAttempts[upstreamAttempts.length - 1],
                 proxy: attemptProxy,
                 summary: chainSummary({
                   downstreamModel: downstreamLog.model,
@@ -1210,7 +1208,6 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
           errorMessage: message,
           downstream: downstreamLog,
           routeTarget: failedRouteTargetLog,
-          upstreamAttempts,
           proxy: requestLogProxyForRoute(failedAddress?.proxy),
           summary: chainSummary({
             downstreamModel: downstreamLog.model,

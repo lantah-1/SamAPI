@@ -135,8 +135,8 @@ import {
   temporaryAccountTypeLabel,
   toastDurationMs,
   uniqueMembers,
-  upstreamAttemptsSummary,
-  upstreamRequestBodies
+  upstreamRequestSummary,
+  upstreamRequestBody
 } from "./app/utils";
 
 // Keep UI progressive checks aligned with server default; high concurrency stresses local proxies.

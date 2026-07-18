@@ -376,21 +376,23 @@ export function prettyJson(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
 
-export function upstreamAttemptsSummary(log: RequestLog) {
-  return (log.upstreamAttempts || []).map(({ requestBody: _requestBody, ...attempt }) => attempt);
+export function upstreamRequestSummary(log: RequestLog) {
+  const request = log.upstreamRequest;
+  if (!request) return "-";
+  const { requestBody: _requestBody, ...summary } = request;
+  return summary;
 }
 
-export function upstreamRequestBodies(log: RequestLog) {
-  const bodies = (log.upstreamAttempts || [])
-    .filter((attempt) => attempt.requestBody !== undefined)
-    .map((attempt) => ({
-      addressLabel: attempt.addressLabel,
-      upstreamUrl: attempt.upstreamUrl,
-      model: attempt.model,
-      endpoint: attempt.endpoint,
-      body: attempt.requestBody
-    }));
-  return bodies.length > 0 ? bodies : "-";
+export function upstreamRequestBody(log: RequestLog) {
+  const request = log.upstreamRequest;
+  if (!request || request.requestBody === undefined) return "-";
+  return {
+    addressLabel: request.addressLabel,
+    upstreamUrl: request.upstreamUrl,
+    model: request.model,
+    endpoint: request.endpoint,
+    body: request.requestBody
+  };
 }
 
 export function apiOrigin() {
