@@ -379,20 +379,23 @@ export function prettyJson(value: unknown) {
 export function upstreamRequestSummary(log: RequestLog) {
   const request = log.upstreamRequest;
   if (!request) return "-";
-  const { requestBody: _requestBody, ...summary } = request;
+  const {
+    requestBody: _requestBody,
+    status: _status,
+    statusCode: _statusCode,
+    durationMs: _durationMs,
+    contentType: _contentType,
+    responsePreview: _responsePreview,
+    errorMessage: _errorMessage,
+    ...summary
+  } = request;
   return summary;
 }
 
 export function upstreamRequestBody(log: RequestLog) {
   const request = log.upstreamRequest;
   if (!request || request.requestBody === undefined) return "-";
-  return {
-    addressLabel: request.addressLabel,
-    upstreamUrl: request.upstreamUrl,
-    model: request.model,
-    endpoint: request.endpoint,
-    body: request.requestBody
-  };
+  return request.requestBody;
 }
 
 export function apiOrigin() {

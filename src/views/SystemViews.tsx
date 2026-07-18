@@ -271,20 +271,13 @@ export function LogDetailModal(props: { log: RequestLog | null; loading: boolean
               <ForwardingTargetDetail log={log} />
               <UpstreamRequestDetail log={log} />
               <DetailBlock
-                title="上游返回"
-                value={{
-                  upstreamUrl: log.upstreamUrl,
-                  contentType: log.upstreamContentType,
-                  preview: log.responsePreview,
-                  error: log.errorMessage || undefined
-                }}
-              />
-              <DetailBlock
                 title="返回"
+                wide
                 value={{
                   status: log.status,
                   statusCode: log.statusCode,
                   durationMs: log.durationMs,
+                  contentType: log.upstreamContentType,
                   preview: log.responsePreview,
                   error: log.errorMessage || undefined
                 }}
@@ -535,7 +528,6 @@ function LogSummaryDetail(props: { log: RequestLog }) {
         <section className="summary-node">
           <div className="summary-node-label">下游请求</div>
           <div className="summary-node-main">{downstream.model || log.routeName || "-"}</div>
-          <SummaryField label="Endpoint" value={downstream.endpoint || log.path} />
           <SummaryField label="Path" value={downstream.path || log.path} />
           <SummaryField label="UA" value={downstream.userAgent || log.userAgent || "unknown ua"} />
         </section>
@@ -593,8 +585,10 @@ function SectionedDetailBlock(props: { title: string; summary: unknown; detail: 
 
 function DownstreamHeadersDetail(props: { log: RequestLog }) {
   const log = props.log;
+  const downstream = log.downstream || { model: log.routeName, userAgent: log.userAgent };
+  const { endpoint: _endpoint, ...downstreamWithoutEndpoint } = downstream;
   const summary = {
-    ...(log.downstream || { model: log.routeName, endpoint: log.path, userAgent: log.userAgent }),
+    ...downstreamWithoutEndpoint,
     method: log.method,
     path: log.path,
     clientIp: log.clientIp
@@ -607,9 +601,8 @@ function ForwardingTargetDetail(props: { log: RequestLog }) {
   const log = props.log;
   const forwardingTarget = {
     ...(log.routeTarget || { routeName: log.routeName, model: log.model, endpoint: log.endpoint, providerName: log.providerName }),
-    routeId: log.routeId,
     upstreamUrl: log.upstreamUrl,
-    proxy: log.proxy || { mode: "direct" }
+    proxy_mode: log.proxy?.mode || "direct"
   };
 
   return <DetailBlock title="转发目标" value={forwardingTarget} wide />;
