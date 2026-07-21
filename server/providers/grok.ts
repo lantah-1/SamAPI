@@ -7,6 +7,7 @@ import {
   XAI_OAUTH_TOKEN_URL,
   fetchTemporaryAccountCheckText
 } from "./constants.js";
+import type { RosettaConverter } from "../proxy-path.js";
 import type { RouteProxyConfig, TemporaryAccount, TemporaryAccountQuotaStage } from "../../shared/types.js";
 
 const CPA_CLIENT_VERSION = "0.2.93";
@@ -16,6 +17,8 @@ const GROK_SUPPORTED_INPUT_TYPES = new Set([
   "message",
   "function_call",
   "function_call_output",
+  "custom_tool_call",
+  "custom_tool_call_output",
   "reasoning",
   "item_reference"
 ]);
@@ -184,7 +187,7 @@ function grokFunctionToolFromUnknown(tool: unknown, namePrefix = ""): Record<str
   return converted;
 }
 
-function grokToolsFromUnknown(tools: unknown, namePrefix = ""): Record<string, unknown>[] {
+function grokToolsFromUnknown(tools: unknown, namePrefix = "", customNames?: Set<string>): Record<string, unknown>[] {
   if (!Array.isArray(tools)) return [];
   const converted: Record<string, unknown>[] = [];
   for (const tool of tools) {
@@ -192,7 +195,7 @@ function grokToolsFromUnknown(tools: unknown, namePrefix = ""): Record<string, u
     const type = typeof tool.type === "string" ? tool.type : "function";
     if (type === "namespace") {
       const namespace = typeof tool.name === "string" ? tool.name.trim() : "";
-      converted.push(...grokToolsFromUnknown(tool.tools, namespace ? `${namespace}__` : namePrefix));
+      converted.push(...grokToolsFromUnknown(tool.tools, namespace ? `${namespace}__` : namePrefix, customNames));
       continue;
     }
     if (type === "custom") {
@@ -208,7 +211,12 @@ function grokToolsFromUnknown(tools: unknown, namePrefix = ""): Record<string, u
           additionalProperties: false
         }
       }, namePrefix);
-      if (custom) converted.push(custom);
+      if (custom) {
+        converted.push(custom);
+        // Remember the (prefixed) name so the response side can turn Grok's function_call back into
+        // the custom_tool_call shape that Codex expects for this tool.
+        if (customNames && typeof custom.name === "string") customNames.add(custom.name);
+      }
       continue;
     }
     if (type === "function" || !tool.type) {
@@ -276,7 +284,44 @@ function grokInputItemFromUnknown(item: unknown): Record<string, unknown> | stri
     };
   }
 
-  if (type === "reasoning" || type === "item_reference") {
+  // Codex freeform tools (exec/apply_patch etc.) are exposed to Grok as plain functions, but their
+  // history items use the custom_tool_call shape. Grok's ModelInput has no custom_tool_call variant,
+  // so remap them to function_call/function_call_output — the `input` string becomes the function's
+  // arguments. Dropping these (as unknown types) breaks multi-turn tool use: Grok never sees that the
+  // tool ran, so it re-issues or stalls the call ("工具调用中断").
+  if (type === "custom_tool_call") {
+    if (typeof item.name !== "string" || typeof item.call_id !== "string") return undefined;
+    const input = typeof item.input === "string" ? item.input : textFromContent(item.input);
+    return {
+      type: "function_call",
+      call_id: item.call_id,
+      name: item.name,
+      arguments: JSON.stringify({ input })
+    };
+  }
+
+  if (type === "custom_tool_call_output") {
+    if (typeof item.call_id !== "string") return undefined;
+    return {
+      type: "function_call_output",
+      call_id: item.call_id,
+      output: typeof item.output === "string" ? item.output : textFromContent(item.output) || JSON.stringify(item.output ?? "")
+    };
+  }
+
+  if (type === "reasoning") {
+    // A reasoning item with null content and null encrypted_content fails Grok's
+    // ModelInput enum (422 "did not match any variant"). Grok can only resume a
+    // chain of thought from an encrypted blob it issued, so drop reasoning that
+    // lacks a usable encrypted_content and forward only the clean shape otherwise.
+    const encryptedContent = typeof item.encrypted_content === "string" ? item.encrypted_content : "";
+    if (!encryptedContent) return undefined;
+    const cloned: Record<string, unknown> = { type, encrypted_content: encryptedContent };
+    if (Array.isArray(item.summary) && item.summary.length > 0) cloned.summary = item.summary;
+    return cloned;
+  }
+
+  if (type === "item_reference") {
     const cloned: Record<string, unknown> = { ...item, type };
     delete cloned.id;
     return cloned;
@@ -361,6 +406,170 @@ export function grokOAuthRequestBody(body: unknown, model: string) {
   delete source.max_output_tokens;
 
   return source;
+}
+
+// Collect the (prefix-resolved) names of tools that Codex declared as `custom` (freeform/grammar
+// tools like exec/apply_patch). We expose them to Grok as plain functions, but Grok answers with
+// `function_call` items — Codex only accepts those tools back as `custom_tool_call`. The response
+// converter uses this set to map matching function_call events back to the custom_tool_call shape.
+// Codex re-sends the full tool list every turn, so scanning the current request body is reliable.
+export function grokCustomToolNames(body: unknown): Set<string> {
+  const names = new Set<string>();
+  if (!isRecord(body)) return names;
+  const inputSource = body.input;
+  if (Array.isArray(inputSource)) {
+    for (const item of inputSource) {
+      if (isRecord(item) && item.type === "additional_tools") {
+        grokToolsFromUnknown(item.tools, "", names);
+      }
+    }
+  }
+  grokToolsFromUnknown(body.tools, "", names);
+  return names;
+}
+
+function unwrapGrokCustomToolInput(args: unknown): string {
+  if (typeof args !== "string") return typeof args === "undefined" ? "" : String(args);
+  try {
+    const parsed = JSON.parse(args) as unknown;
+    if (isRecord(parsed) && typeof parsed.input === "string") return parsed.input;
+  } catch {
+    // Grok wraps a custom tool's freeform input as {"input": "..."}; if it isn't valid JSON just
+    // hand back the raw string so the tool still receives something usable.
+  }
+  return args;
+}
+
+function grokCompletedOutputToCustom(output: unknown, customNames: Set<string>): unknown {
+  if (!Array.isArray(output)) return output;
+  return output.map((item) => {
+    if (!isRecord(item) || item.type !== "function_call") return item;
+    const name = typeof item.name === "string" ? item.name : "";
+    if (!name || !customNames.has(name)) return item;
+    const { arguments: rawArgs, ...rest } = item;
+    return { ...rest, type: "custom_tool_call", input: unwrapGrokCustomToolInput(rawArgs) };
+  });
+}
+
+// Build a converter that rewrites Grok's function_call responses back into the custom_tool_call shape
+// Codex expects, but only for tools Codex originally declared as custom. Native function tools pass
+// through untouched. Without this, Codex sees a function_call for a tool it registered as custom and
+// treats the turn as broken ("工具调用中断").
+export function createGrokResponsesToolConverter(customNames: Set<string>): RosettaConverter {
+  return {
+    convertRequest: (payload: unknown) => payload,
+    convertResponse: (payload: unknown) => {
+      if (!isRecord(payload)) return payload;
+      if (isRecord(payload.response)) {
+        return { ...payload, response: { ...payload.response, output: grokCompletedOutputToCustom(payload.response.output, customNames) } };
+      }
+      if (Array.isArray(payload.output)) {
+        return { ...payload, output: grokCompletedOutputToCustom(payload.output, customNames) };
+      }
+      return payload;
+    },
+    convertStream: (stream: AsyncIterable<unknown>) => grokConvertToolCallStream(stream, customNames)
+  };
+}
+
+async function* grokConvertToolCallStream(stream: AsyncIterable<unknown>, customNames: Set<string>) {
+  // item_id -> output_index for function_call items that belong to a custom tool.
+  const customItems = new Map<string, number>();
+  let sequence = 0;
+  const stamp = (event: Record<string, unknown>) => ({ ...event, sequence_number: sequence++ });
+
+  for await (const raw of stream) {
+    if (!isRecord(raw)) {
+      yield raw;
+      continue;
+    }
+    const type = typeof raw.type === "string" ? raw.type : "";
+
+    if (type === "response.output_item.added" || type === "response.output_item.done") {
+      const item = isRecord(raw.item) ? raw.item : undefined;
+      const name = item && typeof item.name === "string" ? item.name : "";
+      if (item && item.type === "function_call" && name && customNames.has(name)) {
+        const itemId = typeof item.id === "string" ? item.id : "";
+        const outputIndex = typeof raw.output_index === "number" ? raw.output_index : 0;
+        if (type === "response.output_item.added" && itemId) customItems.set(itemId, outputIndex);
+        const { arguments: rawArgs, ...restItem } = item;
+        const customItem =
+          type === "response.output_item.done"
+            ? { ...restItem, type: "custom_tool_call", input: unwrapGrokCustomToolInput(rawArgs) }
+            : { ...restItem, type: "custom_tool_call", input: "" };
+        yield stamp({ ...raw, item: customItem });
+        continue;
+      }
+      yield stamp(raw);
+      continue;
+    }
+
+    if (type === "response.function_call_arguments.delta") {
+      const itemId = typeof raw.item_id === "string" ? raw.item_id : "";
+      // Suppress incremental JSON-fragment deltas for custom tools; we emit one clean input delta on
+      // the matching .done event (partial {"input":...} JSON can't be unwrapped chunk by chunk).
+      if (itemId && customItems.has(itemId)) continue;
+      yield stamp(raw);
+      continue;
+    }
+
+    if (type === "response.function_call_arguments.done") {
+      const itemId = typeof raw.item_id === "string" ? raw.item_id : "";
+      if (itemId && customItems.has(itemId)) {
+        const outputIndex = customItems.get(itemId) ?? 0;
+        const input = unwrapGrokCustomToolInput(raw.arguments);
+        yield stamp({ type: "response.custom_tool_call_input.delta", item_id: itemId, output_index: outputIndex, delta: input });
+        yield stamp({ type: "response.custom_tool_call_input.done", item_id: itemId, output_index: outputIndex, input });
+        continue;
+      }
+      yield stamp(raw);
+      continue;
+    }
+
+    if (type === "response.completed" || type === "response.incomplete" || type === "response.failed") {
+      if (isRecord(raw.response)) {
+        yield stamp({ ...raw, response: { ...raw.response, output: grokCompletedOutputToCustom(raw.response.output, customNames) } });
+        continue;
+      }
+    }
+
+    yield stamp(raw);
+  }
+}
+
+export function isGrokEncryptedContentError(text: string) {
+  if (!text) return false;
+  return /could not decrypt the provided encrypted_content/i.test(text) || /unmodified encrypted_content/i.test(text);
+}
+
+// Grok can only decrypt an `encrypted_content` blob it issued itself. When a conversation is routed
+// to Grok carrying reasoning minted by another provider (e.g. Codex/OpenAI), Grok rejects the whole
+// request with an "encrypted_content" decrypt error. We cannot tell foreign blobs apart from Grok's
+// own, so drop every reasoning item that carries encrypted_content and retry — losing that turn's
+// reasoning context but letting the request succeed. Returns undefined when there is nothing to strip.
+export function stripGrokEncryptedReasoning(body: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(body)) return undefined;
+  let changed = false;
+  const clone: Record<string, unknown> = { ...body };
+  if (Array.isArray(clone.input)) {
+    const filtered = clone.input.filter((item) => {
+      if (isRecord(item) && item.type === "reasoning" && typeof item.encrypted_content === "string") {
+        changed = true;
+        return false;
+      }
+      return true;
+    });
+    if (changed) clone.input = filtered.length > 0 ? filtered : "hi";
+  }
+  if (Array.isArray(clone.include)) {
+    const filteredInclude = clone.include.filter((entry) => entry !== "reasoning.encrypted_content");
+    if (filteredInclude.length !== clone.include.length) {
+      changed = true;
+      if (filteredInclude.length > 0) clone.include = filteredInclude;
+      else delete clone.include;
+    }
+  }
+  return changed ? clone : undefined;
 }
 
 function numberHeader(headers: Headers, name: string) {

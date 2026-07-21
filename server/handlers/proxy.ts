@@ -41,11 +41,15 @@ import { CODEX_BACKEND_RESPONSES_URL, CODEX_USER_AGENT } from "../providers/cons
 import { codexTemporaryHeaders, codexTemporaryRequestBody, collectCodexResponsesBody } from "../providers/codex.js";
 import {
   grokOAuthAccessTokenNeedsRefresh,
+  createGrokResponsesToolConverter,
+  grokCustomToolNames,
   grokOAuthBaseUrl,
   grokOAuthHeaders,
   grokOAuthRequestBody,
+  isGrokEncryptedContentError,
   isGrokOAuthTemporaryAccount,
-  refreshGrokOAuthTemporaryAccountToken
+  refreshGrokOAuthTemporaryAccountToken,
+  stripGrokEncryptedReasoning
 } from "../providers/grok.js";
 import type { ProxyExecutionCandidate } from "../routing.js";
 import type { RequestLog, RequestLogStatus, RequestLogUpstreamRequest, RouteRecord, SiteAddress } from "../../shared/types.js";
@@ -440,10 +444,20 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
               "upstream-authorization": "Header 模版已提供"
         };
         const converted = convertedRouteRequestBody(body, candidate.model, executionEndpoint, proxyInfo.kind);
-        const responseConverter = converted.converter;
         const sanitizedBody = sanitizeOpenAiCompatibleResponsesBody(converted.body, executionEndpoint);
+        // Grok speaks the Responses protocol but only supports `function` tools. Codex declares some
+        // tools as `custom`; we forward them as functions and then map Grok's function_call replies
+        // back to custom_tool_call so Codex accepts them. This converter runs only for those tools.
+        const grokCustomTools = grokAccount ? grokCustomToolNames(sanitizedBody) : undefined;
+        const responseConverter =
+          grokCustomTools && grokCustomTools.size > 0
+            ? createGrokResponsesToolConverter(grokCustomTools)
+            : converted.converter;
         const grokBody = grokAccount ? grokOAuthRequestBody(sanitizedBody, candidate.model) : sanitizedBody;
-        const forwardedBody = downstreamStream ? applyStreamingFlag(grokBody, true) : grokBody;
+        let forwardedBody = downstreamStream ? applyStreamingFlag(grokBody, true) : grokBody;
+        // Grok rejects a request when it carries encrypted reasoning it did not mint (cross-provider
+        // routing). We retry once with that reasoning stripped; this guard prevents an infinite loop.
+        let grokEncryptedRetryUsed = false;
         const upstreamRequestHeaders = {
           ...maskedStringHeaders(headers),
           ...upstreamAuthLog
@@ -799,7 +813,9 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
         }
 
         for (const address of executionAddresses) {
-        for (const target of proxyEndpointCandidates(address.baseUrl, executionEndpoint)) {
+        const addressTargets = proxyEndpointCandidates(address.baseUrl, executionEndpoint);
+        for (let targetIndex = 0; targetIndex < addressTargets.length; targetIndex += 1) {
+          const target = addressTargets[targetIndex];
           const attemptStartedAt = Date.now();
           try {
             const { response: upstream, proxy: attemptProxy } = await fetchWithRouteProxy(target, {
@@ -809,6 +825,23 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
               signal: clientAbort.signal
             }, address.proxy);
             const contentType = upstream.headers.get("content-type") || undefined;
+
+            // Grok cross-provider reasoning fix: on the "could not decrypt encrypted_content" error we
+            // strip the foreign encrypted reasoning and retry the same target once (peek via clone so
+            // the original body stays readable for the normal failure path if this is not the case).
+            if (grokAccount && !upstream.ok && !grokEncryptedRetryUsed) {
+              const peekText = await upstream.clone().text().catch(() => "");
+              if (isGrokEncryptedContentError(peekText)) {
+                const stripped = stripGrokEncryptedReasoning(forwardedBody);
+                if (stripped) {
+                  grokEncryptedRetryUsed = true;
+                  forwardedBody = downstreamStream ? applyStreamingFlag(stripped, true) : stripped;
+                  upstream.body?.cancel().catch(() => {});
+                  targetIndex -= 1;
+                  continue;
+                }
+              }
+            }
 
             if (upstream.ok && !looksLikeHtml(contentType, "")) {
               if (downstreamStream && upstream.body) {
