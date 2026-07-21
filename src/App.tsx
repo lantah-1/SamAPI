@@ -39,7 +39,6 @@ import type {
   RequestLog,
   RequestLogSummary,
   RouteDisplayGroup,
-  RouteProxyConfig,
   RouteRecord,
   RouteType,
   Site,
@@ -79,7 +78,6 @@ import {
   blankHeaderRow,
   endpointLabels,
   groupStrategyLabels,
-  routeProxyModeLabels,
   routeTypeLabels,
   siteTypeLabels,
   temporaryAccountAvailabilityLabels,
@@ -184,8 +182,8 @@ export default function App() {
   const [modelSyncingGroupId, setModelSyncingGroupId] = useState<string | null>(null);
   const [temporaryAccountChecking, setTemporaryAccountChecking] = useState<string | null>(null);
   const [temporaryAccountCheckingIds, setTemporaryAccountCheckingIds] = useState<string[]>([]);
+  const [temporaryAccountQueuedIds, setTemporaryAccountQueuedIds] = useState<string[]>([]);
   const [temporaryAccountCheckProviderType, setTemporaryAccountCheckProviderType] = useState<Extract<TemporaryAccountProviderType, "gpt" | "grok">>("gpt");
-  const [temporaryAccountCheckProxy, setTemporaryAccountCheckProxy] = useState<RouteProxyConfig>({ mode: "system" });
   const [temporaryAccountUpdating, setTemporaryAccountUpdating] = useState<string | null>(null);
   const [temporaryAccountDeleting, setTemporaryAccountDeleting] = useState<string | null>(null);
   const [selectedTemporaryAccountIds, setSelectedTemporaryAccountIds] = useState<string[]>([]);
@@ -723,15 +721,15 @@ export default function App() {
     event.preventDefault();
     setBusy(true);
     (async () => {
+      const providerType = temporaryAccountDraft.providerType;
       const result = await api.importTemporaryAccounts({
         name: temporaryAccountDraft.name,
-        providerType: temporaryAccountDraft.providerType,
+        providerType,
         source: temporaryAccountDraft.mode === "cpa" ? "cpa" : "subapi",
         mode: temporaryAccountDraft.mode,
         content: temporaryAccountDraft.content,
         contents: temporaryAccountDraft.contents,
-        fileNames: temporaryAccountDraft.fileNames,
-        checkProxy: temporaryAccountCheckProxy
+        fileNames: temporaryAccountDraft.fileNames
       });
       setTemporaryAccountEditorOpen(false);
       setTemporaryAccountDraft(emptyTemporaryAccountImport());
@@ -739,16 +737,37 @@ export default function App() {
       setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
       setTemporaryAccountsLoaded(true);
       setTemporaryAccountsLoading(false);
-      const checkSummary = result.checkResult ? `；检查结果：${temporaryAccountCheckSummary(result.checkResult)}` : "";
+      setTemporaryAccountCheckProviderType(providerType === "grok" ? "grok" : "gpt");
       const unrecognizedSummary = result.unrecognizedFiles?.length
         ? `；${result.unrecognizedFiles.length} 个文件未识别：${result.unrecognizedFiles.slice(0, 3).join("、")}${result.unrecognizedFiles.length > 3 ? " 等" : ""}`
         : "";
-      setToast(`已导入 ${result.imported} 个临时账号${result.skipped ? `，跳过 ${result.skipped} 个重复项` : ""}${unrecognizedSummary}${checkSummary}`);
+      setToast(`已导入 ${result.imported} 个临时账号${result.skipped ? `，跳过 ${result.skipped} 个重复项` : ""}${unrecognizedSummary}`);
+      setBusy(false);
+
+      // Preview imported accounts first, then check availability progressively.
+      const accountIds = result.accountIds || [];
+      if (accountIds.length === 0 || !["gpt", "grok"].includes(providerType)) return;
+      setTemporaryAccountChecking("import");
+      try {
+        const { result: checkResult, requestFailures } = await checkTemporaryAccountIdsProgressively(accountIds);
+        const refreshedGroups = await api.listTemporaryAccountGroups();
+        setSnapshot((current) => (current ? { ...current, temporaryAccountGroups: refreshedGroups } : current));
+        const failureHint = requestFailures > 0 ? `，${requestFailures} 个请求失败已跳过` : "";
+        setToast(
+          `已导入 ${result.imported} 个临时账号${result.skipped ? `，跳过 ${result.skipped} 个重复项` : ""}${unrecognizedSummary}；检查结果：${temporaryAccountCheckSummary(checkResult)}${failureHint}`
+        );
+      } catch (error) {
+        if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "导入后账号检查失败");
+      } finally {
+        setTemporaryAccountChecking(null);
+        setTemporaryAccountCheckingIds([]);
+        setTemporaryAccountQueuedIds([]);
+      }
     })()
       .catch((error) => {
         if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号导入失败");
-      })
-      .finally(() => setBusy(false));
+        setBusy(false);
+      });
   };
 
   const applyTemporaryAccountCheckItem = (item: TemporaryAccountCheckItemResult) => {
@@ -779,6 +798,7 @@ export default function App() {
     const results = new Array<TemporaryAccountCheckItemResult | undefined>(accountIds.length);
     const errors: unknown[] = [];
     let nextIndex = 0;
+    setTemporaryAccountQueuedIds(accountIds);
     const workers = Array.from(
       { length: Math.min(TEMPORARY_ACCOUNT_PROGRESS_CONCURRENCY, accountIds.length) },
       async () => {
@@ -786,8 +806,10 @@ export default function App() {
           const index = nextIndex;
           nextIndex += 1;
           const accountId = accountIds[index];
+          setTemporaryAccountQueuedIds((current) => current.filter((id) => id !== accountId));
+          setTemporaryAccountCheckingIds((current) => [...current, accountId]);
           try {
-            const result = await api.checkTemporaryAccount(accountId, { proxy: temporaryAccountCheckProxy });
+            const result = await api.checkTemporaryAccount(accountId);
             const item = result.results[0];
             if (!item) throw new Error("账号检查没有返回结果");
             results[index] = item;
@@ -798,6 +820,7 @@ export default function App() {
             if (isUnauthorizedError(error)) {
               errors.unshift(error);
               nextIndex = accountIds.length;
+              setTemporaryAccountQueuedIds([]);
               return;
             }
             errors.push(error);
@@ -828,7 +851,6 @@ export default function App() {
       .flatMap((group) => group.accounts.map((account) => account.id));
     if (accountIds.length === 0) return;
     setTemporaryAccountChecking("all");
-    setTemporaryAccountCheckingIds(accountIds);
     try {
       const { result, requestFailures } = await checkTemporaryAccountIdsProgressively(accountIds);
       const temporaryAccountGroups = await api.listTemporaryAccountGroups();
@@ -842,6 +864,7 @@ export default function App() {
     } finally {
       setTemporaryAccountChecking(null);
       setTemporaryAccountCheckingIds([]);
+      setTemporaryAccountQueuedIds([]);
     }
   };
 
@@ -850,19 +873,20 @@ export default function App() {
     setTemporaryAccountChecking(id);
     setTemporaryAccountCheckingIds([id]);
     try {
-      const result = await api.checkTemporaryAccount(id, { proxy: temporaryAccountCheckProxy });
+      const result = await api.checkTemporaryAccount(id);
       const item = result.results[0];
       if (item) applyTemporaryAccountCheckItem(item);
       const temporaryAccountGroups = await api.listTemporaryAccountGroups();
       setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
       setTemporaryAccountsLoaded(true);
       setTemporaryAccountsLoading(false);
-      setToast(`GPT 账号刷新完成：${temporaryAccountCheckSummary(result)}`);
+      setToast(`${temporaryAccountProviderLabels[temporaryAccountCheckProviderType]} 账号刷新完成：${temporaryAccountCheckSummary(result)}`);
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号刷新失败");
     } finally {
       setTemporaryAccountChecking(null);
       setTemporaryAccountCheckingIds([]);
+      setTemporaryAccountQueuedIds([]);
     }
   };
 
@@ -876,7 +900,6 @@ export default function App() {
     const accountIds = selectedTemporaryAccountIds.filter((id) => currentTypeAccountIds.has(id));
     if (accountIds.length === 0) return;
     setTemporaryAccountChecking("selected");
-    setTemporaryAccountCheckingIds(accountIds);
     try {
       const { result, requestFailures } = await checkTemporaryAccountIdsProgressively(accountIds);
       const temporaryAccountGroups = await api.listTemporaryAccountGroups();
@@ -890,6 +913,7 @@ export default function App() {
     } finally {
       setTemporaryAccountChecking(null);
       setTemporaryAccountCheckingIds([]);
+      setTemporaryAccountQueuedIds([]);
     }
   };
 
@@ -1349,13 +1373,12 @@ export default function App() {
                 busy={busy}
                 checking={temporaryAccountChecking}
                 checkingAccountIds={temporaryAccountCheckingIds}
+                queuedAccountIds={temporaryAccountQueuedIds}
                 checkProviderType={temporaryAccountCheckProviderType}
                 onCheckProviderTypeChange={(providerType) => {
                   setTemporaryAccountCheckProviderType(providerType);
                   setSelectedTemporaryAccountIds([]);
                 }}
-                checkProxy={temporaryAccountCheckProxy}
-                onCheckProxyChange={setTemporaryAccountCheckProxy}
                 updating={temporaryAccountUpdating}
                 deleting={temporaryAccountDeleting}
                 selectedAccountIds={selectedTemporaryAccountIds}

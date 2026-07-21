@@ -26,6 +26,7 @@ export interface RouteDraft {
   matchRule?: string;
   members?: GroupRouteMember[];
   strategy?: GroupRouteStrategy;
+  specifiedMember?: GroupRouteMember;
   endpoint?: EndpointKind;
   headerTemplateId?: string;
   enabled?: boolean;

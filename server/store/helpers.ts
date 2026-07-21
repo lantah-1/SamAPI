@@ -119,8 +119,18 @@ export function normalizeGroupStrategy(value: unknown): GroupRouteStrategy {
   if (value === "sequential") return "sequential";
   if (value === "random") return "random";
   if (value === "priority") return "priority";
+  if (value === "specified") return "specified";
   if (value === "stable-first" || value == null || value === "") return "stable-first";
   throw new Error("请选择有效的分组策略");
+}
+
+export function normalizeGroupRouteMember(value: unknown): GroupRouteMember | undefined {
+  if (!isRecord(value)) return undefined;
+  const siteId = typeof value.siteId === "string" ? value.siteId.trim() : "";
+  const apiKeyId = typeof value.apiKeyId === "string" ? value.apiKeyId.trim() : "";
+  const model = typeof value.model === "string" ? value.model.trim() : "";
+  if (!siteId || !apiKeyId || !model) return undefined;
+  return { siteId, apiKeyId, model };
 }
 
 export function matchRuleTokens(rule: string) {

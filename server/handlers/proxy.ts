@@ -43,6 +43,7 @@ import {
   grokOAuthAccessTokenNeedsRefresh,
   grokOAuthBaseUrl,
   grokOAuthHeaders,
+  grokOAuthRequestBody,
   isGrokOAuthTemporaryAccount,
   refreshGrokOAuthTemporaryAccountToken
 } from "../providers/grok.js";
@@ -441,7 +442,8 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
         const converted = convertedRouteRequestBody(body, candidate.model, executionEndpoint, proxyInfo.kind);
         const responseConverter = converted.converter;
         const sanitizedBody = sanitizeOpenAiCompatibleResponsesBody(converted.body, executionEndpoint);
-        const forwardedBody = downstreamStream ? applyStreamingFlag(sanitizedBody, true) : sanitizedBody;
+        const grokBody = grokAccount ? grokOAuthRequestBody(sanitizedBody, candidate.model) : sanitizedBody;
+        const forwardedBody = downstreamStream ? applyStreamingFlag(grokBody, true) : grokBody;
         const upstreamRequestHeaders = {
           ...maskedStringHeaders(headers),
           ...upstreamAuthLog

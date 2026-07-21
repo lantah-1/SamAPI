@@ -86,7 +86,7 @@ export function createRouting(store: JsonStore) {
   }
 
   function orderedGroupCandidates(route: GroupRoute, candidates: ProxyExecutionCandidate[]) {
-    if (route.strategy === "priority") return candidates;
+    if (route.strategy === "priority" || route.strategy === "specified") return candidates;
     if (route.strategy === "random") {
       const shuffled = [...candidates];
       for (let index = shuffled.length - 1; index > 0; index -= 1) {
@@ -205,7 +205,17 @@ export function createRouting(store: JsonStore) {
                 .map((model) => ({ siteId: group.siteId, apiKeyId: apiKey.id, model }))
             )
           );
-    for (const member of members) {
+    const selectedMembers =
+      route.strategy === "specified"
+        ? (() => {
+            if (!route.specifiedMember) throw new Error(`分组路由 ${route.name} 未配置指定模型`);
+            const specifiedKey = routeMemberKey(route.specifiedMember);
+            const matched = members.filter((member) => routeMemberKey(member) === specifiedKey);
+            if (matched.length === 0) throw new Error(`分组路由 ${route.name} 指定模型不可用`);
+            return matched;
+          })()
+        : members;
+    for (const member of selectedMembers) {
       const memberKey = routeMemberKey(member);
       if (usedMembers.has(memberKey)) continue;
       usedMembers.add(memberKey);

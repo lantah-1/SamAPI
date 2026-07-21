@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { emailFromIdToken, extractUpstreamError } from "../util/text.js";
+import { emailFromIdToken, extractUpstreamError, isRecord, textFromContent } from "../util/text.js";
 import {
   XAI_CLI_CHAT_PROXY_BASE_URL,
   XAI_DEFAULT_API_BASE_URL,
@@ -11,6 +11,16 @@ import type { RouteProxyConfig, TemporaryAccount, TemporaryAccountQuotaStage } f
 
 const CPA_CLIENT_VERSION = "0.2.93";
 const GROK2API_CLIENT_VERSION = "0.2.99";
+
+const GROK_SUPPORTED_INPUT_TYPES = new Set([
+  "message",
+  "function_call",
+  "function_call_output",
+  "reasoning",
+  "item_reference"
+]);
+
+const GROK_REASONING_EFFORTS = new Set(["low", "medium", "high"]);
 
 function trimmedBaseUrl(value?: string) {
   return value?.trim().replace(/\/+$/, "");
@@ -147,6 +157,210 @@ export async function fetchGrokOAuthResponses(account: TemporaryAccount, model: 
       stream: false
     })
   }, proxyConfig);
+}
+
+function defaultFunctionParameters() {
+  return { type: "object", properties: {} };
+}
+
+function grokFunctionToolFromUnknown(tool: unknown, namePrefix = ""): Record<string, unknown> | undefined {
+  if (!isRecord(tool)) return undefined;
+  const rawName = typeof tool.name === "string" ? tool.name.trim() : "";
+  if (!rawName) return undefined;
+  const name = namePrefix ? `${namePrefix}${rawName}` : rawName;
+  const description = typeof tool.description === "string" ? tool.description : "";
+  const parameters = isRecord(tool.parameters)
+    ? tool.parameters
+    : isRecord(tool.input_schema)
+      ? tool.input_schema
+      : defaultFunctionParameters();
+  const converted: Record<string, unknown> = {
+    type: "function",
+    name,
+    description,
+    parameters
+  };
+  if (typeof tool.strict === "boolean") converted.strict = tool.strict;
+  return converted;
+}
+
+function grokToolsFromUnknown(tools: unknown, namePrefix = ""): Record<string, unknown>[] {
+  if (!Array.isArray(tools)) return [];
+  const converted: Record<string, unknown>[] = [];
+  for (const tool of tools) {
+    if (!isRecord(tool)) continue;
+    const type = typeof tool.type === "string" ? tool.type : "function";
+    if (type === "namespace") {
+      const namespace = typeof tool.name === "string" ? tool.name.trim() : "";
+      converted.push(...grokToolsFromUnknown(tool.tools, namespace ? `${namespace}__` : namePrefix));
+      continue;
+    }
+    if (type === "custom") {
+      // Codex custom/grammar tools are not Grok ModelInput tools; expose a plain function shell.
+      const custom = grokFunctionToolFromUnknown({
+        ...tool,
+        parameters: isRecord(tool.parameters) ? tool.parameters : {
+          type: "object",
+          properties: {
+            input: { type: "string", description: "Tool input" }
+          },
+          required: ["input"],
+          additionalProperties: false
+        }
+      }, namePrefix);
+      if (custom) converted.push(custom);
+      continue;
+    }
+    if (type === "function" || !tool.type) {
+      const fn = grokFunctionToolFromUnknown(tool, namePrefix);
+      if (fn) converted.push(fn);
+    }
+  }
+  return converted;
+}
+
+function grokMessageRole(role: unknown) {
+  if (role === "assistant") return "assistant";
+  if (role === "system" || role === "developer") return "system";
+  return "user";
+}
+
+function grokMessageContent(content: unknown) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return textFromContent(content);
+  const parts = content
+    .map((part) => {
+      if (typeof part === "string") return { type: "input_text", text: part };
+      if (!isRecord(part)) return undefined;
+      const type = typeof part.type === "string" ? part.type : "";
+      if (type === "input_text" || type === "output_text" || type === "text") {
+        const text = typeof part.text === "string" ? part.text : textFromContent(part);
+        if (!text) return undefined;
+        return {
+          type: type === "output_text" ? "output_text" : "input_text",
+          text
+        };
+      }
+      if (type === "input_image" || type === "image_url") return part;
+      const text = textFromContent(part);
+      return text ? { type: "input_text", text } : undefined;
+    })
+    .filter((part): part is Record<string, unknown> => Boolean(part));
+  return parts.length > 0 ? parts : "";
+}
+
+function grokInputItemFromUnknown(item: unknown): Record<string, unknown> | string | undefined {
+  if (typeof item === "string") return item;
+  if (!isRecord(item)) return undefined;
+
+  const type = typeof item.type === "string" ? item.type : "message";
+  if (type === "additional_tools") return undefined;
+  if (!GROK_SUPPORTED_INPUT_TYPES.has(type) && type !== "message") return undefined;
+
+  if (type === "function_call") {
+    if (typeof item.name !== "string" || typeof item.call_id !== "string") return undefined;
+    return {
+      type,
+      call_id: item.call_id,
+      name: item.name,
+      arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {})
+    };
+  }
+
+  if (type === "function_call_output") {
+    if (typeof item.call_id !== "string") return undefined;
+    return {
+      type,
+      call_id: item.call_id,
+      output: typeof item.output === "string" ? item.output : textFromContent(item.output) || JSON.stringify(item.output ?? "")
+    };
+  }
+
+  if (type === "reasoning" || type === "item_reference") {
+    const cloned: Record<string, unknown> = { ...item, type };
+    delete cloned.id;
+    return cloned;
+  }
+
+  const role = grokMessageRole(item.role);
+  const content = grokMessageContent(item.content);
+  if (content === "" || (Array.isArray(content) && content.length === 0)) return undefined;
+  return {
+    type: "message",
+    role,
+    content
+  };
+}
+
+function grokReasoningFromUnknown(value: unknown) {
+  if (!isRecord(value)) return undefined;
+  const effortRaw = typeof value.effort === "string" ? value.effort.toLowerCase() : "";
+  const effort =
+    effortRaw === "xhigh" || effortRaw === "maximal" || effortRaw === "max"
+      ? "high"
+      : GROK_REASONING_EFFORTS.has(effortRaw)
+        ? effortRaw
+        : undefined;
+  return effort ? { effort } : undefined;
+}
+
+export function grokOAuthRequestBody(body: unknown, model: string) {
+  const source: Record<string, unknown> = isRecord(body) ? { ...body } : { input: body };
+  const extractedTools: Record<string, unknown>[] = [];
+  const inputSource = source.input;
+
+  if (Array.isArray(inputSource)) {
+    for (const item of inputSource) {
+      if (isRecord(item) && item.type === "additional_tools") {
+        extractedTools.push(...grokToolsFromUnknown(item.tools));
+      }
+    }
+    const input = inputSource
+      .map((item) => grokInputItemFromUnknown(item))
+      .filter((item): item is Record<string, unknown> | string => item !== undefined);
+    source.input = input.length > 0 ? input : "hi";
+  } else if (inputSource != null && typeof inputSource !== "string") {
+    source.input = textFromContent(inputSource) || "hi";
+  }
+
+  extractedTools.push(...grokToolsFromUnknown(source.tools));
+  if (extractedTools.length > 0) {
+    const seen = new Set<string>();
+    source.tools = extractedTools.filter((tool) => {
+      const name = typeof tool.name === "string" ? tool.name : "";
+      if (!name || seen.has(name)) return false;
+      seen.add(name);
+      return true;
+    });
+  } else {
+    delete source.tools;
+  }
+
+  const reasoning = grokReasoningFromUnknown(source.reasoning);
+  if (reasoning) source.reasoning = reasoning;
+  else delete source.reasoning;
+
+  if (source.tool_choice != null && source.tool_choice !== "auto" && source.tool_choice !== "none" && source.tool_choice !== "required" && !isRecord(source.tool_choice)) {
+    delete source.tool_choice;
+  }
+
+  source.model = model;
+  if (typeof source.stream !== "boolean") source.stream = true;
+
+  delete source.metadata;
+  delete source.client_metadata;
+  delete source.include;
+  delete source.text;
+  delete source.prompt_cache_key;
+  delete source.prompt_cache_retention;
+  delete source.parallel_tool_calls;
+  delete source.store;
+  delete source.previous_response_id;
+  delete source.safety_identifier;
+  delete source.stream_options;
+  delete source.max_output_tokens;
+
+  return source;
 }
 
 function numberHeader(headers: Headers, name: string) {

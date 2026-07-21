@@ -148,7 +148,7 @@ const PROXY_AGENT_CONNECT_TIMEOUT_MS = 15_000;
 const PROXY_AGENT_HEADERS_TIMEOUT_MS = 60_000;
 // Only applies until fetch receives response headers. Once streaming starts, the body can run
 // arbitrarily long without being interrupted.
-export const UPSTREAM_HEADERS_TIMEOUT_MS = positiveIntegerEnv("SAMAPI_UPSTREAM_HEADERS_TIMEOUT_MS", 30_000);
+export const UPSTREAM_HEADERS_TIMEOUT_MS = positiveIntegerEnv("SAMAPI_UPSTREAM_HEADERS_TIMEOUT_MS", 60_000);
 const UPSTREAM_HEADERS_TIMEOUT_CODE = "SAMAPI_UPSTREAM_HEADERS_TIMEOUT";
 
 export function proxyAgentFor(proxyUrl: string) {

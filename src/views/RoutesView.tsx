@@ -333,8 +333,27 @@ export function RoutesView(props: {
       };
     })
     .filter((group) => group.apiKeys.length > 0);
-  const updateGroupMembers = (members: GroupRouteMember[]) => {
-    props.onDraft({ ...props.draft, type: "group", members: uniqueMembers(members) });
+  const updateGroupMembers = (members: GroupRouteMember[], patch?: Partial<RouteDraft>) => {
+    const nextMembers = uniqueMembers(members);
+    const specifiedKey = props.draft.specifiedMember ? groupMemberKey(props.draft.specifiedMember) : "";
+    const specifiedStillSelected = specifiedKey
+      ? nextMembers.some((member) => groupMemberKey(member) === specifiedKey)
+      : false;
+    props.onDraft({
+      ...props.draft,
+      ...patch,
+      type: "group",
+      members: nextMembers,
+      specifiedMember: specifiedStillSelected ? props.draft.specifiedMember : undefined
+    });
+  };
+  const setSpecifiedMember = (memberKey: string) => {
+    const member = draftMembers.find((item) => groupMemberKey(item) === memberKey);
+    props.onDraft({
+      ...props.draft,
+      type: "group",
+      specifiedMember: member
+    });
   };
   const toggleGroupMember = (option: ProviderModelOption, checked: boolean) => {
     const optionKey = groupMemberKey(option);
@@ -344,13 +363,13 @@ export function RoutesView(props: {
     const rule = (props.draft.matchRule || "").trim();
     if (!rule) return;
     const matched = enabledModelOptions.filter((option) => modelMatchesRule(option.model, rule)).map(optionToMember);
-    props.onDraft({ ...props.draft, type: "group", matchRule: rule, members: uniqueMembers([...draftMembers, ...matched]) });
+    updateGroupMembers([...draftMembers, ...matched], { matchRule: rule });
   };
   const applySmartSelection = () => {
     const query = (props.draft.matchRule || "").trim();
     if (!query) return;
     const matched = enabledModelOptions.filter((option) => smartModelMatches(option.model, query)).map(optionToMember);
-    props.onDraft({ ...props.draft, type: "group", matchRule: query, members: uniqueMembers([...draftMembers, ...matched]) });
+    updateGroupMembers([...draftMembers, ...matched], { matchRule: query });
   };
   const clearGroupSelection = () => updateGroupMembers([]);
   const moveGroupMember = (index: number, delta: number) => {
@@ -398,19 +417,43 @@ export function RoutesView(props: {
     updateGroupMembers(draftMembers.filter((_, position) => position !== index));
   };
   const memberOptionLookup = new globalThis.Map(modelOptions.map((option) => [groupMemberKey(option), option] as const));
-  const canSaveRoute = draftType !== "group" || selectedAvailableCount > 0;
+  const draftSpecifiedKey = props.draft.specifiedMember ? groupMemberKey(props.draft.specifiedMember) : "";
+  const canSaveRoute =
+    draftType !== "group" ||
+    (selectedAvailableCount > 0 &&
+      (props.draft.strategy !== "specified" ||
+        Boolean(draftSpecifiedKey && draftMembers.some((member) => groupMemberKey(member) === draftSpecifiedKey))));
   const actionRoute = routeActionEditor ? props.snapshot.routes.find((route) => route.id === routeActionEditor.routeId) : undefined;
   const actionDraft = actionRoute ? routeDraft(actionRoute) : undefined;
   const actionMembersChanged =
     actionRoute?.type === "group" &&
     actionDraft?.type === "group" &&
     (actionRoute.members || []).map(groupMemberKey).join("\n") !== (actionDraft.members || []).map(groupMemberKey).join("\n");
+  const actionSpecifiedChanged =
+    actionRoute?.type === "group" &&
+    actionDraft?.type === "group" &&
+    (actionRoute.specifiedMember ? groupMemberKey(actionRoute.specifiedMember) : "") !==
+      (actionDraft.specifiedMember ? groupMemberKey(actionDraft.specifiedMember) : "");
   const actionHasChanges = Boolean(
     routeActionEditor &&
     actionRoute?.type === "group" &&
     actionDraft?.type === "group" &&
-    ((actionDraft as GroupRoute).strategy !== actionRoute.strategy || actionMembersChanged)
+    ((actionDraft as GroupRoute).strategy !== actionRoute.strategy || actionMembersChanged || actionSpecifiedChanged)
   );
+  const actionSpecifiedKey =
+    actionRoute?.type === "group" && actionDraft?.type === "group" && actionDraft.specifiedMember
+      ? groupMemberKey(actionDraft.specifiedMember)
+      : "";
+  const actionCanSave =
+    actionHasChanges &&
+    (actionDraft?.type !== "group" ||
+      (actionDraft as GroupRoute).strategy !== "specified" ||
+      Boolean(actionSpecifiedKey && (actionDraft.members || []).some((member) => groupMemberKey(member) === actionSpecifiedKey)));
+  const setActionSpecifiedMember = (memberKey: string) => {
+    if (!actionRoute || actionRoute.type !== "group" || !actionDraft || actionDraft.type !== "group") return;
+    const member = (actionDraft.members || []).find((item) => groupMemberKey(item) === memberKey);
+    updateRouteDraft(actionRoute, { specifiedMember: member });
+  };
   const actionGroupMembers = actionRoute?.type === "group" && actionDraft?.type === "group" ? actionDraft.members || [] : [];
   const moveActionGroupMember = (index: number, delta: number) => {
     if (!actionRoute || actionRoute.type !== "group" || !actionDraft || actionDraft.type !== "group") return;
@@ -456,6 +499,27 @@ export function RoutesView(props: {
     const memberGroups = groupRouteMemberGroups(props.snapshot, route);
     const quick = routeDraft(route);
     const orderedMembers = quick.strategy === "priority" ? groupRouteOrderedMembers(props.snapshot, quick) : [];
+    const specifiedMember =
+      quick.strategy === "specified" && quick.specifiedMember
+        ? memberOptionLookup.get(groupMemberKey(quick.specifiedMember))
+        : undefined;
+    const specifiedMemberFallback =
+      quick.strategy === "specified" && quick.specifiedMember
+        ? {
+            model: quick.specifiedMember.model,
+            siteName: quick.specifiedMember.siteId,
+            apiKeyLabel: undefined as string | undefined,
+            resolved: false
+          }
+        : undefined;
+    const specifiedDisplay = specifiedMember
+      ? {
+          model: specifiedMember.model,
+          siteName: specifiedMember.siteName,
+          apiKeyLabel: specifiedMember.apiKeyLabel,
+          resolved: true
+        }
+      : specifiedMemberFallback;
     const isOpen = Boolean(expanded[route.id]);
     const toggleRoute = () => setExpanded((current) => ({ ...current, [route.id]: !isOpen }));
     return (
@@ -478,7 +542,8 @@ export function RoutesView(props: {
               <span className="record-title">{route.name}</span>
             </div>
             <div className="record-meta">
-              关键词 {route.matchRule || "-"} / {groupStrategyLabels[quick.strategy]} / {endpointLabels[route.endpoint]}
+              关键词 {route.matchRule || "-"} / {groupStrategyLabels[quick.strategy]}
+              {specifiedDisplay ? ` / 指定 ${specifiedDisplay.model}` : ""} / {endpointLabels[route.endpoint]}
             </div>
             <div className="mt-3 flex flex-wrap gap-2">
               <span className="pill">{stats.providerCount} 个供应商</span>
@@ -519,6 +584,16 @@ export function RoutesView(props: {
                 <span>调用策略</span>
                 <strong>{groupStrategyLabels[quick.strategy]}</strong>
               </div>
+              {quick.strategy === "specified" ? (
+                <div>
+                  <span>指定模型</span>
+                  <strong>
+                    {specifiedDisplay
+                      ? `${specifiedDisplay.model} · ${specifiedDisplay.siteName}${specifiedDisplay.apiKeyLabel ? ` · ${specifiedDisplay.apiKeyLabel}` : ""}${specifiedDisplay.resolved ? "" : "（已失效）"}`
+                      : "未配置"}
+                  </strong>
+                </div>
+              ) : null}
               <div>
                 <span>请求头模板</span>
                 <strong>{props.snapshot.headerTemplates.find((template) => template.id === route.headerTemplateId)?.name || "不使用"}</strong>
@@ -552,6 +627,20 @@ export function RoutesView(props: {
                       </div>
                     </li>
                   ))}
+                </ol>
+              ) : quick.strategy === "specified" && specifiedDisplay ? (
+                <ol className="group-route-priority-list">
+                  <li className="group-route-priority-item">
+                    <span className="group-priority-rank">指定</span>
+                    <div className="group-priority-info">
+                      <strong>{specifiedDisplay.model}</strong>
+                      <span>
+                        {specifiedDisplay.siteName}
+                        {specifiedDisplay.apiKeyLabel ? ` · ${specifiedDisplay.apiKeyLabel}` : ""}
+                        {specifiedDisplay.resolved ? "" : "（已失效）"}
+                      </span>
+                    </div>
+                  </li>
                 </ol>
               ) : (
                 <div className="group-route-member-list">
@@ -850,14 +939,45 @@ export function RoutesView(props: {
                     调用策略
                     <SelectInput
                       value={(actionDraft as GroupRoute).strategy || "stable-first"}
-                      onChange={(event) => updateRouteDraft(actionRoute, { strategy: event.target.value as GroupRouteStrategy })}
+                      onChange={(event) => {
+                        const strategy = event.target.value as GroupRouteStrategy;
+                        const draft = actionDraft as GroupRoute;
+                        const next: Partial<GroupRoute> = { strategy };
+                        if (strategy === "specified" && !draft.specifiedMember && actionGroupMembers[0]) {
+                          next.specifiedMember = actionGroupMembers[0];
+                        }
+                        if (strategy !== "specified") next.specifiedMember = undefined;
+                        updateRouteDraft(actionRoute, next);
+                      }}
                     >
                       <option value="stable-first">{groupStrategyLabels["stable-first"]}</option>
                       <option value="sequential">{groupStrategyLabels.sequential}</option>
                       <option value="random">{groupStrategyLabels.random}</option>
                       <option value="priority">{groupStrategyLabels.priority}</option>
+                      <option value="specified">{groupStrategyLabels.specified}</option>
                     </SelectInput>
                   </label>
+                  {(actionDraft as GroupRoute).strategy === "specified" ? (
+                    <label>
+                      指定模型
+                      <SelectInput
+                        value={actionSpecifiedKey}
+                        disabled={actionGroupMembers.length === 0}
+                        onChange={(event) => setActionSpecifiedMember(event.target.value)}
+                      >
+                        {actionGroupMembers.length === 0 ? <option value="">暂无组内模型</option> : <option value="">选择指定模型</option>}
+                        {actionGroupMembers.map((member) => {
+                          const option = memberOptionLookup.get(groupMemberKey(member));
+                          return (
+                            <option key={groupMemberKey(member)} value={groupMemberKey(member)}>
+                              {option?.model || member.model}
+                              {option ? ` · ${option.siteName}${option.apiKeyLabel ? ` · ${option.apiKeyLabel}` : ""}` : "（已失效）"}
+                            </option>
+                          );
+                        })}
+                      </SelectInput>
+                    </label>
+                  ) : null}
                   {(actionDraft as GroupRoute).strategy === "priority" ? (
                     <div className="route-action-priority">
                       <div className="group-priority-head">
@@ -964,7 +1084,7 @@ export function RoutesView(props: {
               >
                 还原
               </ActionButton>
-              <ActionButton type="submit" disabled={!actionHasChanges}>
+              <ActionButton type="submit" disabled={!actionCanSave}>
                 <Save className="h-4 w-4" />
                 保存
               </ActionButton>
@@ -1052,14 +1172,47 @@ export function RoutesView(props: {
                       调用策略
                       <SelectInput
                         value={props.draft.strategy || "stable-first"}
-                        onChange={(event) => props.onDraft({ ...props.draft, type: "group", strategy: event.target.value as GroupRouteStrategy })}
+                        onChange={(event) => {
+                          const strategy = event.target.value as GroupRouteStrategy;
+                          props.onDraft({
+                            ...props.draft,
+                            type: "group",
+                            strategy,
+                            specifiedMember:
+                              strategy === "specified"
+                                ? props.draft.specifiedMember || draftMembers[0]
+                                : undefined
+                          });
+                        }}
                       >
                         <option value="stable-first">{groupStrategyLabels["stable-first"]}</option>
                         <option value="sequential">{groupStrategyLabels.sequential}</option>
                         <option value="random">{groupStrategyLabels.random}</option>
                         <option value="priority">{groupStrategyLabels.priority}</option>
+                        <option value="specified">{groupStrategyLabels.specified}</option>
                       </SelectInput>
                     </label>
+                    {props.draft.strategy === "specified" ? (
+                      <label>
+                        指定模型
+                        <SelectInput
+                          value={draftSpecifiedKey}
+                          disabled={draftMembers.length === 0}
+                          onChange={(event) => setSpecifiedMember(event.target.value)}
+                        >
+                          {draftMembers.length === 0 ? <option value="">请先勾选组内模型</option> : <option value="">选择指定模型</option>}
+                          {draftMembers.map((member) => {
+                            const option = memberOptionLookup.get(groupMemberKey(member));
+                            return (
+                              <option key={groupMemberKey(member)} value={groupMemberKey(member)}>
+                                {option?.model || member.model}
+                                {option ? ` · ${option.siteName}${option.apiKeyLabel ? ` · ${option.apiKeyLabel}` : ""}` : "（已失效）"}
+                              </option>
+                            );
+                          })}
+                        </SelectInput>
+                      </label>
+                    ) : null}
                     {props.draft.strategy === "priority" ? (
                       <div className="group-priority-picker form-span-2">
                         <div className="group-priority-head">

@@ -1,9 +1,12 @@
 import {
   Braces,
-  Check,
   ChevronDown,
   ChevronRight,
   ChevronUp,
+  CircleCheck,
+  CircleHelp,
+  CircleX,
+  Clock3,
   Copy,
   Database,
   KeyRound,
@@ -35,7 +38,6 @@ import type {
   ProviderModelGroupOption,
   RequestLog,
   RequestLogSummary,
-  RouteProxyConfig,
   RouteRecord,
   RouteType,
   Site,
@@ -52,7 +54,6 @@ import {
   blankHeaderRow,
   endpointLabels,
   groupStrategyLabels,
-  routeProxyModeLabels,
   routeTypeLabels,
   siteTypeLabels,
   temporaryAccountAvailabilityLabels,
@@ -96,7 +97,6 @@ import {
   temporaryAccountAvailabilityStats,
   temporaryAccountQuotaPercent,
   temporaryAccountQuotaText,
-  temporaryAccountTypeLabel,
   uniqueMembers,
   upstreamRequestSummary,
   upstreamRequestBody
@@ -129,6 +129,13 @@ function isTemporaryImportZip(file: File) {
   return file.name.toLowerCase().endsWith(".zip") || ["application/zip", "application/x-zip-compressed"].includes(file.type);
 }
 
+function TemporaryAccountStatusIcon(props: { availability: TemporaryAccount["availability"]; checking: boolean }) {
+  if (props.checking) return <RefreshCw className="h-3.5 w-3.5 animate-spin" />;
+  if (props.availability === "available") return <CircleCheck className="h-3.5 w-3.5" />;
+  if (props.availability === "unavailable") return <CircleX className="h-3.5 w-3.5" />;
+  return <CircleHelp className="h-3.5 w-3.5" />;
+}
+
 export function TemporaryAccountsView(props: {
   snapshot: AppSnapshot;
   draft: TemporaryAccountImportDraft;
@@ -138,10 +145,9 @@ export function TemporaryAccountsView(props: {
   error: string;
   checking: string | null;
   checkingAccountIds: string[];
+  queuedAccountIds: string[];
   checkProviderType: Extract<TemporaryAccountProviderType, "gpt" | "grok">;
   onCheckProviderTypeChange: (providerType: Extract<TemporaryAccountProviderType, "gpt" | "grok">) => void;
-  checkProxy: RouteProxyConfig;
-  onCheckProxyChange: (proxy: RouteProxyConfig) => void;
   updating: string | null;
   deleting: string | null;
   selectedAccountIds: string[];
@@ -177,6 +183,9 @@ export function TemporaryAccountsView(props: {
     .filter((account) => (account.availability || "unknown") === "unknown")
     .map((account) => account.id);
   const checkingAccountIdSet = new Set(props.checkingAccountIds);
+  const queuedAccountIdSet = new Set(props.queuedAccountIds);
+  const visibleCheckingCount = props.checkingAccountIds.filter((id) => visibleAccountIdSet.has(id)).length;
+  const visibleQueuedCount = props.queuedAccountIds.filter((id) => visibleAccountIdSet.has(id)).length;
   const currentTypeLabel = temporaryAccountProviderLabels[props.checkProviderType];
   const temporaryAccountStrategy = props.snapshot.settings.temporaryAccountStrategy || "sequential";
   const hasImportContent = props.draft.content.trim() || props.draft.contents.some((content) => content.trim());
@@ -268,41 +277,28 @@ export function TemporaryAccountsView(props: {
               <span><strong>{visibleAvailabilityStats.available}</strong>可用</span>
               <span><strong>{visibleAvailabilityStats.unavailable}</strong>不可用</span>
               <span><strong>{visibleAvailabilityStats.unknown}</strong>未检查</span>
+              {props.checking !== null ? <span><strong>{visibleCheckingCount}</strong>检测中</span> : null}
+              {props.checking !== null ? <span><strong>{visibleQueuedCount}</strong>等待检测</span> : null}
             </div>
           </div>
           <div className="temp-account-toolbar">
-            <div className="temp-account-toolbar-filters">
-              <label className="temp-account-check-provider">
-                <span>检查账号</span>
-                <SelectInput value={props.checkProviderType} onChange={(event) => props.onCheckProviderTypeChange(event.target.value as Extract<TemporaryAccountProviderType, "gpt" | "grok">)}>
-                  <option value="gpt">{temporaryAccountProviderLabels.gpt}</option>
-                  <option value="grok">{temporaryAccountProviderLabels.grok}</option>
-                </SelectInput>
-              </label>
-              <label className="temp-account-check-proxy">
-                <span>检测代理</span>
-                <SelectInput
-                  value={props.checkProxy.mode}
-                  onChange={(event) => {
-                    const mode = event.target.value as RouteProxyConfig["mode"];
-                    props.onCheckProxyChange(mode === "custom" ? { mode, url: props.checkProxy.url || "http://127.0.0.1:7897" } : { mode });
-                  }}
-                >
-                  <option value="system">{routeProxyModeLabels.system}</option>
-                  <option value="direct">{routeProxyModeLabels.direct}</option>
-                  <option value="custom">防封 Docker / 自定义代理</option>
-                </SelectInput>
-              </label>
-              {props.checkProxy.mode === "custom" ? (
-                <label className="temp-account-check-proxy temp-account-check-proxy-url">
-                  <span>代理地址</span>
-                  <TextInput
-                    value={props.checkProxy.url || ""}
-                    placeholder="http://127.0.0.1:7897"
-                    onChange={(event) => props.onCheckProxyChange({ mode: "custom", url: event.target.value })}
-                  />
-                </label>
-              ) : null}
+            <div className="temp-account-toolbar-controls">
+              <div className="temp-account-check-provider">
+                <span className="temp-account-control-label">账号类型</span>
+                <div className="temp-account-provider-switch" role="group" aria-label="账号类型">
+                  {(["gpt", "grok"] as const).map((providerType) => (
+                    <button
+                      key={providerType}
+                      type="button"
+                      className={`temp-account-provider-option ${props.checkProviderType === providerType ? "temp-account-provider-option-active" : ""}`}
+                      aria-pressed={props.checkProviderType === providerType}
+                      onClick={() => props.onCheckProviderTypeChange(providerType)}
+                    >
+                      {temporaryAccountProviderLabels[providerType]}
+                    </button>
+                  ))}
+                </div>
+              </div>
               <label className="temp-account-strategy">
                 <span>全局复用策略</span>
                 <SelectInput value={temporaryAccountStrategy} onChange={(event) => props.onStrategyChange(event.target.value as GroupRouteStrategy)}>
@@ -311,32 +307,33 @@ export function TemporaryAccountsView(props: {
                   <option value="random">{groupStrategyLabels.random}</option>
                 </SelectInput>
               </label>
-            </div>
-            <div className="temp-account-toolbar-actions">
-              <ActionButton type="button" tone="ghost" disabled={props.checking !== null || visibleAccounts.length === 0} onClick={() => props.onCheck()}>
+              <ActionButton className="temp-account-check-action" type="button" tone="ghost" disabled={props.checking !== null || visibleAccounts.length === 0} onClick={() => props.onCheck()}>
                 <RefreshCw className={`h-4 w-4 ${props.checking === "all" ? "animate-spin" : ""}`} />
                 检查 {currentTypeLabel}
               </ActionButton>
-              <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || visibleAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(visibleAccountIds)}>
-                <Check className="h-4 w-4" />
-                全选{visibleAccountIds.length > 0 ? ` ${visibleAccountIds.length}` : ""}
-              </ActionButton>
-              <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || unavailableAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(unavailableAccountIds)}>
-                <Check className="h-4 w-4" />
-                选中不可用{unavailableAccountIds.length > 0 ? ` ${unavailableAccountIds.length}` : ""}
-              </ActionButton>
-              <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || uncheckedAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(uncheckedAccountIds)}>
-                <Check className="h-4 w-4" />
-                选中未检查{uncheckedAccountIds.length > 0 ? ` ${uncheckedAccountIds.length}` : ""}
-              </ActionButton>
-              <ActionButton type="button" disabled={props.checking !== null || props.deleting !== null || selectedVisibleAccountIds.length === 0} onClick={props.onCheckSelected}>
-                <RefreshCw className={`h-4 w-4 ${props.checking === "selected" ? "animate-spin" : ""}`} />
-                复检选中{selectedVisibleAccountIds.length > 0 ? ` ${selectedVisibleAccountIds.length}` : ""}
-              </ActionButton>
-              <ActionButton type="button" tone="danger" disabled={props.deleting !== null || selectedVisibleAccountIds.length === 0} onClick={props.onDeleteSelected}>
-                <Trash2 className="h-4 w-4" />
-                删除选中{selectedVisibleAccountIds.length > 0 ? ` ${selectedVisibleAccountIds.length}` : ""}
-              </ActionButton>
+            </div>
+            <div className="temp-account-toolbar-actions">
+              <div className="temp-account-selection-group" role="group" aria-label="选择账号">
+                <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || visibleAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(visibleAccountIds)}>
+                  全部 <strong>{visibleAccountIds.length}</strong>
+                </ActionButton>
+                <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || unavailableAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(unavailableAccountIds)}>
+                  不可用 <strong>{unavailableAccountIds.length}</strong>
+                </ActionButton>
+                <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || uncheckedAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(uncheckedAccountIds)}>
+                  未检查 <strong>{uncheckedAccountIds.length}</strong>
+                </ActionButton>
+              </div>
+              <div className="temp-account-bulk-actions">
+                <ActionButton type="button" disabled={props.checking !== null || props.deleting !== null || selectedVisibleAccountIds.length === 0} onClick={props.onCheckSelected}>
+                  <RefreshCw className={`h-4 w-4 ${props.checking === "selected" ? "animate-spin" : ""}`} />
+                  复检{selectedVisibleAccountIds.length > 0 ? ` ${selectedVisibleAccountIds.length}` : ""}
+                </ActionButton>
+                <ActionButton type="button" tone="danger" disabled={props.deleting !== null || selectedVisibleAccountIds.length === 0} onClick={props.onDeleteSelected}>
+                  <Trash2 className="h-4 w-4" />
+                  删除{selectedVisibleAccountIds.length > 0 ? ` ${selectedVisibleAccountIds.length}` : ""}
+                </ActionButton>
+              </div>
             </div>
           </div>
           <div className="temp-account-groups">
@@ -351,6 +348,7 @@ export function TemporaryAccountsView(props: {
             ) : visibleGroups.map((group) => {
               const availabilityStats = temporaryAccountAvailabilityStats(group.accounts);
               const models = Array.from(new Set(group.accounts.flatMap((account) => account.models))).sort();
+              const groupIsGrok = (group.providerType || "gpt") === "grok";
               return (
                 <article key={group.id} className="temp-account-group-card">
                   <div className="temp-account-group-head">
@@ -360,64 +358,38 @@ export function TemporaryAccountsView(props: {
                         {group.accounts.length} 个账号 / {availabilityStats.available} 可用 / {availabilityStats.unavailable} 不可用 / {availabilityStats.unknown} 未检查
                       </div>
                     </div>
-                    <span className="temp-account-type-badge">{temporaryAccountProviderLabels[group.providerType || "gpt"]}</span>
                   </div>
                   <div className="min-w-0">
                     <div className="temp-account-list">
                       {group.accounts.map((account) => {
                         const availability = account.availability || "unknown";
                         const checking = checkingAccountIdSet.has(account.id);
+                        const queued = queuedAccountIdSet.has(account.id);
+                        const accountKind = groupIsGrok
+                          ? account.grokOAuthFormat === "grok2api-oauth" ? "grok2api" : "CPA"
+                          : temporaryAccountSourceLabels[group.source];
                         return (
-                          <div key={account.id} className={`temp-account-row temp-account-row-${availability}`}>
+                          <div key={account.id} className={`temp-account-row temp-account-row-${availability} ${groupIsGrok ? "temp-account-row-status-only" : ""}`}>
+                            <label className="temp-account-row-select" title={`选择 ${account.label}`}>
+                              <input
+                                type="checkbox"
+                                checked={selectedAccountIdSet.has(account.id)}
+                                onChange={(event) =>
+                                  props.onSelectedAccountIds(
+                                    event.target.checked
+                                      ? Array.from(new Set([...selectedVisibleAccountIds, account.id]))
+                                      : selectedVisibleAccountIds.filter((id) => id !== account.id)
+                                  )
+                                }
+                                aria-label={`选择 ${account.label}`}
+                              />
+                            </label>
                             <div className="temp-account-row-main">
-                              <div className="temp-account-row-title">
-                                <input
-                                  type="checkbox"
-                                  checked={selectedAccountIdSet.has(account.id)}
-                                  onChange={(event) =>
-                                    props.onSelectedAccountIds(
-                                      event.target.checked
-                                        ? Array.from(new Set([...selectedVisibleAccountIds, account.id]))
-                                        : selectedVisibleAccountIds.filter((id) => id !== account.id)
-                                    )
-                                  }
-                                  aria-label={`选择 ${account.label}`}
-                                />
-                                <span className={`account-status account-status-${checking ? "checking" : availability}`}>
-                                  {checking ? "检测中" : temporaryAccountAvailabilityLabels[availability]}
-                                </span>
-                                <span className="temp-account-name">{account.label}</span>
-                                <div className="temp-account-row-actions">
-                                  <button
-                                    className="temp-account-icon-button"
-                                    type="button"
-                                    disabled={props.checking !== null || props.deleting !== null}
-                                    onClick={() => props.onCheckAccount(account.id)}
-                                    title="刷新账号"
-                                  >
-                                    <RefreshCw className={`h-4 w-4 ${checking ? "animate-spin" : ""}`} />
-                                  </button>
-                                  <label className="temp-account-enable" title={account.enabled ? "停用账号" : "启用账号"}>
-                                    <input
-                                      type="checkbox"
-                                      checked={account.enabled}
-                                      disabled={props.updating !== null || props.deleting !== null}
-                                      onChange={(event) => props.onUpdateAccount(account.id, { enabled: event.target.checked })}
-                                    />
-                                    启用
-                                  </label>
-                                  <button className="temp-account-delete" type="button" disabled={props.deleting !== null} onClick={() => props.onDeleteAccount(account.id)} title="删除账号">
-                                    {props.deleting === account.id ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-                                  </button>
-                                </div>
+                              <div className="temp-account-identity">
+                                <span className="temp-account-name" title={account.label}>{account.label}</span>
+                                <span className="temp-account-kind">{accountKind}</span>
                               </div>
-                              <div className="temp-account-secret">
-                                {temporaryAccountTypeLabel(account)} / {account.prefix}...
-                                {account.email ? ` / ${account.email}` : ""}
-                                {account.accountId ? ` / ${account.accountId}` : ""}
-                                {account.lastCheckStatusCode ? ` / HTTP ${account.lastCheckStatusCode}` : ""}
-                              </div>
-                              {account.quotaStages.length > 0 ? (
+                              {!groupIsGrok && account.quotaStages.length > 0 ? (
                                 <div className="temp-account-quota-list">
                                   {account.quotaStages.slice(0, 5).map((stage, index) => {
                                     const percent = temporaryAccountQuotaPercent(stage);
@@ -439,8 +411,40 @@ export function TemporaryAccountsView(props: {
                               ) : null}
                               {account.lastCheckError ? <div className="temp-account-error">{account.lastCheckError}</div> : null}
                             </div>
-                            <div className="temp-account-last-check">
-                              {account.lastQuotaCheckedAt ? formatTime(account.lastQuotaCheckedAt) : "未检查"}
+                            <div className="temp-account-row-side">
+                              <div className="temp-account-health">
+                                <button
+                                  className={`account-status account-status-${checking ? "checking" : queued ? "queued" : availability}`}
+                                  type="button"
+                                  disabled={props.checking !== null || props.deleting !== null}
+                                  onClick={() => props.onCheckAccount(account.id)}
+                                  title={checking ? "正在检测账号" : queued ? "账号等待检测" : "重新检查账号"}
+                                  aria-label={`${checking ? "正在检测" : queued ? "等待检测" : "重新检查"} ${account.label}`}
+                                >
+                                  {queued ? <Clock3 className="h-3.5 w-3.5" /> : <TemporaryAccountStatusIcon availability={availability} checking={checking} />}
+                                  {checking ? "检测中" : queued ? "等待检测" : temporaryAccountAvailabilityLabels[availability]}
+                                </button>
+                                <span className="temp-account-last-check">
+                                  <Clock3 className="h-3.5 w-3.5" />
+                                  {account.lastQuotaCheckedAt ? formatTime(account.lastQuotaCheckedAt) : "尚未检测"}
+                                </span>
+                                {account.lastCheckStatusCode ? <span className="temp-account-http-status">HTTP {account.lastCheckStatusCode}</span> : null}
+                              </div>
+                              <div className="temp-account-row-actions">
+                                <label className="temp-account-enable" title={account.enabled ? "停用账号" : "启用账号"}>
+                                  <input
+                                    type="checkbox"
+                                    checked={account.enabled}
+                                    disabled={props.updating !== null || props.deleting !== null}
+                                    onChange={(event) => props.onUpdateAccount(account.id, { enabled: event.target.checked })}
+                                    aria-label={account.enabled ? `停用 ${account.label}` : `启用 ${account.label}`}
+                                  />
+                                  <span className="temp-account-enable-track" aria-hidden="true"><span /></span>
+                                </label>
+                                <button className="temp-account-delete" type="button" disabled={props.deleting !== null} onClick={() => props.onDeleteAccount(account.id)} title="删除账号" aria-label={`删除 ${account.label}`}>
+                                  {props.deleting === account.id ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                                </button>
+                              </div>
                             </div>
                           </div>
                         );

@@ -54,6 +54,14 @@ function isTemporaryAccountAuthFailure(errorMessage = "") {
 }
 
 export function createAccountCheck(store: JsonStore) {
+  function siteProxyForTemporaryAccountGroup(groupId: string): RouteProxyConfig {
+    const db = store.getDb();
+    const group = db.temporaryAccountGroups.find((item) => item.id === groupId);
+    const site = group ? db.sites.find((item) => item.id === group.siteId) : undefined;
+    const address = site?.enabled === false ? undefined : site?.addresses.find((item) => item.enabled);
+    return address?.proxy || { mode: "direct" };
+  }
+
   function grokConfiguredModels(account: TemporaryAccount) {
     const upstreamModels = Array.from(
       new Set(
@@ -280,14 +288,15 @@ export function createAccountCheck(store: JsonStore) {
 
   async function checkTemporaryAccount(groupId: string, account: TemporaryAccount, proxyConfig?: RouteProxyConfig): Promise<TemporaryAccountCheckItemResult> {
     const checkedAt = new Date().toISOString();
+    const accountProxy = proxyConfig || siteProxyForTemporaryAccountGroup(groupId);
     try {
       const accountIsCodex = account.accountType === "codex" || Boolean(account.accountId);
       const providerType = account.providerType || "gpt";
       const check = providerType === "grok"
-        ? await checkGrokTemporaryAccount(account, checkedAt, proxyConfig)
+        ? await checkGrokTemporaryAccount(account, checkedAt, accountProxy)
         : accountIsCodex
-          ? await checkCodexTemporaryAccount(account, checkedAt, proxyConfig)
-          : await checkOpenAiApiKeyTemporaryAccount(account, checkedAt, proxyConfig);
+          ? await checkCodexTemporaryAccount(account, checkedAt, accountProxy)
+          : await checkOpenAiApiKeyTemporaryAccount(account, checkedAt, accountProxy);
       const updated = store.updateTemporaryAccountCheckResult(account.id, check.patch);
       return {
         groupId,

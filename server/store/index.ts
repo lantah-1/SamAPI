@@ -45,6 +45,7 @@ import {
   groupMemberKey,
   hashSecret,
   normalizeBaseUrl,
+  normalizeGroupRouteMember,
   normalizeGroupStrategy,
   normalizeMatchRule,
   normalizeModelList,
@@ -1013,6 +1014,21 @@ export class JsonStore {
       matchRule ? input.modelGroupId ?? currentGroup?.modelGroupId : undefined
     );
     if (members.length === 0) throw new Error("请至少选择一个组内模型");
+    const specifiedMemberInput =
+      input.specifiedMember !== undefined
+        ? normalizeGroupRouteMember(input.specifiedMember)
+        : currentGroup?.specifiedMember;
+    const specifiedMember =
+      strategy === "specified"
+        ? (() => {
+            if (!specifiedMemberInput) throw new Error("请选择指定的供应商模型");
+            const memberKey = groupMemberKey(specifiedMemberInput);
+            if (!members.some((member) => groupMemberKey(member) === memberKey)) {
+              throw new Error("指定模型必须属于组内模型");
+            }
+            return specifiedMemberInput;
+          })()
+        : undefined;
 
     const routeShape = {
       name: input.name.trim(),
@@ -1021,6 +1037,7 @@ export class JsonStore {
       modelGroupId: input.modelGroupId?.trim() || undefined,
       matchRule,
       members,
+      specifiedMember,
       endpoint: input.endpoint || "messages",
       headerTemplateId: input.headerTemplateId || undefined,
       enabled: input.enabled ?? true,

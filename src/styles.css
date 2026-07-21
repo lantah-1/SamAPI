@@ -1249,39 +1249,152 @@ textarea.field:focus {
 }
 
 .temp-account-check-provider,
-.temp-account-check-proxy,
 .temp-account-strategy {
-  width: min(220px, 100%);
+  width: min(180px, 100%);
 }
 
 .temp-account-toolbar {
   display: flex;
-  flex-direction: column;
-  gap: 0.7rem;
-  border-top: 1px solid var(--line);
-  padding-top: 1rem;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.75rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 0.72rem;
 }
 
-.temp-account-toolbar-filters {
+.temp-account-toolbar-controls {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
-  gap: 0.7rem;
+  gap: 0.6rem;
 }
 
-.temp-account-toolbar-filters .temp-account-strategy {
-  margin-left: auto;
+.temp-account-control-label,
+.temp-account-strategy > span {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: var(--muted-strong);
+  font-size: 0.68rem;
+  font-weight: 820;
+}
+
+.temp-account-strategy .select-shell {
+  margin-top: 0;
+}
+
+.temp-account-provider-switch {
+  display: grid;
+  min-height: 44px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--field-bg);
+  padding: 3px;
+}
+
+.temp-account-provider-option {
+  min-width: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  padding: 0.42rem 0.62rem;
+  color: var(--muted-strong);
+  font-size: 0.78rem;
+  font-weight: 840;
+  transition: background 150ms ease, color 150ms ease, box-shadow 150ms ease;
+}
+
+.temp-account-provider-option:hover {
+  background: var(--surface-muted);
+  color: var(--ink);
+}
+
+.temp-account-provider-option:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: 1px;
+}
+
+.temp-account-provider-option-active,
+.temp-account-provider-option-active:hover {
+  background: var(--accent);
+  color: var(--accent-foreground);
+  box-shadow: 0 4px 10px var(--accent-soft);
+}
+
+.temp-account-check-action {
+  min-height: 44px;
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--line));
+  background: var(--accent-softer);
+  color: var(--accent-strong);
 }
 
 .temp-account-toolbar-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
-  gap: 0.5rem;
+  gap: 0.6rem;
 }
 
 .temp-account-toolbar-actions .action {
   flex: 0 0 auto;
+  min-height: 36px;
+  padding: 0.46rem 0.66rem;
+  font-size: 0.78rem;
+}
+
+.temp-account-selection-group {
+  display: flex;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--field-bg);
+}
+
+.temp-account-selection-group .action {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.temp-account-selection-group .action + .action {
+  border-left: 1px solid var(--line);
+}
+
+.temp-account-selection-group .action:hover {
+  background: var(--surface-muted);
+  transform: none;
+}
+
+.temp-account-selection-group strong {
+  color: var(--accent-strong);
+  font-size: 0.72rem;
+  font-weight: 900;
+}
+
+.temp-account-selection-group .action:disabled strong {
+  color: inherit;
+}
+
+.temp-account-bulk-actions {
+  display: flex;
+  gap: 0.42rem;
+}
+
+@media (min-width: 761px) and (max-width: 1180px) {
+  .temp-account-toolbar-controls,
+  .temp-account-toolbar-actions {
+    width: 100%;
+  }
+
+  .temp-account-toolbar-actions {
+    justify-content: space-between;
+  }
 }
 
 .temp-account-groups {
@@ -1291,105 +1404,110 @@ textarea.field:focus {
 
 .temp-account-group-card {
   min-width: 0;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--record-bg);
-  padding: 1rem;
-  box-shadow: var(--shadow-row);
-  transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease, background 160ms ease;
-}
-
-.temp-account-group-card:hover {
-  border-color: color-mix(in srgb, var(--accent) 18%, transparent);
-  box-shadow: var(--shadow-lift);
+  padding: 0.15rem 0;
 }
 
 .temp-account-group-head {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 1rem;
-}
-
-.temp-account-type-badge {
-  flex: none;
-  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
-  border-radius: 999px;
-  background: var(--accent-softer);
-  padding: 0.24rem 0.55rem;
-  color: var(--accent-strong);
-  font-size: 0.7rem;
-  font-weight: 860;
+  padding: 0 0.15rem 0.65rem;
 }
 
 .temp-account-list {
   display: grid;
-  gap: 0.55rem;
-  margin-top: 0.9rem;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
 }
 
 .temp-account-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 0.8rem;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  gap: 0.85rem;
   align-items: start;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface-soft);
-  padding: 0.7rem;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  padding: 0.72rem 0.82rem;
+  transition: background 150ms ease;
+}
+
+.temp-account-row:first-child {
+  border-top: 0;
+}
+
+.temp-account-row:hover {
+  background: var(--surface-solid);
+}
+
+.temp-account-row-status-only {
+  align-items: center;
 }
 
 .temp-account-row-available {
-  border-color: var(--success-line);
+  box-shadow: inset 2px 0 0 var(--success-line);
 }
 
 .temp-account-row-unavailable {
-  border-color: color-mix(in srgb, var(--danger) 22%, var(--line));
+  background: color-mix(in srgb, var(--danger-soft) 42%, transparent);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--danger) 36%, transparent);
 }
 
 .temp-account-row-main {
   min-width: 0;
 }
 
-.temp-account-row-title {
+.temp-account-row-select {
   display: grid;
-  min-width: 0;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 0.4rem;
+  height: 28px;
+  place-items: center;
+  cursor: pointer;
 }
 
-.temp-account-row-title input[type="checkbox"] {
+.temp-account-row-select input[type="checkbox"] {
+  height: 15px;
+  width: 15px;
   accent-color: var(--accent);
+}
+
+.temp-account-identity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.48rem;
+}
+
+.temp-account-row-side {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 0.85rem;
+}
+
+.temp-account-health {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: start;
+  gap: 0.48rem;
 }
 
 .temp-account-row-actions {
   display: flex;
   align-items: center;
-  gap: 0.28rem;
+  gap: 0.24rem;
 }
 
-.temp-account-icon-button,
 .temp-account-delete {
   display: grid;
-  height: 30px;
-  width: 30px;
+  height: 32px;
+  width: 32px;
   place-items: center;
   border-radius: 8px;
-  transition: background 150ms ease, transform 150ms ease, opacity 150ms ease;
-}
-
-.temp-account-icon-button {
-  color: var(--accent-strong);
-}
-
-.temp-account-icon-button:hover {
-  background: var(--accent-softer);
-  transform: translateY(-1px);
-}
-
-.temp-account-delete {
   color: var(--danger-strong);
+  transition: background 150ms ease, transform 150ms ease, opacity 150ms ease;
 }
 
 .temp-account-delete:hover {
@@ -1398,23 +1516,59 @@ textarea.field:focus {
 }
 
 .temp-account-enable {
-  display: inline-flex;
+  position: relative;
+  display: grid;
+  height: 32px;
+  width: 38px;
   align-items: center;
-  gap: 0.24rem;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 0.28rem 0.48rem;
-  color: var(--muted);
-  font-size: 0.68rem;
-  font-weight: 840;
-  white-space: nowrap;
+  place-items: center;
+  cursor: pointer;
 }
 
 .temp-account-enable input {
-  accent-color: var(--accent);
+  position: absolute;
+  height: 1px;
+  width: 1px;
+  opacity: 0;
 }
 
-.temp-account-icon-button:disabled,
+.temp-account-enable-track {
+  position: relative;
+  display: block;
+  height: 18px;
+  width: 32px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  transition: border-color 150ms ease, background 150ms ease;
+}
+
+.temp-account-enable-track span {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  height: 12px;
+  width: 12px;
+  border-radius: 50%;
+  background: var(--surface-solid);
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--ink) 28%, transparent);
+  transition: transform 150ms ease;
+}
+
+.temp-account-enable input:checked + .temp-account-enable-track {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.temp-account-enable input:checked + .temp-account-enable-track span {
+  transform: translateX(14px);
+}
+
+.temp-account-enable input:focus-visible + .temp-account-enable-track {
+  outline: 2px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: 2px;
+}
+
 .temp-account-delete:disabled,
 .temp-account-enable:has(input:disabled) {
   cursor: not-allowed;
@@ -1425,22 +1579,48 @@ textarea.field:focus {
 .temp-account-name {
   min-width: 0;
   color: var(--ink);
-  font-size: 0.86rem;
+  font-size: 0.9rem;
   font-weight: 860;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.temp-account-secret,
 .temp-account-last-check {
   color: var(--muted);
-  font-size: 0.74rem;
+  font-size: 0.72rem;
   font-weight: 700;
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
 
+.temp-account-kind {
+  flex: none;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: 999px;
+  background: var(--accent-softer);
+  padding: 0.18rem 0.42rem;
+  color: var(--accent-strong);
+  font-size: 0.66rem;
+  font-weight: 860;
+  line-height: 1;
+}
+
 .temp-account-last-check {
-  text-align: right;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  white-space: nowrap;
+}
+
+.temp-account-last-check svg {
+  flex: none;
+}
+
+.temp-account-http-status {
+  color: var(--muted);
+  font-size: 0.66rem;
+  font-weight: 800;
   white-space: nowrap;
 }
 
@@ -1448,11 +1628,30 @@ textarea.field:focus {
   display: inline-flex;
   min-height: 22px;
   align-items: center;
+  gap: 0.28rem;
+  border: 0;
   border-radius: 999px;
   padding: 0.18rem 0.45rem;
   font-size: 0.68rem;
   font-weight: 860;
   line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: box-shadow 150ms ease, filter 150ms ease;
+}
+
+.account-status:not(:disabled):hover {
+  box-shadow: inset 0 0 0 1px currentColor;
+  filter: saturate(1.15);
+}
+
+.account-status:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: 2px;
+}
+
+.account-status:disabled {
+  cursor: wait;
 }
 
 .account-status-available {
@@ -1466,7 +1665,8 @@ textarea.field:focus {
 }
 
 .account-status-unknown,
-.account-status-muted {
+.account-status-muted,
+.account-status-queued {
   background: var(--surface-muted);
   color: var(--muted-strong);
 }
@@ -1474,6 +1674,10 @@ textarea.field:focus {
 .account-status-checking {
   background: var(--accent-soft);
   color: var(--accent-strong);
+}
+
+.account-status svg {
+  flex: none;
 }
 
 .temp-account-quota-list {
@@ -3998,65 +4202,102 @@ textarea.field:focus {
   }
 
   .temp-account-toolbar {
+    align-items: stretch;
     gap: 0.55rem;
+    padding: 0.6rem;
   }
 
-  .temp-account-toolbar-filters {
+  .temp-account-toolbar-controls {
     display: grid;
-    grid-template-columns: 1fr;
+    width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 0.55rem;
   }
 
-  .temp-account-toolbar-filters .temp-account-check-provider,
-  .temp-account-toolbar-filters .temp-account-check-proxy,
-  .temp-account-toolbar-filters .temp-account-strategy {
+  .temp-account-toolbar-controls .temp-account-check-provider,
+  .temp-account-toolbar-controls .temp-account-strategy {
     width: 100%;
-    margin-left: 0;
+  }
+
+  .temp-account-check-action {
+    grid-column: 1 / -1;
+    width: 100%;
   }
 
   .temp-account-toolbar-actions {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+    grid-template-columns: minmax(0, 1fr);
     justify-content: stretch;
-    gap: 0.5rem;
+    gap: 0.55rem;
   }
 
-  .temp-account-toolbar-actions .action {
+  .temp-account-selection-group {
+    width: 100%;
+  }
+
+  .temp-account-selection-group .action {
+    min-width: 0;
+    flex: 1 1 0;
+  }
+
+  .temp-account-bulk-actions {
+    display: grid;
+    width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .temp-account-bulk-actions .action {
     width: 100%;
   }
 
   .temp-account-group-card {
-    padding: 0.72rem;
+    padding: 0.05rem 0;
   }
 
   .temp-account-group-head {
-    align-items: stretch;
-    flex-direction: column;
+    align-items: flex-start;
+    flex-direction: row;
     gap: 0.55rem;
-  }
-
-  .temp-account-type-badge {
-    width: fit-content;
   }
 
   .temp-account-row {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 0.55rem;
+    grid-template-columns: 20px minmax(0, 1fr);
+    gap: 0.55rem 0.65rem;
     padding: 0.62rem;
   }
 
-  .temp-account-row-title {
-    grid-template-columns: auto auto minmax(0, 1fr);
+  .temp-account-row-select {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .temp-account-row-main {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .temp-account-row-side {
+    grid-column: 2;
+    grid-row: 2;
+    width: 100%;
+    align-items: center;
+    justify-content: space-between;
+    border-top: 1px solid var(--line);
+    padding-top: 0.55rem;
+  }
+
+  .temp-account-health {
+    display: flex;
+    min-width: 0;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem 0.5rem;
   }
 
   .temp-account-row-actions {
-    grid-column: 1 / -1;
+    flex: none;
     justify-content: flex-end;
-  }
-
-  .temp-account-last-check {
-    text-align: left;
-    white-space: normal;
   }
 
   .temp-account-quota-list {
@@ -4153,6 +4394,32 @@ textarea.field:focus {
 
   .auth-metric-row {
     display: none;
+  }
+
+  .temp-account-group-card {
+    padding: 0.05rem 0;
+  }
+
+  .temp-account-toolbar-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .temp-account-check-action {
+    grid-column: auto;
+  }
+
+  .temp-account-row-side {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+
+  .temp-account-health {
+    width: 100%;
+  }
+
+  .temp-account-row-actions {
+    align-self: flex-end;
   }
 }
 

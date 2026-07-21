@@ -4,7 +4,7 @@ export type RouteType = "switch" | "group";
 
 export type SiteType = "newapi" | "unknown";
 
-export type GroupRouteStrategy = "stable-first" | "sequential" | "random" | "priority";
+export type GroupRouteStrategy = "stable-first" | "sequential" | "random" | "priority" | "specified";
 
 export type RouteProxyMode = "direct" | "system" | "custom";
 
@@ -286,6 +286,7 @@ export interface GroupRoute {
   modelGroupId?: string;
   matchRule: string;
   members: GroupRouteMember[];
+  specifiedMember?: GroupRouteMember;
   endpoint: EndpointKind;
   headerTemplateId?: string;
   enabled: boolean;

@@ -12,10 +12,10 @@ import type {
   TemporaryAccountProviderType
 } from "../../shared/types.js";
 
-function temporaryAccountCheckProxyFromBody(body: unknown): RouteProxyConfig {
-  if (!isRecord(body)) return { mode: "system" };
+function temporaryAccountCheckProxyFromBody(body: unknown): RouteProxyConfig | undefined {
+  if (!isRecord(body)) return undefined;
   const proxy = isRecord(body.proxy) ? body.proxy : isRecord(body.checkProxy) ? body.checkProxy : undefined;
-  if (!proxy) return { mode: "system" };
+  if (!proxy) return undefined;
   const mode = proxy.mode;
   if (mode === "direct" || mode === "system") return { mode };
   if (mode === "custom") {
@@ -23,7 +23,7 @@ function temporaryAccountCheckProxyFromBody(body: unknown): RouteProxyConfig {
     if (!url) throw new Error("自定义代理地址不能为空");
     return { mode, url };
   }
-  return { mode: "system" };
+  return undefined;
 }
 
 function temporaryAccountProviderTypeFromBody(body: unknown): TemporaryAccountProviderType {
@@ -234,12 +234,9 @@ export function createApiHandler(deps: ApiHandlerDeps) {
         if (method === "POST" && parts[2] === "import") {
           const body = await readJson(request);
           const imported = store.importTemporaryAccounts(body);
-          const checkProxy = temporaryAccountCheckProxyFromBody(body);
-          const checkResult = ["gpt", "grok"].includes(imported.group.providerType || "")
-            ? await checkTemporaryAccountIds(imported.accountIds, checkProxy, imported.group.providerType)
-            : undefined;
-          const updatedGroup = store.getDb().temporaryAccountGroups.find((group) => group.id === imported.group.id) || imported.group;
-          return sendJson(response, 201, { ...imported, group: updatedGroup, checkResult });
+          // Availability checks run client-side after the list previews imported accounts.
+          const group = store.getDb().temporaryAccountGroups.find((item) => item.id === imported.group.id) || imported.group;
+          return sendJson(response, 201, { ...imported, group });
         }
         if (method === "POST" && parts[2] === "check") {
           const body = await readJson(request);

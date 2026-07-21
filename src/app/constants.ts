@@ -58,7 +58,8 @@ export const groupStrategyLabels: Record<GroupRouteStrategy, string> = {
   "stable-first": "稳定优先",
   sequential: "顺序执行",
   random: "随机调用",
-  priority: "优先级顺序"
+  priority: "优先级顺序",
+  specified: "指定"
 };
 
 export const routeProxyModeLabels: Record<RouteProxyConfig["mode"], string> = {
