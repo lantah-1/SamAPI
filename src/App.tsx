@@ -880,7 +880,11 @@ export default function App() {
       setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
       setTemporaryAccountsLoaded(true);
       setTemporaryAccountsLoading(false);
-      setToast(`${temporaryAccountProviderLabels[temporaryAccountCheckProviderType]} 账号刷新完成：${temporaryAccountCheckSummary(result)}`);
+      setToast(
+        `${temporaryAccountProviderLabels[temporaryAccountCheckProviderType]} 账号检查完成：${
+          item ? temporaryAccountAvailabilityLabels[item.availability] : "完成"
+        }`
+      );
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号刷新失败");
     } finally {

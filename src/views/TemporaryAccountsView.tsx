@@ -109,8 +109,8 @@ const TEMPORARY_IMPORT_ARCHIVE_LIMIT = 25 * 1024 * 1024;
 const TEMPORARY_IMPORT_TEXT_FILE = /\.(?:json|jsonl|txt|csv)$/i;
 
 const temporaryImportModeHints: Record<TemporaryAccountImportMode, string> = {
-  auto: "逐个文件识别，适合不确定格式或同时导入多种来源。",
-  subapi: "按 Sub2API 来源导入，同时兼容常见账号字段。",
+  auto: "逐个文件识别；支持 OAuth、API Key，以及含 agent_runtime_id + base64 PKCS8 Ed25519 agent_private_key 的 OpenAI Agent Identity。",
+  subapi: "按 Sub2API 来源导入，支持 tokenless OpenAI Agent Identity（严格校验 PKCS8 Ed25519 私钥）。",
   "sub2api-k12": "导入 Sub2API 导出的 ChatGPT K12 OAuth 账号列表 JSON。",
   cpa: "按 CPA 来源导入，同时兼容常见账号字段。",
   "auth-json": "适合直接导入 Codex 或 Grok 的 auth.json。",
@@ -307,10 +307,13 @@ export function TemporaryAccountsView(props: {
                   <option value="random">{groupStrategyLabels.random}</option>
                 </SelectInput>
               </label>
-              <ActionButton className="temp-account-check-action" type="button" tone="ghost" disabled={props.checking !== null || visibleAccounts.length === 0} onClick={() => props.onCheck()}>
-                <RefreshCw className={`h-4 w-4 ${props.checking === "all" ? "animate-spin" : ""}`} />
-                检查 {currentTypeLabel}
-              </ActionButton>
+              <div className="temp-account-check-control">
+                <span className="temp-account-control-label temp-account-control-label-placeholder" aria-hidden="true">检查</span>
+                <ActionButton className="temp-account-check-action" type="button" tone="ghost" disabled={props.checking !== null || visibleAccounts.length === 0} onClick={() => props.onCheck()}>
+                  <RefreshCw className={`h-4 w-4 ${props.checking === "all" ? "animate-spin" : ""}`} />
+                  检查 {currentTypeLabel}
+                </ActionButton>
+              </div>
             </div>
             <div className="temp-account-toolbar-actions">
               <div className="temp-account-selection-group" role="group" aria-label="选择账号">

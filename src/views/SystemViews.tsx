@@ -187,6 +187,26 @@ function logStatusLabel(status: RequestLogSummary["status"]) {
   return "失败";
 }
 
+function compactFailureReason(message?: string) {
+  const text = (message || "")
+    .replace(/\s+/g, " ")
+    .replace(/^上游地址均不可用[：:]\s*/, "")
+    .trim();
+  if (!text) return "";
+  const firstReason = text.split(/[；;]/)[0]?.trim() || text;
+  return firstReason.length > 96 ? `${firstReason.slice(0, 95)}...` : firstReason;
+}
+
+function LogContextItem(props: { label: string; value?: string }) {
+  const value = props.value || "未记录";
+  return (
+    <span className="log-context-item" title={`${props.label}: ${value}`}>
+      <span className="log-context-label">{props.label}</span>
+      <span className="log-context-value">{value}</span>
+    </span>
+  );
+}
+
 function LogSummaryRow(props: { log: RequestLogSummary; selected: boolean; onOpen: (id: string) => void; onCopy: (value: string) => void }) {
   const { log } = props;
   const downstream = log.downstream;
@@ -194,6 +214,7 @@ function LogSummaryRow(props: { log: RequestLogSummary; selected: boolean; onOpe
   const downstreamPath = downstream.path || downstream.endpoint || "-";
   const targetProvider = routeTarget.providerName || log.providerName || "-";
   const proxyLabel = log.proxy ? routeProxyModeLabels[log.proxy.mode] : "直连";
+  const failureReason = log.status === "failed" ? compactFailureReason(log.errorMessage) : "";
   return (
     <article className={`log-row ${props.selected ? "log-row-selected" : ""}`}>
       <button type="button" className="log-copy-id" title={`复制日志 ID: ${log.id}`} aria-label="复制日志 ID" onClick={() => props.onCopy(log.id)}>
@@ -210,7 +231,6 @@ function LogSummaryRow(props: { log: RequestLogSummary; selected: boolean; onOpe
               {downstreamPath}
             </span>
           </span>
-          <ChevronRight className="log-flow-arrow" />
           <span className="log-flow-block">
             <span className="summary-node-label">转发目标</span>
             <span className="log-main-value" title={routeTarget.model || log.model || "-"}>
@@ -221,17 +241,23 @@ function LogSummaryRow(props: { log: RequestLogSummary; selected: boolean; onOpe
             </span>
           </span>
         </span>
-        <span className="log-route-meta">
-          <span className="log-meta-pill" title={log.headerTemplateName || "未使用"}>
-            请求头: {log.headerTemplateName || "未使用"}
-          </span>
-          <span className="log-meta-pill" title={proxyLabel}>
-            代理: {proxyLabel}
-          </span>
-        </span>
         <span className="log-state-cell">
-          <span className={`status-badge status-${log.status}`}>{logStatusLabel(log.status)}</span>
-          <span className="log-time-value">{formatTime(log.createdAt)}</span>
+          <span className="log-state-line">
+            <span className={`status-badge status-${log.status}`}>{logStatusLabel(log.status)}</span>
+            <span className="log-time-value">{formatTime(log.createdAt)}</span>
+          </span>
+          {failureReason ? (
+            <span className="log-error-snippet" title={log.errorMessage}>
+              {failureReason}
+            </span>
+          ) : null}
+        </span>
+        <span className="log-context-row">
+          <LogContextItem label="请求头" value={log.headerTemplateName || "未使用"} />
+          <LogContextItem label="代理" value={proxyLabel} />
+          <LogContextItem label="客户端" value={log.clientDevice || "未知客户端"} />
+          <LogContextItem label="来源 IP" value={log.clientIp || "未知"} />
+          <LogContextItem label="API Key" value={log.apiKeyName} />
         </span>
       </button>
     </article>
@@ -306,6 +332,7 @@ export function SettingsView(props: {
   onThemeChange: (themeId: AppThemeId) => void;
 }) {
   const [maxRequestLogs, setMaxRequestLogs] = useState(String(props.snapshot.settings.maxRequestLogs));
+  const [requestTimeoutSeconds, setRequestTimeoutSeconds] = useState(String(props.snapshot.settings.requestTimeoutSeconds || 60));
   const [adminSessionTtlMinutes, setAdminSessionTtlMinutes] = useState(String(props.snapshot.settings.adminSessionTtlMinutes || 30));
   const [themeId, setThemeId] = useState<AppThemeId>(props.snapshot.settings.themeId || "fresh");
   const [currentPassword, setCurrentPassword] = useState("");
@@ -315,9 +342,10 @@ export function SettingsView(props: {
 
   useEffect(() => {
     setMaxRequestLogs(String(props.snapshot.settings.maxRequestLogs));
+    setRequestTimeoutSeconds(String(props.snapshot.settings.requestTimeoutSeconds || 60));
     setAdminSessionTtlMinutes(String(props.snapshot.settings.adminSessionTtlMinutes || 30));
     setThemeId(props.snapshot.settings.themeId || "fresh");
-  }, [props.snapshot.settings.adminSessionTtlMinutes, props.snapshot.settings.maxRequestLogs, props.snapshot.settings.themeId]);
+  }, [props.snapshot.settings.adminSessionTtlMinutes, props.snapshot.settings.maxRequestLogs, props.snapshot.settings.requestTimeoutSeconds, props.snapshot.settings.themeId]);
 
   const chooseTheme = (nextThemeId: AppThemeId) => {
     setThemeId(nextThemeId);
@@ -326,7 +354,12 @@ export function SettingsView(props: {
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    props.onSave({ maxRequestLogs: Number(maxRequestLogs), adminSessionTtlMinutes: Number(adminSessionTtlMinutes), themeId });
+    props.onSave({
+      maxRequestLogs: Number(maxRequestLogs),
+      requestTimeoutSeconds: Number(requestTimeoutSeconds),
+      adminSessionTtlMinutes: Number(adminSessionTtlMinutes),
+      themeId
+    });
   };
 
   const changePassword = async () => {
@@ -487,6 +520,25 @@ export function SettingsView(props: {
             />
           </label>
         </div>
+        <div className="settings-section form-span-2">
+          <div className="settings-section-head">
+            <div>
+              <h3>上游请求超时</h3>
+              <p>等待上游响应头的最长时间；流式响应开始后不会被此设置中断。</p>
+            </div>
+          </div>
+          <label>
+            超时秒数
+            <TextInput
+              type="number"
+              min={1}
+              max={600}
+              step={1}
+              value={requestTimeoutSeconds}
+              onChange={(event) => setRequestTimeoutSeconds(event.target.value)}
+            />
+          </label>
+        </div>
         <div className="flex justify-end">
           <ActionButton type="submit">
             <Save className="h-4 w-4" />
@@ -530,6 +582,9 @@ function LogSummaryDetail(props: { log: RequestLog }) {
           <div className="summary-node-main">{downstream.model || log.routeName || "-"}</div>
           <SummaryField label="Path" value={downstream.path || log.path} />
           <SummaryField label="UA" value={downstream.userAgent || log.userAgent || "unknown ua"} />
+          <SummaryField label="客户端" value={log.clientDevice} />
+          <SummaryField label="IP" value={log.clientIp} />
+          <SummaryField label="API Key" value={log.apiKeyName} />
         </section>
         <div className="summary-arrow">
           <ChevronRight className="h-4 w-4" />

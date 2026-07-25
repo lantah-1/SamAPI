@@ -353,22 +353,25 @@ textarea {
   display: grid;
   max-width: 680px;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface);
-  box-shadow: var(--shadow-row);
+  gap: 0.75rem;
 }
 
 .auth-metric-row div {
   display: grid;
   gap: 0.2rem;
   min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
   padding: 1rem;
+  box-shadow: var(--shadow-row);
+  transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
 }
 
-.auth-metric-row div + div {
-  border-left: 1px solid var(--line);
+.auth-metric-row div:hover {
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-lift);
+  transform: translateY(-2px);
 }
 
 .auth-metric-row strong {
@@ -1200,8 +1203,8 @@ textarea.field:focus {
 }
 
 .temp-account-stats {
-  display: grid;
-  grid-template-columns: repeat(3, auto);
+  display: flex;
+  flex-wrap: nowrap;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1210,9 +1213,9 @@ textarea.field:focus {
 
 .temp-account-stats span {
   display: grid;
-  min-width: 72px;
+  min-width: 58px;
   gap: 0.1rem;
-  padding: 0.55rem 0.7rem;
+  padding: 0.42rem 0.58rem;
   color: var(--muted);
   font-size: 0.68rem;
   font-weight: 760;
@@ -1225,7 +1228,7 @@ textarea.field:focus {
 
 .temp-account-stats strong {
   color: var(--ink);
-  font-size: 1rem;
+  font-size: 0.92rem;
   font-weight: 920;
   line-height: 1;
 }
@@ -1249,8 +1252,11 @@ textarea.field:focus {
 }
 
 .temp-account-check-provider,
-.temp-account-strategy {
-  width: min(180px, 100%);
+.temp-account-strategy,
+.temp-account-check-control {
+  display: grid;
+  grid-template-rows: auto 44px;
+  min-width: 0;
 }
 
 .temp-account-toolbar {
@@ -1266,10 +1272,12 @@ textarea.field:focus {
 }
 
 .temp-account-toolbar-controls {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
+  display: grid;
+  flex: 0 1 auto;
+  grid-template-columns: minmax(220px, 360px) minmax(220px, 360px) minmax(180px, 224px);
+  align-items: start;
   gap: 0.6rem;
+  min-width: 0;
 }
 
 .temp-account-control-label,
@@ -1279,10 +1287,21 @@ textarea.field:focus {
   color: var(--muted-strong);
   font-size: 0.68rem;
   font-weight: 820;
+  line-height: 1.15;
+}
+
+.temp-account-control-label-placeholder {
+  visibility: hidden;
 }
 
 .temp-account-strategy .select-shell {
   margin-top: 0;
+}
+
+.temp-account-strategy .select-trigger,
+.temp-account-check-action {
+  box-sizing: border-box;
+  height: 44px;
 }
 
 .temp-account-provider-switch {
@@ -1326,7 +1345,8 @@ textarea.field:focus {
 }
 
 .temp-account-check-action {
-  min-height: 44px;
+  height: 44px;
+  width: 100%;
   border-color: color-mix(in srgb, var(--accent) 24%, var(--line));
   background: var(--accent-softer);
   color: var(--accent-strong);
@@ -3127,13 +3147,17 @@ textarea.field:focus {
 }
 
 .log-summary {
+  position: relative;
   display: grid;
   width: 100%;
-  grid-template-columns: minmax(18rem, 1.35fr) minmax(12rem, 0.72fr) minmax(7.5rem, auto);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-areas:
+    "downstream target state"
+    "context context context";
   align-items: center;
-  gap: 0.75rem;
-  min-height: 62px;
-  padding: 0.58rem 3.05rem 0.58rem 0.75rem;
+  gap: 0.8rem 1.25rem;
+  min-height: 104px;
+  padding: 0.85rem 3.65rem 0.78rem 1rem;
   text-align: left;
 }
 
@@ -3169,20 +3193,17 @@ textarea.field:focus {
   background: color-mix(in srgb, var(--accent) 5%, var(--record-bg));
 }
 
-.log-summary-card {
-  grid-template-columns: minmax(18rem, 1.35fr) minmax(12rem, 0.72fr) minmax(7.5rem, auto);
-}
-
 .log-flow-block,
-.log-route-meta,
+.log-context-row,
+.log-context-item,
 .log-state-cell {
   min-width: 0;
 }
 
 .log-copy-id {
   position: absolute;
-  right: 0.58rem;
-  bottom: 0.52rem;
+  top: 0.78rem;
+  right: 0.78rem;
   z-index: 2;
   display: grid;
   place-items: center;
@@ -3203,22 +3224,21 @@ textarea.field:focus {
 }
 
 .log-flow-cell {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 18px minmax(0, 1fr);
-  align-items: center;
-  gap: 0.5rem;
-  min-width: 0;
+  display: contents;
 }
 
 .log-flow-block {
   display: grid;
+  min-width: 0;
   gap: 0.08rem;
 }
 
-.log-flow-arrow {
-  color: var(--muted);
-  height: 15px;
-  width: 15px;
+.log-flow-block:first-child {
+  grid-area: downstream;
+}
+
+.log-flow-block:last-child {
+  grid-area: target;
 }
 
 .log-main-value,
@@ -3230,7 +3250,7 @@ textarea.field:focus {
 
 .log-main-value {
   color: var(--ink);
-  font-size: 0.86rem;
+  font-size: 0.92rem;
   font-weight: 860;
   line-height: 1.25;
 }
@@ -3242,33 +3262,60 @@ textarea.field:focus {
   line-height: 1.25;
 }
 
-.log-route-meta {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-start;
-  gap: 0.28rem;
+.log-context-row {
+  grid-area: context;
+  display: grid;
+  grid-template-columns: minmax(7rem, 0.8fr) minmax(7rem, 0.7fr) minmax(15rem, 1.55fr) minmax(11rem, 1fr) minmax(8rem, 0.8fr);
+  padding-top: 0.68rem;
+  border-top: 1px solid var(--line);
 }
 
-.log-meta-pill {
-  max-width: 100%;
+.log-context-item {
+  display: grid;
+  gap: 0.18rem;
+  padding: 0 0.85rem;
+}
+
+.log-context-item:first-child {
+  padding-left: 0;
+}
+
+.log-context-item + .log-context-item {
+  border-left: 1px solid var(--line);
+}
+
+.log-context-label {
+  color: var(--muted);
+  font-size: 0.66rem;
+  font-weight: 780;
+  line-height: 1.15;
+}
+
+.log-context-value {
   overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: var(--subtle-fill);
   color: var(--muted-strong);
-  font-size: 0.72rem;
-  font-weight: 760;
-  line-height: 1;
-  padding: 0.28rem 0.45rem;
+  font-size: 0.75rem;
+  font-weight: 780;
+  line-height: 1.3;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .log-state-cell {
+  grid-area: state;
   display: grid;
-  justify-items: end;
-  gap: 0.24rem;
-  text-align: right;
+  justify-items: start;
+  gap: 0.42rem;
+  min-width: 0;
+  text-align: left;
+}
+
+.log-state-line {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.65rem;
+  min-width: 0;
 }
 
 .log-time-value {
@@ -3276,6 +3323,21 @@ textarea.field:focus {
   font-size: 0.72rem;
   font-weight: 780;
   line-height: 1.2;
+  white-space: nowrap;
+}
+
+.log-error-snippet {
+  max-width: 100%;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--danger-strong) 24%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger-soft) 72%, var(--record-bg));
+  color: var(--danger-strong);
+  font-size: 0.72rem;
+  font-weight: 760;
+  line-height: 1.25;
+  padding: 0.3rem 0.48rem;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -3578,17 +3640,23 @@ textarea.field:focus {
 
   .log-summary,
   .log-summary-card {
-    grid-template-columns: minmax(0, 1fr) minmax(7rem, auto);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-areas:
+      "downstream target state"
+      "context context context";
   }
 
-  .log-route-meta {
-    grid-column: 1;
-    grid-row: 2;
+  .log-context-row {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.7rem 1rem;
   }
 
-  .log-state-cell {
-    grid-column: 2;
-    grid-row: 1 / span 2;
+  .log-context-item {
+    padding: 0;
+  }
+
+  .log-context-item + .log-context-item {
+    border-left: 0;
   }
 
   .route-quick-grid {
@@ -4192,10 +4260,6 @@ textarea.field:focus {
     gap: 0.75rem;
   }
 
-  .temp-account-stats {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
   .temp-account-stats span {
     min-width: 0;
     padding: 0.5rem 0.35rem;
@@ -4210,17 +4274,17 @@ textarea.field:focus {
   .temp-account-toolbar-controls {
     display: grid;
     width: 100%;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     gap: 0.55rem;
   }
 
   .temp-account-toolbar-controls .temp-account-check-provider,
-  .temp-account-toolbar-controls .temp-account-strategy {
+  .temp-account-toolbar-controls .temp-account-strategy,
+  .temp-account-toolbar-controls .temp-account-check-control {
     width: 100%;
   }
 
   .temp-account-check-action {
-    grid-column: 1 / -1;
     width: 100%;
   }
 
@@ -4306,39 +4370,59 @@ textarea.field:focus {
 
   .log-summary,
   .log-summary-card {
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 0.38rem 0.55rem;
-    padding: 0.52rem 2.8rem 0.52rem 0.56rem;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-areas:
+      "downstream target state"
+      "context context context";
+    gap: 0.7rem 0.65rem;
+    min-height: 0;
+    padding: 0.72rem 2.8rem 0.68rem 0.7rem;
   }
 
   .log-copy-id {
     right: 0.45rem;
-    bottom: 0.42rem;
+    top: 0.45rem;
     width: 1.8rem;
     height: 1.8rem;
   }
 
   .log-state-cell {
-    grid-column: 2;
-    grid-row: 1;
-    text-align: right;
+    grid-area: state;
+    gap: 0.2rem;
+    min-width: 0;
+    text-align: left;
+  }
+
+  .log-state-line {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.2rem;
+  }
+
+  .log-error-snippet {
+    max-width: 100%;
   }
 
   .log-flow-cell {
-    grid-column: 1;
-    grid-row: 1;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 0.32rem;
+    display: contents;
   }
 
-  .log-flow-arrow {
-    display: none;
+  .log-context-row {
+    grid-area: context;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.68rem 0.8rem;
+    padding-top: 0.62rem;
   }
 
-  .log-route-meta {
+  .log-context-item:nth-child(3) {
     grid-column: 1 / -1;
-    grid-row: 2;
-    justify-content: flex-start;
+  }
+
+  .log-context-item:nth-child(3) .log-context-value {
+    overflow: visible;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
   }
 
   .detail-block pre {
@@ -4402,10 +4486,6 @@ textarea.field:focus {
 
   .temp-account-toolbar-controls {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .temp-account-check-action {
-    grid-column: auto;
   }
 
   .temp-account-row-side {

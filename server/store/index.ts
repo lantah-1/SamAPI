@@ -62,13 +62,36 @@ import {
   smartModelMatches,
   temporaryAccountCanBeUsed
 } from "./helpers.js";
+import { clientDeviceFromUserAgent, resolveStoredClientIp } from "../util/text.js";
 
 function normalizeRequestLogShape(log: RequestLog): RequestLog {
   const legacy = log as RequestLog & { upstreamAttempts?: RequestLogUpstreamRequest[] };
-  if (log.upstreamRequest || !Array.isArray(legacy.upstreamAttempts)) return log;
-  const upstreamRequest = legacy.upstreamAttempts.at(-1);
-  const { upstreamAttempts: _upstreamAttempts, ...rest } = legacy;
-  return upstreamRequest ? { ...rest, upstreamRequest } : rest;
+  let normalized: RequestLog = log;
+  if (!log.upstreamRequest && Array.isArray(legacy.upstreamAttempts)) {
+    const upstreamRequest = legacy.upstreamAttempts.at(-1);
+    const { upstreamAttempts: _upstreamAttempts, ...rest } = legacy;
+    normalized = upstreamRequest ? { ...rest, upstreamRequest } : rest;
+  }
+  return {
+    ...normalized,
+    clientIp: resolveStoredClientIp(normalized),
+    clientDevice: normalized.clientDevice || clientDeviceFromUserAgent(normalized.userAgent)
+  };
+}
+
+function normalizedTemporaryAccountLabel(
+  account: Pick<TemporaryAccount, "label" | "email" | "accountId" | "agentRuntimeId">,
+  index: number
+) {
+  const current = account.label?.trim() || "";
+  if (current && !/^(?:账号|账户|account)\s*\d+$/i.test(current)) return current;
+  const email = account.email?.trim();
+  if (email) return email;
+  const accountId = account.accountId?.trim();
+  if (accountId) return `账号 ${accountId.slice(0, 8)}`;
+  const runtimeId = account.agentRuntimeId?.trim();
+  if (runtimeId) return `Agent ${runtimeId.slice(0, 8)}`;
+  return `账号 ${index + 1}`;
 }
 
 export class JsonStore {
@@ -118,10 +141,23 @@ export class JsonStore {
       const providerType = normalizeTemporaryAccountProviderType(group.providerType || group.name.toLowerCase());
       const existing = merged.get(providerType);
       if (!existing) {
+        const normalizedGroupEnabled = group.enabled !== false;
+        const normalizedAccounts = group.accounts.map((account, index) => ({
+          ...account,
+          label: normalizedTemporaryAccountLabel(account, index),
+          providerType,
+          enabled: account.enabled !== false
+        }));
+        const accountsNeedNormalization = group.accounts.some((account, index) =>
+          account.label !== normalizedAccounts[index]?.label || account.providerType !== providerType || typeof account.enabled !== "boolean"
+        );
+        if (group.providerType !== providerType || group.name !== TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType] || group.enabled !== normalizedGroupEnabled || accountsNeedNormalization) {
+          changed = true;
+        }
         group.providerType = providerType;
         group.name = TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType];
-        group.enabled = true;
-        group.accounts = group.accounts.map((account) => ({ ...account, providerType, enabled: true }));
+        group.enabled = normalizedGroupEnabled;
+        group.accounts = normalizedAccounts;
         merged.set(providerType, group);
         continue;
       }
@@ -129,7 +165,12 @@ export class JsonStore {
       const existingSecrets = new Set(existing.accounts.map((account) => hashSecret(account.secret.trim() || account.refreshToken?.trim() || account.id)));
       const incoming = group.accounts
         .filter((account) => !existingIds.has(account.id) && !existingSecrets.has(hashSecret(account.secret.trim() || account.refreshToken?.trim() || account.id)))
-        .map((account) => ({ ...account, providerType, enabled: true }));
+        .map((account, index) => ({
+          ...account,
+          label: normalizedTemporaryAccountLabel(account, existing.accounts.length + index),
+          providerType,
+          enabled: account.enabled !== false
+        }));
       existing.accounts.push(...incoming);
       existing.updatedAt = now();
       changed = true;
@@ -191,6 +232,11 @@ export class JsonStore {
       providerName: log.providerName,
       providerId: log.providerId,
       model: log.model,
+      userAgent: log.userAgent,
+      clientIp: resolveStoredClientIp(log),
+      clientDevice: log.clientDevice || clientDeviceFromUserAgent(log.userAgent),
+      apiKeyId: log.apiKeyId,
+      apiKeyName: log.apiKeyName,
       headerTemplateId,
       headerTemplateName: headerTemplate?.name,
       upstreamUrl: log.upstreamUrl,
@@ -209,7 +255,13 @@ export class JsonStore {
   }
 
   getRequestLog(id: string) {
-    return this.requestLogs.find((log) => log.id === id);
+    const log = this.requestLogs.find((item) => item.id === id);
+    if (!log) return undefined;
+    return {
+      ...log,
+      clientIp: resolveStoredClientIp(log),
+      clientDevice: log.clientDevice || clientDeviceFromUserAgent(log.userAgent)
+    };
   }
 
   updateRequestLog(id: string, patch: Partial<Omit<RequestLog, "id" | "createdAt">>) {
@@ -462,7 +514,7 @@ export class JsonStore {
     }
     const seen = new Set<string>(
       this.db.temporaryAccountGroups.flatMap((group) =>
-        group.accounts.map((account) => hashSecret(account.secret.trim() || account.refreshToken?.trim() || account.id))
+        group.accounts.map((account) => hashSecret(account.secret.trim() || account.refreshToken?.trim() || account.accountId?.trim() && account.chatgptUserId?.trim() ? `${account.accountId}:${account.chatgptUserId}` : account.accountId?.trim() || account.agentRuntimeId?.trim() || account.id))
       )
     );
     const group = this.ensureTemporaryAccountTypeGroup(providerType, site.id, source, timestamp);
@@ -470,7 +522,8 @@ export class JsonStore {
     let skipped = 0;
     for (const account of parsedAccounts) {
       const secret = account.secret.trim();
-      const credentialIdentity = secret || account.refreshToken?.trim() || "";
+      // Agent Identity exports intentionally contain no bearer token; account ID is its stable dedupe key.
+      const credentialIdentity = secret || account.refreshToken?.trim() || (account.accountId?.trim() && account.chatgptUserId?.trim() ? `${account.accountId}:${account.chatgptUserId}` : account.accountId?.trim()) || account.agentRuntimeId?.trim() || "";
       if (!credentialIdentity) continue;
       const hash = hashSecret(credentialIdentity);
       if (seen.has(hash)) {
@@ -480,8 +533,8 @@ export class JsonStore {
       seen.add(hash);
       accounts.push({
         id: `temp-account-${randomUUID()}`,
-        label: account.label || `账号 ${group.accounts.length + accounts.length + 1}`,
-        prefix: secret ? secret.slice(0, 12) : "oauth-refresh",
+        label: normalizedTemporaryAccountLabel(account, group.accounts.length + accounts.length),
+        prefix: secret ? secret.slice(0, 12) : account.agentRuntimeId ? "agent-identity" : "oauth-refresh",
         secret,
         accountType: providerType === "gpt" ? account.accountType : undefined,
         providerType,
@@ -490,6 +543,11 @@ export class JsonStore {
         refreshToken: account.refreshToken,
         idToken: account.idToken,
         sessionToken: account.sessionToken,
+        agentRuntimeId: account.agentRuntimeId,
+        agentPrivateKey: account.agentPrivateKey,
+        agentTaskId: account.agentTaskId,
+        chatgptUserId: account.chatgptUserId,
+        chatgptAccountIsFedramp: account.chatgptAccountIsFedramp,
         grokOAuthFormat: account.grokOAuthFormat,
         oauthClientId: account.oauthClientId,
         oauthTokenEndpoint: account.oauthTokenEndpoint,
@@ -567,8 +625,8 @@ export class JsonStore {
 
   resolveTemporaryProviderAccounts(providerType: TemporaryAccountProviderType, model: string) {
     const allEnabledAccounts = this.db.temporaryAccountGroups
-      .filter((group) => normalizeTemporaryAccountProviderType(group.providerType) === providerType)
-      .flatMap((group) => group.accounts);
+      .filter((group) => group.enabled !== false && normalizeTemporaryAccountProviderType(group.providerType) === providerType)
+      .flatMap((group) => group.accounts.filter((account) => account.enabled !== false));
     const candidates = allEnabledAccounts.filter((account) => account.models.length === 0 || account.models.includes(model));
     const pool = candidates.length > 0 ? candidates : allEnabledAccounts;
     const usable = pool.filter(temporaryAccountCanBeUsed);
@@ -656,6 +714,7 @@ export class JsonStore {
       accountId?: string;
       email?: string;
       tokenExpiresAt?: string;
+      agentTaskId?: string;
     }
   ) {
     for (const group of this.db.temporaryAccountGroups) {
@@ -675,6 +734,7 @@ export class JsonStore {
       if (typeof input.accountId === "string" && input.accountId.trim()) account.accountId = input.accountId.trim();
       if (typeof input.email === "string" && input.email.trim()) account.email = input.email.trim();
       if (typeof input.tokenExpiresAt === "string" && input.tokenExpiresAt.trim()) account.tokenExpiresAt = input.tokenExpiresAt.trim();
+      if (typeof input.agentTaskId === "string" && input.agentTaskId.trim()) account.agentTaskId = input.agentTaskId.trim();
       group.updatedAt = now();
       this.persistTemporaryAccountCheckResult(group.id, account);
       return account;
@@ -1287,7 +1347,7 @@ export class JsonStore {
       CREATE TABLE IF NOT EXISTS provider_api_keys (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'api-key', enabled INTEGER NOT NULL, models_json TEXT NOT NULL, last_checked_at TEXT, FOREIGN KEY (group_id) REFERENCES provider_api_key_groups(id) ON DELETE CASCADE);
       CREATE INDEX IF NOT EXISTS idx_provider_api_keys_group_id ON provider_api_keys(group_id);
       CREATE TABLE IF NOT EXISTS temporary_account_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, source TEXT NOT NULL, provider_type TEXT, site_id TEXT NOT NULL, strategy TEXT, enabled INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS temporary_accounts (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, account_type TEXT, provider_type TEXT, account_id TEXT, email TEXT, refresh_token TEXT, id_token TEXT, session_token TEXT, grok_oauth_format TEXT, oauth_client_id TEXT, oauth_token_endpoint TEXT, upstream_base_url TEXT, token_expires_at TEXT, grok_using_api INTEGER, enabled INTEGER NOT NULL, models_json TEXT NOT NULL, availability TEXT, quota_stages_json TEXT NOT NULL, imported_at TEXT NOT NULL, last_quota_checked_at TEXT, last_check_status_code INTEGER, last_check_error TEXT, FOREIGN KEY (group_id) REFERENCES temporary_account_groups(id) ON DELETE CASCADE);
+      CREATE TABLE IF NOT EXISTS temporary_accounts (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, label TEXT NOT NULL, prefix TEXT NOT NULL, secret TEXT NOT NULL, account_type TEXT, provider_type TEXT, account_id TEXT, email TEXT, refresh_token TEXT, id_token TEXT, session_token TEXT, agent_runtime_id TEXT, agent_private_key TEXT, agent_task_id TEXT, chatgpt_user_id TEXT, chatgpt_account_is_fedramp INTEGER, grok_oauth_format TEXT, oauth_client_id TEXT, oauth_token_endpoint TEXT, upstream_base_url TEXT, token_expires_at TEXT, grok_using_api INTEGER, enabled INTEGER NOT NULL, models_json TEXT NOT NULL, availability TEXT, quota_stages_json TEXT NOT NULL, imported_at TEXT NOT NULL, last_quota_checked_at TEXT, last_check_status_code INTEGER, last_check_error TEXT, FOREIGN KEY (group_id) REFERENCES temporary_account_groups(id) ON DELETE CASCADE);
       CREATE INDEX IF NOT EXISTS idx_temporary_accounts_group_id ON temporary_accounts(group_id);
       CREATE INDEX IF NOT EXISTS idx_temporary_accounts_enabled ON temporary_accounts(enabled);
       CREATE INDEX IF NOT EXISTS idx_temporary_accounts_availability ON temporary_accounts(availability);
@@ -1299,6 +1359,11 @@ export class JsonStore {
     `);
     this.ensureSqliteColumn("temporary_account_groups", "provider_type", "TEXT");
     this.ensureSqliteColumn("temporary_accounts", "provider_type", "TEXT");
+    this.ensureSqliteColumn("temporary_accounts", "agent_runtime_id", "TEXT");
+    this.ensureSqliteColumn("temporary_accounts", "agent_private_key", "TEXT");
+    this.ensureSqliteColumn("temporary_accounts", "agent_task_id", "TEXT");
+    this.ensureSqliteColumn("temporary_accounts", "chatgpt_user_id", "TEXT");
+    this.ensureSqliteColumn("temporary_accounts", "chatgpt_account_is_fedramp", "INTEGER");
     this.ensureSqliteColumn("temporary_accounts", "grok_oauth_format", "TEXT");
     this.ensureSqliteColumn("temporary_accounts", "oauth_client_id", "TEXT");
     this.ensureSqliteColumn("temporary_accounts", "oauth_token_endpoint", "TEXT");
@@ -1421,6 +1486,11 @@ export class JsonStore {
         refreshToken: account.refresh_token == null ? undefined : String(account.refresh_token),
         idToken: account.id_token == null ? undefined : String(account.id_token),
         sessionToken: account.session_token == null ? undefined : String(account.session_token),
+        agentRuntimeId: account.agent_runtime_id == null ? undefined : String(account.agent_runtime_id),
+        agentPrivateKey: account.agent_private_key == null ? undefined : String(account.agent_private_key),
+        agentTaskId: account.agent_task_id == null ? undefined : String(account.agent_task_id),
+        chatgptUserId: account.chatgpt_user_id == null ? undefined : String(account.chatgpt_user_id),
+        chatgptAccountIsFedramp: account.chatgpt_account_is_fedramp == null ? undefined : Boolean(account.chatgpt_account_is_fedramp),
         grokOAuthFormat: account.grok_oauth_format === "grok2api-oauth" ? "grok2api-oauth" as const : account.grok_oauth_format === "cpa-oauth" ? "cpa-oauth" as const : undefined,
         oauthClientId: account.oauth_client_id == null ? undefined : String(account.oauth_client_id),
         oauthTokenEndpoint: account.oauth_token_endpoint == null ? undefined : String(account.oauth_token_endpoint),
@@ -1437,7 +1507,18 @@ export class JsonStore {
         lastCheckError: account.last_check_error == null ? undefined : String(account.last_check_error)
       }));
       const providerType = normalizeTemporaryAccountProviderType(row.provider_type || String(row.name).toLowerCase());
-      return { id: String(row.id), name: TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType], source: row.source === "cpa" ? "cpa" as const : "subapi" as const, providerType, siteId: String(row.site_id), strategy: normalizeGroupStrategy(row.strategy), enabled: true, accounts: accounts.map((account) => ({ ...account, providerType, enabled: true })), createdAt: String(row.created_at), updatedAt: String(row.updated_at) };
+      return {
+        id: String(row.id),
+        name: TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType],
+        source: row.source === "cpa" ? "cpa" as const : "subapi" as const,
+        providerType,
+        siteId: String(row.site_id),
+        strategy: normalizeGroupStrategy(row.strategy),
+        enabled: row.enabled == null ? true : Boolean(row.enabled),
+        accounts: accounts.map((account) => ({ ...account, providerType })),
+        createdAt: String(row.created_at),
+        updatedAt: String(row.updated_at)
+      };
     });
     const headerTemplates = (this.sqlite.prepare("SELECT * FROM header_templates ORDER BY created_at DESC").all() as Array<Record<string, unknown>>).map((row) => ({
       id: String(row.id),
@@ -1551,11 +1632,11 @@ export class JsonStore {
       for (const apiKey of group.apiKeys) insertProviderKey.run(apiKey.id, group.id, apiKey.label, apiKey.prefix, apiKey.secret, apiKey.kind || "api-key", apiKey.enabled ? 1 : 0, JSON.stringify(apiKey.models), apiKey.lastCheckedAt || null);
     }
     const insertTemporaryGroup = this.sqlite.prepare("INSERT INTO temporary_account_groups (id, name, source, provider_type, site_id, strategy, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    const insertTemporaryAccount = this.sqlite.prepare("INSERT INTO temporary_accounts (id, group_id, label, prefix, secret, account_type, provider_type, account_id, email, refresh_token, id_token, session_token, grok_oauth_format, oauth_client_id, oauth_token_endpoint, upstream_base_url, token_expires_at, grok_using_api, enabled, models_json, availability, quota_stages_json, imported_at, last_quota_checked_at, last_check_status_code, last_check_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    const insertTemporaryAccount = this.sqlite.prepare("INSERT INTO temporary_accounts (id, group_id, label, prefix, secret, account_type, provider_type, account_id, email, refresh_token, id_token, session_token, agent_runtime_id, agent_private_key, agent_task_id, chatgpt_user_id, chatgpt_account_is_fedramp, grok_oauth_format, oauth_client_id, oauth_token_endpoint, upstream_base_url, token_expires_at, grok_using_api, enabled, models_json, availability, quota_stages_json, imported_at, last_quota_checked_at, last_check_status_code, last_check_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     for (const group of db.temporaryAccountGroups) {
       const providerType = normalizeTemporaryAccountProviderType(group.providerType || group.name.toLowerCase());
-      insertTemporaryGroup.run(group.id, TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType], group.source, providerType, group.siteId, group.strategy || null, 1, group.createdAt, group.updatedAt);
-      for (const account of group.accounts) insertTemporaryAccount.run(account.id, group.id, account.label, account.prefix, account.secret, account.accountType || null, account.providerType || providerType, account.accountId || null, account.email || null, account.refreshToken || null, account.idToken || null, account.sessionToken || null, account.grokOAuthFormat || null, account.oauthClientId || null, account.oauthTokenEndpoint || null, account.upstreamBaseUrl || null, account.tokenExpiresAt || null, account.grokUsingApi == null ? null : account.grokUsingApi ? 1 : 0, 1, JSON.stringify(account.models), account.availability || "unknown", JSON.stringify(account.quotaStages || []), account.importedAt, account.lastQuotaCheckedAt || null, account.lastCheckStatusCode ?? null, account.lastCheckError || null);
+      insertTemporaryGroup.run(group.id, TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType], group.source, providerType, group.siteId, group.strategy || null, group.enabled === false ? 0 : 1, group.createdAt, group.updatedAt);
+      for (const account of group.accounts) insertTemporaryAccount.run(account.id, group.id, account.label, account.prefix, account.secret, account.accountType || null, account.providerType || providerType, account.accountId || null, account.email || null, account.refreshToken || null, account.idToken || null, account.sessionToken || null, account.agentRuntimeId || null, account.agentPrivateKey || null, account.agentTaskId || null, account.chatgptUserId || null, account.chatgptAccountIsFedramp == null ? null : account.chatgptAccountIsFedramp ? 1 : 0, account.grokOAuthFormat || null, account.oauthClientId || null, account.oauthTokenEndpoint || null, account.upstreamBaseUrl || null, account.tokenExpiresAt || null, account.grokUsingApi == null ? null : account.grokUsingApi ? 1 : 0, account.enabled === false ? 0 : 1, JSON.stringify(account.models), account.availability || "unknown", JSON.stringify(account.quotaStages || []), account.importedAt, account.lastQuotaCheckedAt || null, account.lastCheckStatusCode ?? null, account.lastCheckError || null);
     }
     const insertHeader = this.sqlite.prepare("INSERT INTO header_templates (id, name, headers_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
     for (const template of db.headerTemplates) insertHeader.run(template.id, template.name, template.headersText, template.createdAt, template.updatedAt);
@@ -1583,9 +1664,9 @@ export class JsonStore {
   private persistTemporaryAccountCheckResult(groupId: string, account: TemporaryAccount) {
     this.sqlite.prepare(`
       UPDATE temporary_accounts
-      SET label = ?, prefix = ?, secret = ?, account_type = ?, provider_type = ?, account_id = ?, email = ?, refresh_token = ?, id_token = ?, session_token = ?, grok_oauth_format = ?, oauth_client_id = ?, oauth_token_endpoint = ?, upstream_base_url = ?, token_expires_at = ?, grok_using_api = ?, enabled = ?, models_json = ?, availability = ?, quota_stages_json = ?, imported_at = ?, last_quota_checked_at = ?, last_check_status_code = ?, last_check_error = ?
+      SET label = ?, prefix = ?, secret = ?, account_type = ?, provider_type = ?, account_id = ?, email = ?, refresh_token = ?, id_token = ?, session_token = ?, agent_runtime_id = ?, agent_private_key = ?, agent_task_id = ?, chatgpt_user_id = ?, chatgpt_account_is_fedramp = ?, grok_oauth_format = ?, oauth_client_id = ?, oauth_token_endpoint = ?, upstream_base_url = ?, token_expires_at = ?, grok_using_api = ?, enabled = ?, models_json = ?, availability = ?, quota_stages_json = ?, imported_at = ?, last_quota_checked_at = ?, last_check_status_code = ?, last_check_error = ?
       WHERE id = ?
-    `).run(account.label, account.prefix, account.secret, account.accountType || null, account.providerType || "gpt", account.accountId || null, account.email || null, account.refreshToken || null, account.idToken || null, account.sessionToken || null, account.grokOAuthFormat || null, account.oauthClientId || null, account.oauthTokenEndpoint || null, account.upstreamBaseUrl || null, account.tokenExpiresAt || null, account.grokUsingApi == null ? null : account.grokUsingApi ? 1 : 0, 1, JSON.stringify(account.models), account.availability || "unknown", JSON.stringify(account.quotaStages || []), account.importedAt, account.lastQuotaCheckedAt || null, account.lastCheckStatusCode ?? null, account.lastCheckError || null, account.id);
+    `).run(account.label, account.prefix, account.secret, account.accountType || null, account.providerType || "gpt", account.accountId || null, account.email || null, account.refreshToken || null, account.idToken || null, account.sessionToken || null, account.agentRuntimeId || null, account.agentPrivateKey || null, account.agentTaskId || null, account.chatgptUserId || null, account.chatgptAccountIsFedramp == null ? null : account.chatgptAccountIsFedramp ? 1 : 0, account.grokOAuthFormat || null, account.oauthClientId || null, account.oauthTokenEndpoint || null, account.upstreamBaseUrl || null, account.tokenExpiresAt || null, account.grokUsingApi == null ? null : account.grokUsingApi ? 1 : 0, account.enabled === false ? 0 : 1, JSON.stringify(account.models), account.availability || "unknown", JSON.stringify(account.quotaStages || []), account.importedAt, account.lastQuotaCheckedAt || null, account.lastCheckStatusCode ?? null, account.lastCheckError || null, account.id);
     this.sqlite.prepare("UPDATE temporary_account_groups SET updated_at = ? WHERE id = ?").run(now(), groupId);
   }
 

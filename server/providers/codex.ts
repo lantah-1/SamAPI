@@ -88,6 +88,7 @@ export function codexQuotaHeaders(account: TemporaryAccount, accessToken = accou
     "User-Agent": CODEX_USER_AGENT
   };
   if (account.accountId) headers["Chatgpt-Account-Id"] = account.accountId;
+  if (account.chatgptAccountIsFedramp) headers["x-openai-fedramp"] = "true";
   return headers;
 }
 
@@ -175,10 +176,10 @@ export function codexUsageCheckResult(payload: unknown) {
   };
 }
 
-export async function fetchCodexUsage(account: TemporaryAccount, accessToken = account.secret, proxyConfig?: RouteProxyConfig) {
-  return fetchTemporaryAccountCheckText(CODEX_USAGE_URL, {
-    headers: codexQuotaHeaders(account, accessToken)
-  }, proxyConfig);
+export async function fetchCodexUsage(account: TemporaryAccount, accessToken = account.secret, proxyConfig?: RouteProxyConfig, authorizationIsComplete = false) {
+  const headers = codexQuotaHeaders(account, accessToken);
+  if (authorizationIsComplete) headers.Authorization = accessToken;
+  return fetchTemporaryAccountCheckText(CODEX_USAGE_URL, { headers }, proxyConfig);
 }
 
 
@@ -194,6 +195,7 @@ export function codexTemporaryHeaders(account: TemporaryAccount, templateHeaders
   if (!headerValue(headers, "Originator")) setHeader(headers, "Originator", CODEX_ORIGINATOR);
   if (!headerValue(headers, "Session_id")) setHeader(headers, "Session_id", randomBytes(16).toString("hex"));
   if (account.accountId && !headerValue(headers, "Chatgpt-Account-Id")) setHeader(headers, "Chatgpt-Account-Id", account.accountId);
+  if (account.chatgptAccountIsFedramp && !headerValue(headers, "x-openai-fedramp")) setHeader(headers, "x-openai-fedramp", "true");
   return headers;
 }
 

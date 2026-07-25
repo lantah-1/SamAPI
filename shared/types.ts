@@ -165,6 +165,12 @@ export interface TemporaryAccount {
   refreshToken?: string;
   idToken?: string;
   sessionToken?: string;
+  /** Sub2API OpenAI Agent Identity (base64 PKCS#8 Ed25519 key). */
+  agentRuntimeId?: string;
+  agentPrivateKey?: string;
+  agentTaskId?: string;
+  chatgptUserId?: string;
+  chatgptAccountIsFedramp?: boolean;
   grokOAuthFormat?: GrokOAuthFormat;
   oauthClientId?: string;
   oauthTokenEndpoint?: string;
@@ -360,6 +366,9 @@ export interface RequestLog {
   model: string;
   userAgent: string;
   clientIp: string;
+  clientDevice?: string;
+  apiKeyId?: string;
+  apiKeyName?: string;
   status: RequestLogStatus;
   statusCode: number;
   durationMs: number;
@@ -389,6 +398,11 @@ export interface RequestLogSummary {
   providerName: string;
   providerId?: string;
   model: string;
+  userAgent?: string;
+  clientIp?: string;
+  clientDevice?: string;
+  apiKeyId?: string;
+  apiKeyName?: string;
   headerTemplateId?: string;
   headerTemplateName?: string;
   upstreamUrl?: string;
@@ -406,6 +420,7 @@ export interface RequestLogPage {
 
 export interface AppSettings {
   maxRequestLogs: number;
+  requestTimeoutSeconds: number;
   themeId: AppThemeId;
   adminSessionTtlMinutes: number;
   temporaryAccountStrategy: GroupRouteStrategy;

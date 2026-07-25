@@ -94,6 +94,7 @@ SamAPI 面向本地或内网客户端提供统一的模型调用入口。管理�
 字段：
 
 - `maxRequestLogs`：请求日志最多保留条数，默认 100，超过后自动丢弃最旧记录。
+- `requestTimeoutSeconds`：等待上游响应头的最长时间，单位为秒，默认 60，可设置为 1–600；流式响应开始后不受此设置限制。
 
 示例：
 
@@ -147,6 +148,8 @@ Content-Type: application/json
 - `endpoint`：最终请求 endpoint。
 - `userAgent`：客户端 UA。
 - `clientIp`：客户端 IP。
+- `clientDevice`：根据 User-Agent 提取的客户端/操作系统/架构摘要；不是硬件唯一指纹。
+- `apiKeyName` / `apiKeyId`：下游请求使用的 SamAPI Key 名称和 ID，不保存密钥明文。
 - `status`：`success` 或 `failed`。
 - `statusCode`：上游或本地代理状态码。
 - `durationMs`：耗时。

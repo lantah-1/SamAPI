@@ -14,7 +14,7 @@ export const XAI_OAUTH_TOKEN_URL = "https://auth.x.ai/oauth2/token";
 export const XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
 export const XAI_DEFAULT_API_BASE_URL = "https://api.x.ai/v1";
 export const XAI_CLI_CHAT_PROXY_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
-export const CHATGPT_MODELS_URL = "https://chatgpt.com/backend-api/models";
+export const CHATGPT_MODELS_URL = "https://chatgpt.com/backend-api/codex/models?client_version=0.135.0";
 export const CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL = "ChatGPT 官方";
 export const TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS = positiveIntegerEnv("SAMAPI_TEMPORARY_ACCOUNT_CHECK_TIMEOUT_MS", 15_000);
 // Keep batch checks gentle on local proxies — concurrent OAuth + usage probes amplify load quickly.

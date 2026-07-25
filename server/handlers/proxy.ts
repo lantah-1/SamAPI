@@ -2,16 +2,22 @@ import http from "node:http";
 import { URL } from "node:url";
 import type { JsonStore } from "../store.js";
 import {
+  clientDeviceFromUserAgent,
+  appendUpstreamUrlToErrorResponse,
+  deleteHeader,
   extractUpstreamError,
+  forwardableRequestHeaders,
   headerValue,
   looksLikeHtml,
   maskedStringHeaders,
   maskRequestHeaders,
   maskSecret,
   requestApiKey,
+  requestClientIp,
   requestModelName,
   responsePreview,
-  setHeader
+  setHeader,
+  userAgentsHaveSameClient
 } from "../util/text.js";
 import { readJson, sendJson, valueToHeaderText } from "../http.js";
 import { proxyEndpointCandidates } from "../util/endpoints.js";
@@ -39,6 +45,13 @@ import { fetchWithRouteProxy, requestLogProxyForRoute } from "../proxy.js";
 import { parseHeaderTemplate } from "../store.js";
 import { CODEX_BACKEND_RESPONSES_URL, CODEX_USER_AGENT } from "../providers/constants.js";
 import { codexTemporaryHeaders, codexTemporaryRequestBody, collectCodexResponsesBody } from "../providers/codex.js";
+import {
+  agentIdentityAuthorization,
+  ensureOpenAiAgentIdentityTask,
+  isOpenAiAgentIdentityAccount,
+  isOpenAiAgentIdentityTaskInvalid,
+  redactOpenAiAgentIdentityText
+} from "../providers/openai-agent-identity.js";
 import {
   grokOAuthAccessTokenNeedsRefresh,
   createGrokResponsesToolConverter,
@@ -174,6 +187,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
 
   async function handleProxy(request: http.IncomingMessage, response: http.ServerResponse, url: URL) {
     const startedAt = Date.now();
+    const upstreamTimeoutMs = store.getDb().settings.requestTimeoutSeconds * 1000;
     // One AbortController per client request. If the client hangs up (browser stop, curl Ctrl-C, etc.)
     // we abort the upstream fetch and release the undici pool slot immediately.
     // `IncomingMessage.close` also fires after a normal request body read, so only use the explicit
@@ -193,7 +207,8 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
       providerName: "未匹配",
       model: "未匹配",
       userAgent: valueToHeaderText(request.headers["user-agent"]),
-      clientIp: request.socket.remoteAddress || "",
+      clientIp: requestClientIp(request),
+      clientDevice: clientDeviceFromUserAgent(valueToHeaderText(request.headers["user-agent"])),
       requestHeaders: maskRequestHeaders(request.headers)
     };
 
@@ -236,7 +251,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
     const downstreamEndpoint = proxyKindLabel(proxyInfo.kind, url.pathname);
     const downstreamUa = valueToHeaderText(request.headers["user-agent"]);
     const routeLogContext = resolveLogContext(routeNameOrId);
-    const requestLogBase = {
+    let requestLogBase: typeof baseLog & { routeName: string; apiKeyId?: string; apiKeyName?: string } = {
       ...baseLog,
       routeName: proxyInfo.kind === "models" ? "proxy-models" : routeNameOrId || "unknown"
     };
@@ -262,6 +277,14 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
       });
       sendJson(response, 401, { error: "Invalid API key" });
       return;
+    }
+
+    if (authenticatedApiKey !== true) {
+      requestLogBase = {
+        ...requestLogBase,
+        apiKeyId: authenticatedApiKey.id,
+        apiKeyName: authenticatedApiKey.name
+      };
     }
 
     if (proxyInfo.kind === "models") {
@@ -380,10 +403,20 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
 
       for (const candidate of candidates) {
         const candidateProxy = candidate.addresses[0]?.proxy || { mode: "direct" as const };
-        const headers: Record<string, string> = {
-          "Content-Type": "application/json",
-          ...parseHeaderTemplate(candidate.headerTemplate?.headersText)
-        };
+        const templateHeaders = parseHeaderTemplate(candidate.headerTemplate?.headersText);
+        const useDownstreamHeaders = userAgentsHaveSameClient(
+          downstreamUa,
+          headerValue(templateHeaders, "User-Agent")
+        );
+        const headers = useDownstreamHeaders
+          ? forwardableRequestHeaders(request.headers)
+          : templateHeaders;
+        if (useDownstreamHeaders) {
+          // These values authenticate the caller to SamAPI and must never become upstream credentials.
+          deleteHeader(headers, "Authorization");
+          deleteHeader(headers, "X-API-Key");
+        }
+        setHeader(headers, "Content-Type", "application/json");
         if (!candidate.providerApiKey && !candidate.temporaryAccount && !candidate.temporaryApiKeyAccount && !headerValue(headers, "Authorization")) {
           throw new Error(`未找到支持模型 ${candidate.model} 的上游 API Key`);
         }
@@ -465,7 +498,18 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
         lastAttemptContext = { candidate, routeUa, routeTargetLog, upstreamAuthLog };
 
         if (candidate.temporaryAccount) {
-          const codexHeaders = codexTemporaryHeaders(candidate.temporaryAccount, headers, true);
+          let codexAccount = candidate.temporaryAccount;
+          const agentIdentity = isOpenAiAgentIdentityAccount(codexAccount);
+          if (agentIdentity) {
+            codexAccount = await ensureOpenAiAgentIdentityTask({
+              account: codexAccount,
+              proxy: candidateProxy,
+              getCurrent: () => store.temporaryAccountCheckTarget(codexAccount.id)?.account,
+              persist: (agentTaskId) => { store.updateTemporaryAccountCheckResult(codexAccount.id, { agentTaskId }); }
+            });
+          }
+          let codexHeaders = codexTemporaryHeaders(codexAccount, headers, true);
+          if (agentIdentity) setHeader(codexHeaders, "Authorization", agentIdentityAuthorization(codexAccount));
           const codexRouteUa = headerValue(codexHeaders, "User-Agent") || CODEX_USER_AGENT;
           const codexRouteTargetLog = {
             ...routeTargetLog,
@@ -473,7 +517,8 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
           };
           const codexAuthLog: Record<string, string> = {
             "upstream-api-key": candidate.temporaryAccount.label,
-            "upstream-authorization": `Bearer ${maskSecret(candidate.temporaryAccount.secret)}`,
+            "upstream-auth-format": agentIdentity ? "agent-identity" : "oauth-bearer",
+            "upstream-authorization": agentIdentity ? "AgentAssertion [redacted]" : `Bearer ${maskSecret(candidate.temporaryAccount.secret)}`,
             "upstream-account-id": candidate.temporaryAccount.accountId ? maskSecret(candidate.temporaryAccount.accountId) : "未提供"
           };
           lastAttemptContext = { candidate, routeUa: codexRouteUa, routeTargetLog: codexRouteTargetLog, upstreamAuthLog: codexAuthLog };
@@ -485,12 +530,32 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
           };
           const attemptStartedAt = Date.now();
           try {
-            const { response: upstream, proxy: attemptProxy } = await fetchWithRouteProxy(CODEX_BACKEND_RESPONSES_URL, {
+            let { response: upstream, proxy: attemptProxy } = await fetchWithRouteProxy(CODEX_BACKEND_RESPONSES_URL, {
               method: "POST",
               headers: codexHeaders,
               body: JSON.stringify(codexForwardedBody),
               signal: clientAbort.signal
-            }, candidateProxy);
+            }, candidateProxy, upstreamTimeoutMs);
+            // Recover an invalid/expired task exactly once. The expected ID prevents concurrent
+            // requests from registering a second task after another request already recovered it.
+            if (agentIdentity && upstream.status === 401) {
+              const invalidBody = await upstream.clone().text();
+              if (isOpenAiAgentIdentityTaskInvalid(upstream.status, invalidBody)) {
+                const expectedTaskId = codexAccount.agentTaskId;
+                codexAccount = await ensureOpenAiAgentIdentityTask({
+                  account: codexAccount,
+                  proxy: candidateProxy,
+                  expectedTaskId,
+                  getCurrent: () => store.temporaryAccountCheckTarget(codexAccount.id)?.account,
+                  persist: (agentTaskId) => { store.updateTemporaryAccountCheckResult(codexAccount.id, { agentTaskId }); }
+                });
+                codexHeaders = codexTemporaryHeaders(codexAccount, headers, true);
+                setHeader(codexHeaders, "Authorization", agentIdentityAuthorization(codexAccount));
+                ({ response: upstream, proxy: attemptProxy } = await fetchWithRouteProxy(CODEX_BACKEND_RESPONSES_URL, {
+                  method: "POST", headers: codexHeaders, body: JSON.stringify(codexForwardedBody), signal: clientAbort.signal
+                }, candidateProxy, upstreamTimeoutMs));
+              }
+            }
             const contentType = upstream.headers.get("content-type") || undefined;
 
             if (upstream.ok && upstream.body && !looksLikeHtml(contentType, "")) {
@@ -743,7 +808,8 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
               return;
             }
 
-            const text = await upstream.text();
+            const rawText = await upstream.text();
+            const text = agentIdentity ? redactOpenAiAgentIdentityText(rawText, codexAccount) : rawText;
             const htmlMessage = looksLikeHtml(contentType, text) ? "返回了 HTML 页面，请检查 Codex 账号、代理或 ChatGPT 访问状态" : "";
             const errorMessage = htmlMessage || extractUpstreamError(text) || `HTTP ${upstream.status}`;
             markTemporaryAccountAttempt(candidate, upstream.status, errorMessage);
@@ -823,7 +889,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
               headers,
               body: JSON.stringify(forwardedBody),
               signal: clientAbort.signal
-            }, address.proxy);
+            }, address.proxy, upstreamTimeoutMs);
             const contentType = upstream.headers.get("content-type") || undefined;
 
             // Grok cross-provider reasoning fix: on the "could not decrypt encrypted_content" error we
@@ -1256,11 +1322,14 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
         });
       }
       if (lastFailure?.text) {
+        const upstreamUrl = lastFailure.target;
         response.writeHead(lastFailure.statusCode, {
           "Content-Type": lastFailure.contentType || "application/json; charset=utf-8",
+          "X-SamAPI-Upstream-URL": upstreamUrl,
+          "Access-Control-Expose-Headers": "X-SamAPI-Upstream-URL",
           "Access-Control-Allow-Origin": "*"
         });
-        response.end(lastFailure.text);
+        response.end(appendUpstreamUrlToErrorResponse(lastFailure.text, lastFailure.contentType, upstreamUrl));
         return;
       }
       sendJson(response, 502, { error: message });
@@ -1307,7 +1376,8 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
       providerName: "未匹配",
       model: routeName || "未匹配",
       userAgent: valueToHeaderText(request.headers["user-agent"]),
-      clientIp: request.socket.remoteAddress || "",
+      clientIp: requestClientIp(request),
+      clientDevice: clientDeviceFromUserAgent(valueToHeaderText(request.headers["user-agent"])),
       requestHeaders: maskRequestHeaders(request.headers),
       requestBody: body,
       status: "failed",

@@ -6,6 +6,7 @@ import {
   TEMPORARY_ACCOUNT_CHECK_CONCURRENCY,
   fetchTemporaryAccountCheckText
 } from "./providers/constants.js";
+import { agentIdentityAuthorization, ensureOpenAiAgentIdentityTask, isOpenAiAgentIdentityAccount, isOpenAiAgentIdentityTaskInvalid } from "./providers/openai-agent-identity.js";
 import {
   codexUsageCheckResult,
   fetchCodexUsage,
@@ -85,8 +86,31 @@ export function createAccountCheck(store: JsonStore) {
           email?: string;
         }
       | undefined;
-    let attempt = await fetchCodexUsage(account, account.secret, proxyConfig);
-    if ([401, 403].includes(attempt.response.status) && account.refreshToken) {
+    let activeAccount = account;
+    const agentIdentity = isOpenAiAgentIdentityAccount(account);
+    if (agentIdentity) {
+      activeAccount = await ensureOpenAiAgentIdentityTask({
+        account,
+        proxy: proxyConfig,
+        getCurrent: () => store.temporaryAccountCheckTarget(account.id)?.account,
+        persist: (agentTaskId) => { store.updateTemporaryAccountCheckResult(account.id, { agentTaskId }); }
+      });
+    }
+    const fetchUsage = () => agentIdentity
+      ? fetchCodexUsage(activeAccount, agentIdentityAuthorization(activeAccount), proxyConfig, true)
+      : fetchCodexUsage(activeAccount, activeAccount.secret, proxyConfig);
+    let attempt = await fetchUsage();
+    if (agentIdentity && isOpenAiAgentIdentityTaskInvalid(attempt.response.status, attempt.text)) {
+      activeAccount = await ensureOpenAiAgentIdentityTask({
+        account: activeAccount,
+        proxy: proxyConfig,
+        expectedTaskId: activeAccount.agentTaskId,
+        getCurrent: () => store.temporaryAccountCheckTarget(account.id)?.account,
+        persist: (agentTaskId) => { store.updateTemporaryAccountCheckResult(account.id, { agentTaskId }); }
+      });
+      attempt = await fetchUsage();
+    }
+    if (!agentIdentity && [401, 403].includes(attempt.response.status) && account.refreshToken) {
       const refreshedTokenPatch = await refreshCodexTemporaryAccountToken(account, proxyConfig);
       if (refreshedTokenPatch) {
         tokenPatch = refreshedTokenPatch;

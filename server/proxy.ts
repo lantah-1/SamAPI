@@ -145,7 +145,9 @@ export function requestLogProxyForRoute(routeProxyConfig?: RouteProxyConfig, for
 // fail fast if the proxy itself is unreachable, and allow arbitrarily long streaming bodies.
 const PROXY_AGENT_CONNECTIONS = 128;
 const PROXY_AGENT_CONNECT_TIMEOUT_MS = 15_000;
-const PROXY_AGENT_HEADERS_TIMEOUT_MS = 60_000;
+// The application-level AbortSignal below owns the configurable response-header timeout.
+// Disable undici's independent header timer so it cannot cut off a larger configured value.
+const PROXY_AGENT_HEADERS_TIMEOUT_MS = 0;
 // Only applies until fetch receives response headers. Once streaming starts, the body can run
 // arbitrarily long without being interrupted.
 export const UPSTREAM_HEADERS_TIMEOUT_MS = positiveIntegerEnv("SAMAPI_UPSTREAM_HEADERS_TIMEOUT_MS", 60_000);
@@ -198,7 +200,7 @@ export function isUpstreamHeadersTimeout(error: unknown) {
   return errorCode(error) === UPSTREAM_HEADERS_TIMEOUT_CODE;
 }
 
-function requestHeadersTimeoutSignal(parentSignal?: AbortSignal) {
+function requestHeadersTimeoutSignal(parentSignal: AbortSignal | undefined, timeoutMs: number) {
   const controller = new AbortController();
   let timedOut = false;
   const onParentAbort = () => controller.abort(parentSignal?.reason);
@@ -209,7 +211,7 @@ function requestHeadersTimeoutSignal(parentSignal?: AbortSignal) {
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
-  }, UPSTREAM_HEADERS_TIMEOUT_MS);
+  }, timeoutMs);
   return {
     signal: controller.signal,
     timedOut: () => timedOut,
@@ -220,16 +222,21 @@ function requestHeadersTimeoutSignal(parentSignal?: AbortSignal) {
   };
 }
 
-export async function fetchWithRouteProxy(target: Parameters<typeof fetch>[0], init: RequestInit, routeProxyConfig?: RouteProxyConfig) {
+export async function fetchWithRouteProxy(
+  target: Parameters<typeof fetch>[0],
+  init: RequestInit,
+  routeProxyConfig?: RouteProxyConfig,
+  timeoutMs = UPSTREAM_HEADERS_TIMEOUT_MS
+) {
   let resolvedProxy = routeProxy(routeProxyConfig);
   const proxyInit = resolvedProxy.url ? { ...init, dispatcher: proxyAgentFor(resolvedProxy.url) } as RequestInit & { dispatcher: ProxyAgent } : init;
   const run = async (requestInit: RequestInit) => {
-    const timeout = requestHeadersTimeoutSignal(requestInit.signal || undefined);
+    const timeout = requestHeadersTimeoutSignal(requestInit.signal || undefined, timeoutMs);
     try {
       return await fetch(target, { ...requestInit, signal: timeout.signal });
     } catch (error) {
       if (timeout.timedOut()) {
-        const timeoutError = new Error(`上游响应头超时（${Math.round(UPSTREAM_HEADERS_TIMEOUT_MS / 1000)} 秒）`);
+        const timeoutError = new Error(`上游响应头超时（${Math.round(timeoutMs / 1000)} 秒）`);
         Object.assign(timeoutError, { code: UPSTREAM_HEADERS_TIMEOUT_CODE, cause: error });
         throw timeoutError;
       }

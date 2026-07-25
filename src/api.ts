@@ -39,10 +39,30 @@ export function isUnauthorizedError(error: unknown) {
   return error instanceof ApiError && error.status === 401;
 }
 
+// 运行时从当前页面路径推导挂载前缀，无需 build 时烤入。
+// SamAPI 无客户端路由，URL 始终停在挂载点(如 /samapi/ 或 /samapi/index.html)，
+// 取其所在目录即为前缀。根路径部署时目录为 "/"，前缀为空。
+function detectBasePrefix(): string {
+  if (typeof window === "undefined") return "";
+  // pathname 形如 "/samapi/" 或 "/samapi/index.html" 或 "/"
+  const pathname = window.location.pathname;
+  // 取最后一个 "/" 之前的目录部分
+  const dir = pathname.slice(0, pathname.lastIndexOf("/") + 1);
+  // 去掉末尾斜杠，"/samapi/" → "/samapi"，"/" → ""
+  return dir.endsWith("/") ? dir.slice(0, -1) : dir;
+}
+
+const BASE_PREFIX = detectBasePrefix();
+
+function withBase(path: string): string {
+  if (!path.startsWith("/")) return path;
+  return `${BASE_PREFIX}${path}`;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(path, {
+    response = await fetch(withBase(path), {
       ...init,
       credentials: "same-origin",
       headers: {

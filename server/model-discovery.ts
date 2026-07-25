@@ -1,16 +1,19 @@
 import http from "node:http";
 import type { JsonStore } from "./store.js";
 import {
+  clientDeviceFromUserAgent,
   compactPreview,
   extractUpstreamError,
   maskRequestHeaders,
   maskSecret,
+  requestClientIp,
   responsePreview
 } from "./util/text.js";
 import { valueToHeaderText } from "./http.js";
 import { modelEndpointCandidates, newApiPricingEndpointCandidates } from "./util/endpoints.js";
 import { CHATGPT_MODELS_URL, CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL, fetchTemporaryAccountCheckText } from "./providers/constants.js";
 import { codexQuotaHeaders, refreshCodexTemporaryAccountToken } from "./providers/codex.js";
+import { agentIdentityAuthorization, ensureOpenAiAgentIdentityTask, isOpenAiAgentIdentityAccount, isOpenAiAgentIdentityTaskInvalid, redactOpenAiAgentIdentityText } from "./providers/openai-agent-identity.js";
 import { fetchWithRouteProxy, requestLogProxyForRoute } from "./proxy.js";
 import type { ProviderModelSyncOptions, ProviderModelSyncResult, ProviderModelSyncStatus, RequestLogProxy, Site, SiteAddress } from "../shared/types.js";
 
@@ -136,7 +139,8 @@ export function createModelDiscovery(store: JsonStore) {
       addressLabel: input.address?.label,
       model: input.models ? `模型发现：${input.models.length} 个模型` : "模型发现",
       userAgent: valueToHeaderText(input.request.headers["user-agent"]),
-      clientIp: input.request.socket.remoteAddress || "",
+      clientIp: requestClientIp(input.request),
+      clientDevice: clientDeviceFromUserAgent(valueToHeaderText(input.request.headers["user-agent"])),
       status: input.status,
       statusCode: input.statusCode,
       durationMs: Math.max(0, Date.now() - input.startedAt),
@@ -184,12 +188,36 @@ export function createModelDiscovery(store: JsonStore) {
       throw new Error("请先在临时账号页导入 GPT 官方账号");
     }
 
-    let accessToken = account.secret;
+    let activeAccount = account;
+    const agentIdentity = isOpenAiAgentIdentityAccount(account);
+    if (agentIdentity) {
+      activeAccount = await ensureOpenAiAgentIdentityTask({
+        account,
+        proxy: proxyConfig,
+        getCurrent: () => store.temporaryAccountCheckTarget(account.id)?.account,
+        persist: (agentTaskId) => { store.updateTemporaryAccountCheckResult(account.id, { agentTaskId }); }
+      });
+    }
+    let accessToken = activeAccount.secret;
     let tokenPatch: Awaited<ReturnType<typeof refreshCodexTemporaryAccountToken>> | undefined;
-    const fetchModels = () => fetchTemporaryAccountCheckText(CHATGPT_MODELS_URL, {
-      headers: codexQuotaHeaders(account, accessToken)
-    }, proxyConfig);
+    const fetchModels = () => {
+      const headers = codexQuotaHeaders(activeAccount, accessToken);
+      headers.Version = "0.135.0";
+      headers.Originator = "codex_cli_rs";
+      if (agentIdentity) headers.Authorization = agentIdentityAuthorization(activeAccount);
+      return fetchTemporaryAccountCheckText(CHATGPT_MODELS_URL, { headers }, proxyConfig);
+    };
     let attempt = await fetchModels();
+    if (agentIdentity && isOpenAiAgentIdentityTaskInvalid(attempt.response.status, attempt.text)) {
+      activeAccount = await ensureOpenAiAgentIdentityTask({
+        account: activeAccount,
+        proxy: proxyConfig,
+        expectedTaskId: activeAccount.agentTaskId,
+        getCurrent: () => store.temporaryAccountCheckTarget(account.id)?.account,
+        persist: (agentTaskId) => { store.updateTemporaryAccountCheckResult(account.id, { agentTaskId }); }
+      });
+      attempt = await fetchModels();
+    }
     if ([401, 403].includes(attempt.response.status) && account.refreshToken) {
       tokenPatch = await refreshCodexTemporaryAccountToken(account, proxyConfig);
       if (tokenPatch?.secret) {
@@ -201,7 +229,8 @@ export function createModelDiscovery(store: JsonStore) {
 
     const contentType = attempt.response.headers.get("content-type") || "";
     if (!attempt.response.ok) {
-      const errorMessage = extractUpstreamError(attempt.text) || `HTTP ${attempt.response.status}`;
+      const safeText = agentIdentity ? redactOpenAiAgentIdentityText(attempt.text, activeAccount) : attempt.text;
+      const errorMessage = extractUpstreamError(safeText) || `HTTP ${attempt.response.status}`;
       recordModelDiscoveryLog({
         request,
         siteId,
@@ -215,7 +244,7 @@ export function createModelDiscovery(store: JsonStore) {
         statusCode: attempt.response.status,
         startedAt: discoveryStartedAt,
         contentType,
-        responseText: attempt.text,
+        responseText: agentIdentity ? redactOpenAiAgentIdentityText(attempt.text, activeAccount) : attempt.text,
         errorMessage,
         usesApiKey: false
       });
@@ -240,7 +269,7 @@ export function createModelDiscovery(store: JsonStore) {
         statusCode: attempt.response.status,
         startedAt: discoveryStartedAt,
         contentType,
-        responseText: attempt.text,
+        responseText: agentIdentity ? redactOpenAiAgentIdentityText(attempt.text, activeAccount) : attempt.text,
         errorMessage,
         usesApiKey: false
       });
@@ -401,7 +430,7 @@ export function createModelDiscovery(store: JsonStore) {
                   Accept: "application/json"
                 }
               : newApiPricingHeaders(target)
-          }, address.proxy);
+          }, address.proxy, store.getDb().settings.requestTimeoutSeconds * 1000);
           const contentType = upstream.headers.get("content-type") || "";
           const text = await upstream.text();
           if (!upstream.ok) {

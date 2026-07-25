@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { validateOpenAiAgentIdentityPrivateKey } from "../providers/openai-agent-identity.js";
 import type {
   AppDatabase,
   AppSettings,
@@ -30,6 +31,7 @@ export const TEMPORARY_ACCOUNT_PROVIDER_LABELS: Record<TemporaryAccountProviderT
 };
 export const DEFAULT_SETTINGS: AppSettings = {
   maxRequestLogs: 100,
+  requestTimeoutSeconds: 60,
   themeId: "fresh",
   adminSessionTtlMinutes: 30,
   temporaryAccountStrategy: "sequential"
@@ -77,11 +79,15 @@ export function normalizeProviderModelSyncStatus(value: unknown): "success" | "f
 
 export function normalizeSettings(input?: Partial<AppSettings>): AppSettings {
   const maxRequestLogs = Number(input?.maxRequestLogs ?? DEFAULT_SETTINGS.maxRequestLogs);
+  const requestTimeoutSeconds = Number(input?.requestTimeoutSeconds ?? DEFAULT_SETTINGS.requestTimeoutSeconds);
   const adminSessionTtlMinutes = Number(input?.adminSessionTtlMinutes ?? DEFAULT_SETTINGS.adminSessionTtlMinutes);
   const themeId = THEME_IDS.includes(input?.themeId as AppThemeId) ? (input?.themeId as AppThemeId) : DEFAULT_SETTINGS.themeId;
   const temporaryAccountStrategy = normalizeGroupStrategy(input?.temporaryAccountStrategy ?? DEFAULT_SETTINGS.temporaryAccountStrategy);
   return {
     maxRequestLogs: Number.isFinite(maxRequestLogs) ? Math.min(5000, Math.max(1, Math.floor(maxRequestLogs))) : DEFAULT_SETTINGS.maxRequestLogs,
+    requestTimeoutSeconds: Number.isFinite(requestTimeoutSeconds)
+      ? Math.min(600, Math.max(1, Math.floor(requestTimeoutSeconds)))
+      : DEFAULT_SETTINGS.requestTimeoutSeconds,
     themeId,
     adminSessionTtlMinutes: Number.isFinite(adminSessionTtlMinutes)
       ? Math.min(60 * 24 * 30, Math.max(1, Math.floor(adminSessionTtlMinutes)))
@@ -452,6 +458,11 @@ type TemporaryAccountImportCandidate = {
   refreshToken?: string;
   idToken?: string;
   sessionToken?: string;
+  agentRuntimeId?: string;
+  agentPrivateKey?: string;
+  agentTaskId?: string;
+  chatgptUserId?: string;
+  chatgptAccountIsFedramp?: boolean;
   grokOAuthFormat?: GrokOAuthFormat;
   oauthClientId?: string;
   oauthTokenEndpoint?: string;
@@ -585,10 +596,18 @@ export function temporaryAccountFromRecord(
     "cookies",
     "sk"
   ]);
-  if (!secret) return undefined;
-
   const idToken = firstStringField(records, ["id_token", "idToken"]);
-  const accountId = firstStringField(records, [
+  const agentIdentity = records.map((item) => item.agent_identity ?? item.agentIdentity).find(isRecord);
+  const identityRecords = agentIdentity ? [agentIdentity as Record<string, unknown>, ...records] : records;
+  const agentRuntimeId = firstStringField(identityRecords, ["agent_runtime_id", "agentRuntimeId", "runtime_id", "runtimeId"]);
+  const agentPrivateKey = firstStringField(identityRecords, ["agent_private_key", "agentPrivateKey", "private_key", "privateKey"]);
+  const agentTaskId = firstStringField(identityRecords, ["task_id", "taskId"]);
+  const chatgptUserId = firstStringField(identityRecords, ["chatgpt_user_id", "chatgptUserId", "user_id", "userId"]);
+  const fedrampRaw = identityRecords.map((item) => item.chatgpt_account_is_fedramp ?? item.chatgptAccountIsFedramp).find((value) => value != null);
+  const chatgptAccountIsFedramp = typeof fedrampRaw === "boolean" ? fedrampRaw : undefined;
+  if (agentPrivateKey && fedrampRaw != null && typeof fedrampRaw !== "boolean") throw new Error("chatgpt_account_is_fedramp must be boolean");
+  if (agentPrivateKey) validateOpenAiAgentIdentityPrivateKey(agentPrivateKey);
+  const accountId = firstStringField(identityRecords, [
     "account_id",
     "chatgpt_account_id",
     "chatgptAccountId",
@@ -599,15 +618,24 @@ export function temporaryAccountFromRecord(
     "userId",
     "sub"
   ]) || codexAccountIdFromIdToken(idToken);
+  if ((agentRuntimeId || agentPrivateKey) && (!agentRuntimeId || !agentPrivateKey || !accountId || !chatgptUserId)) {
+    throw new Error("Agent Identity requires agent_runtime_id, agent_private_key, chatgpt_account_id, and chatgpt_user_id");
+  }
+  if (!secret && !agentPrivateKey) return undefined;
   return {
     label: temporaryAccountLabelFromRecords(records, fallbackLabel),
-    secret,
-    accountType: temporaryAccountType(record, secret, accountId),
+    secret: secret || "",
+    accountType: agentPrivateKey ? "codex" : temporaryAccountType(record, secret || "", accountId),
     accountId,
     email: firstStringField(records, ["email", "mail", "username"]) || emailFromIdToken(idToken),
     refreshToken: firstStringField(records, ["refresh_token", "refreshToken"]),
     idToken,
     sessionToken: firstBrowserCookieState(records) || firstStringField(records, ["session_token", "sessionToken"]),
+    agentRuntimeId,
+    agentPrivateKey,
+    agentTaskId,
+    chatgptUserId,
+    chatgptAccountIsFedramp,
     models: mergedModels,
     quotaStages: mergeQuotaStages(records)
   };
@@ -744,6 +772,11 @@ export function mergeTemporaryAccountImportCandidate(
     refreshToken: existing.refreshToken || incoming.refreshToken,
     idToken: existing.idToken || incoming.idToken,
     sessionToken: existing.sessionToken || incoming.sessionToken,
+    agentRuntimeId: existing.agentRuntimeId || incoming.agentRuntimeId,
+    agentPrivateKey: existing.agentPrivateKey || incoming.agentPrivateKey,
+    agentTaskId: existing.agentTaskId || incoming.agentTaskId,
+    chatgptUserId: existing.chatgptUserId || incoming.chatgptUserId,
+    chatgptAccountIsFedramp: existing.chatgptAccountIsFedramp ?? incoming.chatgptAccountIsFedramp,
     grokOAuthFormat: existing.grokOAuthFormat || incoming.grokOAuthFormat,
     oauthClientId: existing.oauthClientId || incoming.oauthClientId,
     oauthTokenEndpoint: existing.oauthTokenEndpoint || incoming.oauthTokenEndpoint,
@@ -798,8 +831,11 @@ export function parseTemporaryAccountImport(
 
   const unique = new Map<string, (typeof output)[number]>();
   for (const account of output) {
-    const existing = unique.get(account.secret);
-    unique.set(account.secret, existing ? mergeTemporaryAccountImportCandidate(existing, account) : account);
+    const identity = account.accountId && account.chatgptUserId
+      ? `identity:${account.accountId}:${account.chatgptUserId}`
+      : account.secret || account.refreshToken || account.agentRuntimeId || `${account.label}:${unique.size}`;
+    const existing = unique.get(identity);
+    unique.set(identity, existing ? mergeTemporaryAccountImportCandidate(existing, account) : account);
   }
   return Array.from(unique.values());
 }
