@@ -184,13 +184,14 @@ export async function fetchCodexUsage(account: TemporaryAccount, accessToken = a
 
 
 export function codexTemporaryHeaders(account: TemporaryAccount, templateHeaders: Record<string, string>, stream: boolean) {
-  const headers: Record<string, string> = {
-    ...templateHeaders,
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${account.secret}`,
-    Accept: stream ? "text/event-stream" : "application/json",
-    Connection: "Keep-Alive"
-  };
+  const headers: Record<string, string> = { ...templateHeaders };
+  // Header names are case-insensitive. Assigning canonical names directly can leave both
+  // e.g. `content-type` and `Content-Type` in this object; fetch then combines them into
+  // `application/json, application/json`, which the Codex backend rejects.
+  setHeader(headers, "Content-Type", "application/json");
+  setHeader(headers, "Authorization", `Bearer ${account.secret}`);
+  setHeader(headers, "Accept", stream ? "text/event-stream" : "application/json");
+  setHeader(headers, "Connection", "Keep-Alive");
   if (!headerValue(headers, "User-Agent")) setHeader(headers, "User-Agent", CODEX_USER_AGENT);
   if (!headerValue(headers, "Originator")) setHeader(headers, "Originator", CODEX_ORIGINATOR);
   if (!headerValue(headers, "Session_id")) setHeader(headers, "Session_id", randomBytes(16).toString("hex"));
@@ -232,4 +233,3 @@ export async function collectCodexResponsesBody(stream: ReadableStream<Uint8Arra
     preview
   };
 }
-

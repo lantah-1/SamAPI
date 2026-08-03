@@ -181,6 +181,7 @@ export default function App() {
   const [modelSyncing, setModelSyncing] = useState(false);
   const [modelSyncingGroupId, setModelSyncingGroupId] = useState<string | null>(null);
   const [temporaryAccountChecking, setTemporaryAccountChecking] = useState<string | null>(null);
+  const [temporaryAccountOAuthBusy, setTemporaryAccountOAuthBusy] = useState(false);
   const [temporaryAccountCheckingIds, setTemporaryAccountCheckingIds] = useState<string[]>([]);
   const [temporaryAccountQueuedIds, setTemporaryAccountQueuedIds] = useState<string[]>([]);
   const [temporaryAccountCheckProviderType, setTemporaryAccountCheckProviderType] = useState<Extract<TemporaryAccountProviderType, "gpt" | "grok">>("gpt");
@@ -845,6 +846,56 @@ export default function App() {
     };
   };
 
+  const loginTemporaryChatGptAccount = async () => {
+    if (temporaryAccountOAuthBusy) return;
+    const loginWindow = window.open("about:blank", "samapi-chatgpt-oauth", "popup=yes,width=720,height=820");
+    setTemporaryAccountOAuthBusy(true);
+    setTemporaryAccountCheckProviderType("gpt");
+    try {
+      const session = await api.startTemporaryAccountOAuth();
+      if (loginWindow) {
+        loginWindow.location.href = session.authorizationUrl;
+      } else {
+        const opened = window.open(session.authorizationUrl, "_blank", "noopener,noreferrer");
+        if (!opened) throw new Error("浏览器阻止了登录窗口，请允许 SamAPI 打开弹窗后重试");
+      }
+      setToast("已打开 ChatGPT 登录页面，正在等待授权完成...");
+      const deadline = Date.now() + 10 * 60 * 1000;
+      let accountId = "";
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1500));
+        const status = await api.temporaryAccountOAuthStatus(session.state);
+        if (status.status === "pending") continue;
+        if (status.status === "error") throw new Error(status.error || "ChatGPT 授权失败");
+        accountId = status.accountId || "";
+        break;
+      }
+      if (!accountId) throw new Error("ChatGPT 登录等待超时，请重新登录");
+      loginWindow?.close();
+      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
+      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
+      setTemporaryAccountsLoaded(true);
+      setTemporaryAccountsLoading(false);
+      setToast("ChatGPT 登录成功，正在检查账号额度...");
+      setTemporaryAccountChecking(accountId);
+      setTemporaryAccountCheckingIds([accountId]);
+      const result = await api.checkTemporaryAccount(accountId);
+      const item = result.results[0];
+      if (item) applyTemporaryAccountCheckItem(item);
+      const refreshedGroups = await api.listTemporaryAccountGroups();
+      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups: refreshedGroups } : current));
+      setToast(`ChatGPT 登录成功：${item ? temporaryAccountAvailabilityLabels[item.availability] : "账号已添加"}`);
+    } catch (error) {
+      loginWindow?.close();
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "ChatGPT 登录失败");
+    } finally {
+      setTemporaryAccountOAuthBusy(false);
+      setTemporaryAccountChecking(null);
+      setTemporaryAccountCheckingIds([]);
+      setTemporaryAccountQueuedIds([]);
+    }
+  };
+
   const checkTemporaryAccounts = async () => {
     const accountIds = (snapshot?.temporaryAccountGroups || [])
       .filter((group) => (group.providerType || "gpt") === temporaryAccountCheckProviderType)
@@ -1376,6 +1427,8 @@ export default function App() {
                 editorOpen={temporaryAccountEditorOpen}
                 busy={busy}
                 checking={temporaryAccountChecking}
+                oauthBusy={temporaryAccountOAuthBusy}
+                onOAuthLogin={loginTemporaryChatGptAccount}
                 checkingAccountIds={temporaryAccountCheckingIds}
                 queuedAccountIds={temporaryAccountQueuedIds}
                 checkProviderType={temporaryAccountCheckProviderType}

@@ -481,6 +481,66 @@ export class JsonStore {
     return this.toProviderApiKeyGroupView(group);
   }
 
+  saveCodexOAuthAccount(input: {
+    accessToken: string;
+    refreshToken: string;
+    idToken?: string;
+    accountId?: string;
+    email?: string;
+    tokenExpiresAt?: string;
+  }) {
+    const timestamp = now();
+    const site = this.ensureOfficialOpenAiSite();
+    const group = this.ensureTemporaryAccountTypeGroup("gpt", site.id, "subapi", timestamp);
+    const existing = group.accounts.find((account) =>
+      account.providerType === "gpt" && (
+        Boolean(input.accountId && account.accountId === input.accountId) ||
+        account.refreshToken === input.refreshToken
+      )
+    );
+    if (existing) {
+      existing.label = input.email || existing.label;
+      existing.prefix = input.accessToken.slice(0, 12);
+      existing.secret = input.accessToken;
+      existing.accountType = "codex";
+      existing.accountId = input.accountId || existing.accountId;
+      existing.email = input.email || existing.email;
+      existing.refreshToken = input.refreshToken;
+      existing.idToken = input.idToken || existing.idToken;
+      existing.tokenExpiresAt = input.tokenExpiresAt;
+      existing.enabled = true;
+      existing.availability = "unknown";
+      existing.lastCheckError = undefined;
+      group.enabled = true;
+      group.updatedAt = timestamp;
+      this.persist();
+      return { account: existing, created: false };
+    }
+    const account: TemporaryAccount = {
+      id: `temp-account-${randomUUID()}`,
+      label: input.email || input.accountId || "Codex OAuth",
+      prefix: input.accessToken.slice(0, 12),
+      secret: input.accessToken,
+      accountType: "codex",
+      providerType: "gpt",
+      accountId: input.accountId,
+      email: input.email,
+      refreshToken: input.refreshToken,
+      idToken: input.idToken,
+      tokenExpiresAt: input.tokenExpiresAt,
+      enabled: true,
+      models: [],
+      availability: "unknown",
+      quotaStages: [],
+      importedAt: timestamp
+    };
+    group.accounts.unshift(account);
+    group.enabled = true;
+    group.updatedAt = timestamp;
+    this.persist();
+    return { account, created: true };
+  }
+
   importTemporaryAccounts(input: TemporaryAccountImportInput) {
     const timestamp = now();
     const source = input.mode === "cpa" || input.source === "cpa" ? "cpa" : "subapi";

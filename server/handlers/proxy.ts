@@ -92,6 +92,22 @@ function isClientAbortError(signal: AbortSignal, error: unknown) {
   return /客户端已断开连接|\b(?:this|the) operation was aborted\b/i.test(message);
 }
 
+const UPSTREAM_429_RETRY_COUNT = 5;
+
+async function fetchWith429Retry(
+  target: Parameters<typeof fetchWithRouteProxy>[0],
+  init: Parameters<typeof fetchWithRouteProxy>[1],
+  routeProxyConfig: Parameters<typeof fetchWithRouteProxy>[2],
+  timeoutMs: Parameters<typeof fetchWithRouteProxy>[3]
+) {
+  let result = await fetchWithRouteProxy(target, init, routeProxyConfig, timeoutMs);
+  for (let retry = 0; retry < UPSTREAM_429_RETRY_COUNT && result.response.status === 429; retry += 1) {
+    result.response.body?.cancel().catch(() => {});
+    result = await fetchWithRouteProxy(target, init, routeProxyConfig, timeoutMs);
+  }
+  return result;
+}
+
 
 
 interface ProxyHandlerDeps {
@@ -530,7 +546,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
           };
           const attemptStartedAt = Date.now();
           try {
-            let { response: upstream, proxy: attemptProxy } = await fetchWithRouteProxy(CODEX_BACKEND_RESPONSES_URL, {
+            let { response: upstream, proxy: attemptProxy } = await fetchWith429Retry(CODEX_BACKEND_RESPONSES_URL, {
               method: "POST",
               headers: codexHeaders,
               body: JSON.stringify(codexForwardedBody),
@@ -551,7 +567,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                 });
                 codexHeaders = codexTemporaryHeaders(codexAccount, headers, true);
                 setHeader(codexHeaders, "Authorization", agentIdentityAuthorization(codexAccount));
-                ({ response: upstream, proxy: attemptProxy } = await fetchWithRouteProxy(CODEX_BACKEND_RESPONSES_URL, {
+                ({ response: upstream, proxy: attemptProxy } = await fetchWith429Retry(CODEX_BACKEND_RESPONSES_URL, {
                   method: "POST", headers: codexHeaders, body: JSON.stringify(codexForwardedBody), signal: clientAbort.signal
                 }, candidateProxy, upstreamTimeoutMs));
               }
@@ -884,7 +900,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
           const target = addressTargets[targetIndex];
           const attemptStartedAt = Date.now();
           try {
-            const { response: upstream, proxy: attemptProxy } = await fetchWithRouteProxy(target, {
+            const { response: upstream, proxy: attemptProxy } = await fetchWith429Retry(target, {
               method: request.method || "POST",
               headers,
               body: JSON.stringify(forwardedBody),

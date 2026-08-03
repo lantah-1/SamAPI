@@ -11,6 +11,7 @@ import {
   Database,
   KeyRound,
   LockKeyhole,
+  LogIn,
   Map,
   Pencil,
   Plus,
@@ -156,6 +157,8 @@ export function TemporaryAccountsView(props: {
   onSubmit: (event: FormEvent) => void;
   onClose: () => void;
   onCheck: () => void;
+  oauthBusy: boolean;
+  onOAuthLogin: () => void;
   onRetry: () => void;
   onStrategyChange: (strategy: GroupRouteStrategy) => void;
   onCheckAccount: (id: string) => void;
@@ -261,8 +264,12 @@ export function TemporaryAccountsView(props: {
           <div className="temp-account-empty-mark"><Upload className="h-5 w-5" /></div>
           <div>
             <div className="center-empty-title">暂无临时账号</div>
-            <div className="center-empty-description">导入 GPT、Grok、Claude 或 Gemini 账号后，这里会展示可用状态和额度信息。</div>
+            <div className="center-empty-description">登录 ChatGPT，或导入 GPT、Grok、Claude、Gemini 账号后，这里会展示可用状态和额度信息。</div>
           </div>
+          <ActionButton type="button" disabled={props.oauthBusy} onClick={props.onOAuthLogin}>
+            {props.oauthBusy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+            {props.oauthBusy ? "等待登录..." : "登录 ChatGPT"}
+          </ActionButton>
         </div>
       ) : (
         <section className="temp-account-panel panel p-4">
@@ -307,6 +314,15 @@ export function TemporaryAccountsView(props: {
                   <option value="random">{groupStrategyLabels.random}</option>
                 </SelectInput>
               </label>
+              {props.checkProviderType === "gpt" ? (
+                <div className="temp-account-check-control">
+                  <span className="temp-account-control-label">添加账号</span>
+                  <ActionButton className="temp-account-login-action" type="button" disabled={props.oauthBusy} onClick={props.onOAuthLogin}>
+                    {props.oauthBusy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+                    {props.oauthBusy ? "等待登录..." : "登录 ChatGPT"}
+                  </ActionButton>
+                </div>
+              ) : null}
               <div className="temp-account-check-control">
                 <span className="temp-account-control-label temp-account-control-label-placeholder" aria-hidden="true">检查</span>
                 <ActionButton className="temp-account-check-action" type="button" tone="ghost" disabled={props.checking !== null || visibleAccounts.length === 0} onClick={() => props.onCheck()}>

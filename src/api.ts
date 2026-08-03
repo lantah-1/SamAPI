@@ -154,6 +154,15 @@ export const api = {
       body: JSON.stringify(options)
     }),
   listTemporaryAccountGroups: () => request<TemporaryAccountGroup[]>("/api/temporary-accounts"),
+  startTemporaryAccountOAuth: () =>
+    request<{ state: string; authorizationUrl: string; redirectUri: string }>("/api/temporary-accounts/oauth/start", {
+      method: "POST",
+      body: JSON.stringify({ providerType: "gpt" })
+    }),
+  temporaryAccountOAuthStatus: (state: string) =>
+    request<{ state: string; status: "pending" | "success" | "error"; error?: string; accountId?: string }>(
+      `/api/temporary-accounts/oauth/status?state=${encodeURIComponent(state)}`
+    ),
   importTemporaryAccounts: (input: TemporaryAccountImportInput) =>
     request<TemporaryAccountImportResult>("/api/temporary-accounts/import", {
       method: "POST",

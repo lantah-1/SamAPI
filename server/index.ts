@@ -11,6 +11,7 @@ import { ADMIN_PASSWORD_IS_DEFAULT, HOST, PORT, WEB_DIR } from "./config.js";
 import { handleStatic, notFound, sendCorsPreflight } from "./http.js";
 import { isSupportedProxyPath } from "./proxy-path.js";
 import { JsonStore } from "./store.js";
+import { createCodexOAuth } from "./codex-oauth.js";
 
 const store = new JsonStore();
 const {
@@ -25,6 +26,7 @@ const {
 const { checkTemporaryAccounts, checkTemporaryAccountIds, checkSingleTemporaryAccount } = createAccountCheck(store);
 const { markTemporaryAccountAttempt, markCandidateSuccess, resolveProxyExecution } = createRouting(store);
 const { discoverProviderModels, syncAllProviderModels } = createModelDiscovery(store);
+const { start: startCodexOAuth, status: codexOAuthStatus } = createCodexOAuth(store);
 const { handleApi } = createApiHandler({
   store,
   hasAdminSession,
@@ -38,7 +40,9 @@ const { handleApi } = createApiHandler({
   checkTemporaryAccountIds,
   checkSingleTemporaryAccount,
   discoverProviderModels,
-  syncAllProviderModels
+  syncAllProviderModels,
+  startCodexOAuth,
+  codexOAuthStatus
 });
 const { handleProxy, handleUnsupportedProxyPath } = createProxyHandler({
   store,

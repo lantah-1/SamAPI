@@ -46,6 +46,8 @@ interface ApiHandlerDeps {
   checkSingleTemporaryAccount: (accountId: string, proxyConfig?: RouteProxyConfig) => Promise<TemporaryAccountCheckResult>;
   discoverProviderModels: (siteId: string, apiKey: string, apiKeyName: string, request: http.IncomingMessage, kind?: string) => Promise<unknown>;
   syncAllProviderModels: (request: http.IncomingMessage, options?: ProviderModelSyncOptions) => Promise<ProviderModelSyncResult>;
+  startCodexOAuth: () => Promise<{ state: string; authorizationUrl: string; redirectUri: string }>;
+  codexOAuthStatus: (state: string) => { state: string; status: "pending" | "success" | "error"; error?: string; accountId?: string } | undefined;
 }
 
 export function createApiHandler(deps: ApiHandlerDeps) {
@@ -62,7 +64,9 @@ export function createApiHandler(deps: ApiHandlerDeps) {
     checkTemporaryAccountIds,
     checkSingleTemporaryAccount,
     discoverProviderModels,
-    syncAllProviderModels
+    syncAllProviderModels,
+    startCodexOAuth,
+    codexOAuthStatus
   } = deps;
 
   async function handleApi(request: http.IncomingMessage, response: http.ServerResponse, url: URL) {
@@ -230,6 +234,15 @@ export function createApiHandler(deps: ApiHandlerDeps) {
       }
 
       if (parts[1] === "temporary-accounts") {
+        if (method === "POST" && parts[2] === "oauth" && parts[3] === "start") {
+          return sendJson(response, 201, await startCodexOAuth());
+        }
+        if (method === "GET" && parts[2] === "oauth" && parts[3] === "status") {
+          const state = url.searchParams.get("state") || "";
+          if (!state) return sendJson(response, 400, { error: "缺少 OAuth state" });
+          const status = codexOAuthStatus(state);
+          return status ? sendJson(response, 200, status) : sendJson(response, 404, { error: "OAuth session 不存在或已过期" });
+        }
         if (method === "GET") return sendJson(response, 200, store.getDb().temporaryAccountGroups);
         if (method === "POST" && parts[2] === "import") {
           const body = await readJson(request);
