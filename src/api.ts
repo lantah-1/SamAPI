@@ -186,6 +186,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify(options || {})
     }),
+  resetTemporaryAccount: (id: string, options?: TemporaryAccountCheckOptions) =>
+    request<TemporaryAccountCheckResult>(`/api/temporary-accounts/accounts/${id}/reset`, {
+      method: "POST",
+      body: JSON.stringify(options || {})
+    }),
   updateTemporaryAccount: (id: string, body: Partial<TemporaryAccountGroup["accounts"][number]>) =>
     request<TemporaryAccountGroup["accounts"][number]>(`/api/temporary-accounts/accounts/${id}`, {
       method: "PATCH",

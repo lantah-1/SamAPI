@@ -1910,6 +1910,39 @@ textarea.field:focus {
   font-size: 0.72rem;
 }
 
+.temp-account-quota-value {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  gap: 0.38rem;
+}
+
+.temp-account-reset {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.18rem;
+  min-height: 24px;
+  padding: 0.18rem 0.42rem;
+  border: 1px solid var(--accent-line);
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 0.66rem;
+  font-weight: 800;
+  white-space: nowrap;
+  transition: background 150ms ease, transform 150ms ease, opacity 150ms ease;
+}
+
+.temp-account-reset:hover:not(:disabled) {
+  background: var(--accent-softer);
+  transform: translateY(-1px);
+}
+
+.temp-account-reset:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .temp-account-quota-track {
   overflow: hidden;
   height: 8px;

@@ -23,7 +23,7 @@ const {
   requireAdminSession,
   verifyAdminPassword
 } = createAuth(store);
-const { checkTemporaryAccounts, checkTemporaryAccountIds, checkSingleTemporaryAccount } = createAccountCheck(store);
+const { checkTemporaryAccounts, checkTemporaryAccountIds, checkSingleTemporaryAccount, resetSingleTemporaryAccount } = createAccountCheck(store);
 const { markTemporaryAccountAttempt, markCandidateSuccess, resolveProxyExecution } = createRouting(store);
 const { discoverProviderModels, syncAllProviderModels } = createModelDiscovery(store);
 const { start: startCodexOAuth, status: codexOAuthStatus } = createCodexOAuth(store);
@@ -39,6 +39,7 @@ const { handleApi } = createApiHandler({
   checkTemporaryAccounts,
   checkTemporaryAccountIds,
   checkSingleTemporaryAccount,
+  resetSingleTemporaryAccount,
   discoverProviderModels,
   syncAllProviderModels,
   startCodexOAuth,

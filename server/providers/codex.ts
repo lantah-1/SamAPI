@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   codexAccountIdFromIdToken,
   emailFromIdToken,
@@ -10,6 +10,7 @@ import {
 } from "../util/text.js";
 import { sseJsonObjectsFromReadable } from "../convert/stream.js";
 import {
+  CODEX_RESET_CREDITS_URL,
   CODEX_OAUTH_CLIENT_ID,
   CODEX_OAUTH_TOKEN_URL,
   CODEX_ORIGINATOR,
@@ -180,6 +181,32 @@ export async function fetchCodexUsage(account: TemporaryAccount, accessToken = a
   const headers = codexQuotaHeaders(account, accessToken);
   if (authorizationIsComplete) headers.Authorization = accessToken;
   return fetchTemporaryAccountCheckText(CODEX_USAGE_URL, { headers }, proxyConfig);
+}
+
+export async function resetCodexTemporaryAccount(
+  account: TemporaryAccount,
+  accessToken = account.secret,
+  proxyConfig?: RouteProxyConfig,
+  authorizationIsComplete = false
+) {
+  const headers = codexQuotaHeaders(account, accessToken);
+  if (authorizationIsComplete) headers.Authorization = accessToken;
+  headers["Content-Type"] = "application/json";
+  const redeemRequestId = randomUUID();
+  const { response, text } = await fetchTemporaryAccountCheckText(CODEX_RESET_CREDITS_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ redeem_request_id: redeemRequestId })
+  }, proxyConfig);
+  if (!response.ok) {
+    const detail = extractUpstreamError(text) || `HTTP ${response.status}`;
+    throw new Error(`重置 Codex 额度失败：HTTP ${response.status} ${detail}`);
+  }
+  try {
+    return text ? JSON.parse(text) as Record<string, unknown> : {};
+  } catch {
+    throw new Error("重置 Codex 额度失败：上游返回内容不是合法 JSON");
+  }
 }
 
 

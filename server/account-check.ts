@@ -10,7 +10,8 @@ import { agentIdentityAuthorization, ensureOpenAiAgentIdentityTask, isOpenAiAgen
 import {
   codexUsageCheckResult,
   fetchCodexUsage,
-  refreshCodexTemporaryAccountToken
+  refreshCodexTemporaryAccountToken,
+  resetCodexTemporaryAccount
 } from "./providers/codex.js";
 import {
   fetchGrokOAuthResponses,
@@ -398,9 +399,50 @@ export function createAccountCheck(store: JsonStore) {
     return checkTemporaryAccountIds([accountId], proxyConfig);
   }
 
+  async function resetSingleTemporaryAccount(accountId: string, proxyConfig?: RouteProxyConfig): Promise<TemporaryAccountCheckResult> {
+    const target = store.temporaryAccountCheckTarget(accountId, "gpt");
+    if (!target) throw new Error("临时账号不存在或不是 GPT 账号");
+    const { group, account } = target;
+    const isCodex = account.accountType === "codex" || Boolean(account.accountId);
+    if (!isCodex) throw new Error("只有 ChatGPT/Codex OAuth 账号支持重置额度");
+
+    let activeAccount = account;
+    const agentIdentity = isOpenAiAgentIdentityAccount(account);
+    if (agentIdentity) {
+      activeAccount = await ensureOpenAiAgentIdentityTask({
+        account,
+        proxy: proxyConfig || siteProxyForTemporaryAccountGroup(group.id),
+        getCurrent: () => store.temporaryAccountCheckTarget(account.id)?.account,
+        persist: (agentTaskId) => { store.updateTemporaryAccountCheckResult(account.id, { agentTaskId }); }
+      });
+    }
+    const accountProxy = proxyConfig || siteProxyForTemporaryAccountGroup(group.id);
+    if (agentIdentity) {
+      await resetCodexTemporaryAccount(activeAccount, agentIdentityAuthorization(activeAccount), accountProxy, true);
+    } else {
+      try {
+        await resetCodexTemporaryAccount(activeAccount, activeAccount.secret, accountProxy);
+      } catch (error) {
+        if (![401, 403].some((status) => String(error).includes(`HTTP ${status}`)) || !account.refreshToken) throw error;
+        const refreshed = await refreshCodexTemporaryAccountToken(account, accountProxy);
+        if (!refreshed) throw error;
+        activeAccount = { ...activeAccount, ...refreshed };
+        await resetCodexTemporaryAccount(activeAccount, activeAccount.secret, accountProxy);
+      }
+    }
+    return checkTemporaryAccount(group.id, activeAccount, accountProxy).then((item) => ({
+      total: 1,
+      available: item.availability === "available" ? 1 : 0,
+      unavailable: item.availability === "unavailable" ? 1 : 0,
+      unknown: item.availability === "unknown" ? 1 : 0,
+      results: [item]
+    }));
+  }
+
   return {
     checkTemporaryAccounts,
     checkTemporaryAccountIds,
-    checkSingleTemporaryAccount
+    checkSingleTemporaryAccount,
+    resetSingleTemporaryAccount
   };
 }

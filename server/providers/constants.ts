@@ -5,6 +5,7 @@ import type { RouteProxyConfig } from "../../shared/types.js";
 
 export const CODEX_BACKEND_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+export const CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 export const CODEX_USER_AGENT = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)";
 export const CODEX_ORIGINATOR = "codex-tui";
 export const CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
@@ -66,4 +67,3 @@ export async function fetchTemporaryAccountCheckText(input: Parameters<typeof fe
     return { response: result.response, text: result.text };
   }
 }
-

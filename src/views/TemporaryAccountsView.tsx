@@ -150,6 +150,7 @@ export function TemporaryAccountsView(props: {
   checkProviderType: Extract<TemporaryAccountProviderType, "gpt" | "grok">;
   onCheckProviderTypeChange: (providerType: Extract<TemporaryAccountProviderType, "gpt" | "grok">) => void;
   updating: string | null;
+  resetting: string | null;
   deleting: string | null;
   selectedAccountIds: string[];
   onSelectedAccountIds: (ids: string[]) => void;
@@ -162,6 +163,7 @@ export function TemporaryAccountsView(props: {
   onRetry: () => void;
   onStrategyChange: (strategy: GroupRouteStrategy) => void;
   onCheckAccount: (id: string) => void;
+  onResetAccount: (id: string) => void;
   onCheckSelected: () => void;
   onUpdateAccount: (id: string, patch: Partial<TemporaryAccount>) => void;
   onDeleteAccount: (id: string) => void;
@@ -404,6 +406,13 @@ export function TemporaryAccountsView(props: {
                         const accountKind = groupIsGrok
                           ? account.grokOAuthFormat === "grok2api-oauth" ? "grok2api" : "CPA"
                           : temporaryAccountSourceLabels[group.source];
+                        const displayedQuotaStages = account.quotaStages.slice(0, 5);
+                        const resetQuotaStage = account.quotaStages.find((stage) => {
+                          const count = Number(stage.remaining);
+                          return stage.label === "主动重置次数" && Number.isFinite(count) && count > 0;
+                        });
+                        if (resetQuotaStage && !displayedQuotaStages.includes(resetQuotaStage)) displayedQuotaStages.push(resetQuotaStage);
+                        const hiddenQuotaStageCount = Math.max(0, account.quotaStages.length - displayedQuotaStages.length);
                         return (
                           <div key={account.id} className={`temp-account-row temp-account-row-${availability} ${groupIsGrok ? "temp-account-row-status-only" : ""}`}>
                             <label className="temp-account-row-select" title={`选择 ${account.label}`}>
@@ -427,13 +436,30 @@ export function TemporaryAccountsView(props: {
                               </div>
                               {!groupIsGrok && account.quotaStages.length > 0 ? (
                                 <div className="temp-account-quota-list">
-                                  {account.quotaStages.slice(0, 5).map((stage, index) => {
+                                  {displayedQuotaStages.map((stage, index) => {
                                     const percent = temporaryAccountQuotaPercent(stage);
+                                    const resetCount = Number(stage.remaining);
+                                    const canReset = stage.label === "主动重置次数" && Number.isFinite(resetCount) && resetCount > 0;
                                     return (
                                       <div key={`${account.id}-${stage.label}-${index}`} className={`temp-account-quota temp-account-quota-${availability}`} title={temporaryAccountQuotaText(stage)}>
                                         <div className="temp-account-quota-head">
                                           <span>{stage.label}</span>
-                                          <strong>{formatQuotaPercent(percent)}</strong>
+                                          <div className="temp-account-quota-value">
+                                            <strong>{formatQuotaPercent(percent)}</strong>
+                                            {canReset ? (
+                                              <button
+                                                type="button"
+                                                className="temp-account-reset"
+                                                disabled={props.resetting !== null || props.checking !== null || props.deleting !== null}
+                                                onClick={() => props.onResetAccount(account.id)}
+                                                title="重置额度"
+                                                aria-label={`重置 ${account.label} 的额度`}
+                                              >
+                                                {props.resetting === account.id ? <RefreshCw className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+                                                重置
+                                              </button>
+                                            ) : null}
+                                          </div>
                                         </div>
                                         <div className="temp-account-quota-track" aria-label={temporaryAccountQuotaText(stage)}>
                                           <div className="temp-account-quota-fill" style={{ width: `${percent ?? 0}%` }} />
@@ -442,7 +468,7 @@ export function TemporaryAccountsView(props: {
                                       </div>
                                     );
                                   })}
-                                  {account.quotaStages.length > 5 ? <span className="temp-account-quota-more">+{account.quotaStages.length - 5} 项</span> : null}
+                                  {hiddenQuotaStageCount > 0 ? <span className="temp-account-quota-more">+{hiddenQuotaStageCount} 项</span> : null}
                                 </div>
                               ) : null}
                               {account.lastCheckError ? <div className="temp-account-error">{account.lastCheckError}</div> : null}

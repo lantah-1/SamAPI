@@ -44,6 +44,7 @@ interface ApiHandlerDeps {
   checkTemporaryAccounts: (groupId?: string, proxyConfig?: RouteProxyConfig, providerType?: TemporaryAccountProviderType) => Promise<TemporaryAccountCheckResult>;
   checkTemporaryAccountIds: (accountIds: string[], proxyConfig?: RouteProxyConfig, providerType?: TemporaryAccountProviderType) => Promise<TemporaryAccountCheckResult>;
   checkSingleTemporaryAccount: (accountId: string, proxyConfig?: RouteProxyConfig) => Promise<TemporaryAccountCheckResult>;
+  resetSingleTemporaryAccount: (accountId: string, proxyConfig?: RouteProxyConfig) => Promise<TemporaryAccountCheckResult>;
   discoverProviderModels: (siteId: string, apiKey: string, apiKeyName: string, request: http.IncomingMessage, kind?: string) => Promise<unknown>;
   syncAllProviderModels: (request: http.IncomingMessage, options?: ProviderModelSyncOptions) => Promise<ProviderModelSyncResult>;
   startCodexOAuth: () => Promise<{ state: string; authorizationUrl: string; redirectUri: string }>;
@@ -63,6 +64,7 @@ export function createApiHandler(deps: ApiHandlerDeps) {
     checkTemporaryAccounts,
     checkTemporaryAccountIds,
     checkSingleTemporaryAccount,
+    resetSingleTemporaryAccount,
     discoverProviderModels,
     syncAllProviderModels,
     startCodexOAuth,
@@ -270,6 +272,10 @@ export function createApiHandler(deps: ApiHandlerDeps) {
           if (method === "POST" && parts[4] === "check") {
             const body = await readJson(request);
             return sendJson(response, 200, await checkSingleTemporaryAccount(accountId, temporaryAccountCheckProxyFromBody(body)));
+          }
+          if (method === "POST" && parts[4] === "reset") {
+            const body = await readJson(request);
+            return sendJson(response, 200, await resetSingleTemporaryAccount(accountId, temporaryAccountCheckProxyFromBody(body)));
           }
           if (method === "PATCH") return sendJson(response, 200, store.updateTemporaryAccount(accountId, await readJson(request)));
           if (method === "DELETE") {

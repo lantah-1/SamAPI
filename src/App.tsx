@@ -189,6 +189,7 @@ export default function App() {
   const [temporaryAccountOAuthBusy, setTemporaryAccountOAuthBusy] = useState(false);
   const [temporaryAccountCheckingIds, setTemporaryAccountCheckingIds] = useState<string[]>([]);
   const [temporaryAccountQueuedIds, setTemporaryAccountQueuedIds] = useState<string[]>([]);
+  const [temporaryAccountResetting, setTemporaryAccountResetting] = useState<string | null>(null);
   const [temporaryAccountCheckProviderType, setTemporaryAccountCheckProviderType] = useState<Extract<TemporaryAccountProviderType, "gpt" | "grok">>("gpt");
   const [temporaryAccountUpdating, setTemporaryAccountUpdating] = useState<string | null>(null);
   const [temporaryAccountDeleting, setTemporaryAccountDeleting] = useState<string | null>(null);
@@ -985,6 +986,25 @@ export default function App() {
     }
   };
 
+  const resetTemporaryAccount = async (id: string) => {
+    if (temporaryAccountResetting || temporaryAccountChecking) return;
+    setTemporaryAccountResetting(id);
+    try {
+      const result = await api.resetTemporaryAccount(id);
+      const item = result.results[0];
+      if (item) applyTemporaryAccountCheckItem(item);
+      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
+      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
+      setTemporaryAccountsLoaded(true);
+      setTemporaryAccountsLoading(false);
+      setToast(item ? `额度已重置：${temporaryAccountAvailabilityLabels[item.availability]}` : "额度已重置");
+    } catch (error) {
+      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号额度重置失败");
+    } finally {
+      setTemporaryAccountResetting(null);
+    }
+  };
+
   const checkSelectedTemporaryAccounts = async () => {
     if (temporaryAccountChecking) return;
     const currentTypeAccountIds = new Set(
@@ -1540,6 +1560,7 @@ export default function App() {
                   setSelectedTemporaryAccountIds([]);
                 }}
                 updating={temporaryAccountUpdating}
+                resetting={temporaryAccountResetting}
                 deleting={temporaryAccountDeleting}
                 selectedAccountIds={selectedTemporaryAccountIds}
                 onSelectedAccountIds={setSelectedTemporaryAccountIds}
@@ -1552,6 +1573,7 @@ export default function App() {
                 onRetry={loadTemporaryAccountGroups}
                 onStrategyChange={(strategy) => mutate(async () => api.updateSettings({ temporaryAccountStrategy: strategy }), "临时账号策略已更新")}
                 onCheckAccount={checkTemporaryAccount}
+                onResetAccount={resetTemporaryAccount}
                 onCheckSelected={checkSelectedTemporaryAccounts}
                 onUpdateAccount={updateTemporaryAccount}
                 onDeleteAccount={deleteTemporaryAccount}
