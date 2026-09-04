@@ -135,11 +135,16 @@ export function createApiHandler(deps: ApiHandlerDeps) {
         if (method === "PATCH") return sendJson(response, 200, store.updateSettings(await readJson(request)));
       }
 
+      if (parts[1] === "backup") {
+        if (method === "GET") return sendJson(response, 200, store.exportBackup(), { "Cache-Control": "no-store" });
+        if (method === "POST") return sendJson(response, 200, store.importBackup(await readJson(request)));
+      }
+
       if (parts[1] === "auth" && method === "POST" && parts[2] === "password") {
         const body = await readJson(request);
         const currentPassword = typeof body.currentPassword === "string" ? body.currentPassword : "";
         const nextPassword = typeof body.nextPassword === "string" ? body.nextPassword : "";
-        if (!verifyAdminPassword(currentPassword)) return sendJson(response, 401, { error: "当前管理密码不正确" });
+        if (!verifyAdminPassword(currentPassword)) return sendJson(response, 400, { error: "当前管理密码不正确" });
         store.updateAdminPasswordHash(nextPassword);
         return sendJson(response, 200, { authenticated: false }, { "Set-Cookie": clearAdminSessionCookie() });
       }

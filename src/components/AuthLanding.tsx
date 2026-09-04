@@ -1,4 +1,4 @@
-import { Activity, KeyRound, LockKeyhole, LogIn, RefreshCw, Route, ShieldCheck } from "lucide-react";
+import { LockKeyhole, LogIn, RefreshCw, ShieldCheck } from "lucide-react";
 import { FormEvent, useState } from "react";
 import type { AuthStatus } from "../app/types";
 import { ActionButton, TextInput } from "./ui";
@@ -19,7 +19,7 @@ export function AuthLanding(props: {
   };
 
   return (
-    <main className="auth-page min-h-screen text-ink">
+    <main className="auth-page min-h-[100dvh] text-ink">
       <div className="grain" />
       <div className="auth-shell">
         <section className="auth-copy" aria-labelledby="auth-title">
@@ -27,39 +27,16 @@ export function AuthLanding(props: {
             <span className="auth-kicker-mark">
               <ShieldCheck className="h-4 w-4" />
             </span>
-            Local model gateway
+            本地模型网关
           </div>
           <h1 id="auth-title">SamAPI</h1>
           <p className="auth-intro">
             一个面向本地和私有部署的模型路由控制台，用来集中管理上游模型供应商、请求头模板、客户端密钥和路由策略。
           </p>
-          <div className="auth-metric-row" aria-label="SamAPI capability summary">
-            <div>
-              <strong>Proxy</strong>
-              <span>统一转发入口</span>
-            </div>
-            <div>
-              <strong>Keys</strong>
-              <span>客户端密钥</span>
-            </div>
-            <div>
-              <strong>Logs</strong>
-              <span>请求链路记录</span>
-            </div>
-          </div>
-          <div className="auth-feature-grid">
-            <div className="auth-feature">
-              <Route className="h-4 w-4" />
-              <span>在多个供应商、模型和 endpoint 之间切换路由。</span>
-            </div>
-            <div className="auth-feature">
-              <KeyRound className="h-4 w-4" />
-              <span>把上游 Key 和下游调用密钥分开管理。</span>
-            </div>
-            <div className="auth-feature">
-              <Activity className="h-4 w-4" />
-              <span>记录下游请求、上游响应和失败原因。</span>
-            </div>
+          <div className="auth-capabilities" aria-label="SamAPI 核心能力">
+            <span>统一转发</span>
+            <span>密钥隔离</span>
+            <span>链路记录</span>
           </div>
         </section>
 

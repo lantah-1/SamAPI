@@ -176,9 +176,11 @@ export function TemporaryAccountsView(props: {
   const visibleAccounts = visibleGroups.flatMap((group) => group.accounts);
   const visibleAccountIds = visibleAccounts.map((account) => account.id);
   const visibleAccountIdSet = new Set(visibleAccountIds);
-  const visibleAvailabilityStats = temporaryAccountAvailabilityStats(visibleAccounts);
   const selectedVisibleAccountIds = props.selectedAccountIds.filter((id) => visibleAccountIdSet.has(id));
   const selectedAccountIdSet = new Set(selectedVisibleAccountIds);
+  const availableAccountIds = visibleAccounts
+    .filter((account) => (account.availability || "unknown") === "available")
+    .map((account) => account.id);
   const unavailableAccountIds = visibleAccounts
     .filter((account) => (account.availability || "unknown") === "unavailable")
     .map((account) => account.id);
@@ -187,15 +189,30 @@ export function TemporaryAccountsView(props: {
     .map((account) => account.id);
   const checkingAccountIdSet = new Set(props.checkingAccountIds);
   const queuedAccountIdSet = new Set(props.queuedAccountIds);
+  const pendingCheckAccountIdSet = new Set([...props.checkingAccountIds, ...props.queuedAccountIds]);
+  const visibleAvailabilityStats = temporaryAccountAvailabilityStats(
+    visibleAccounts.filter((account) => !pendingCheckAccountIdSet.has(account.id))
+  );
   const visibleCheckingCount = props.checkingAccountIds.filter((id) => visibleAccountIdSet.has(id)).length;
   const visibleQueuedCount = props.queuedAccountIds.filter((id) => visibleAccountIdSet.has(id)).length;
   const currentTypeLabel = temporaryAccountProviderLabels[props.checkProviderType];
   const temporaryAccountStrategy = props.snapshot.settings.temporaryAccountStrategy || "sequential";
+  const [selectedStatusGroup, setSelectedStatusGroup] = useState<"all" | "available" | "unavailable" | "unknown" | null>(null);
+  const selectionMatches = (ids: string[]) =>
+    ids.length > 0 && ids.length === selectedVisibleAccountIds.length && ids.every((id) => selectedAccountIdSet.has(id));
+  const selectAccountGroup = (group: Exclude<typeof selectedStatusGroup, null>, ids: string[]) => {
+    const active = selectedStatusGroup === group && selectionMatches(ids);
+    setSelectedStatusGroup(active ? null : group);
+    props.onSelectedAccountIds(active ? [] : ids);
+  };
   const hasImportContent = props.draft.content.trim() || props.draft.contents.some((content) => content.trim());
   const [importFileError, setImportFileError] = useState("");
   useEffect(() => {
     if (props.editorOpen) setImportFileError("");
   }, [props.editorOpen]);
+  useEffect(() => {
+    setSelectedStatusGroup(null);
+  }, [props.checkProviderType]);
   const readImportFiles = async (files?: FileList | null) => {
     const selectedFiles = Array.from(files || []);
     if (selectedFiles.length === 0) return;
@@ -280,10 +297,19 @@ export function TemporaryAccountsView(props: {
                 当前 {currentTypeLabel} / {visibleAccounts.length} 个账号 / 全部 {totalAccounts} 个账号 / {currentProviderSite?.name || currentTypeLabel}
               </div>
             </div>
-            <div className="temp-account-stats" aria-label="临时账号状态统计">
-              <span><strong>{visibleAvailabilityStats.available}</strong>可用</span>
-              <span><strong>{visibleAvailabilityStats.unavailable}</strong>不可用</span>
-              <span><strong>{visibleAvailabilityStats.unknown}</strong>未检查</span>
+            <div className="temp-account-stats" role="group" aria-label="按状态选择账号">
+              <button type="button" className={selectedStatusGroup === "all" && selectionMatches(visibleAccountIds) ? "temp-account-stat-active" : ""} disabled={props.deleting !== null || visibleAccountIds.length === 0} aria-pressed={selectedStatusGroup === "all" && selectionMatches(visibleAccountIds)} onClick={() => selectAccountGroup("all", visibleAccountIds)}>
+                <strong>{visibleAccountIds.length}</strong>全部
+              </button>
+              <button type="button" className={selectedStatusGroup === "available" && selectionMatches(availableAccountIds) ? "temp-account-stat-active" : ""} disabled={props.deleting !== null || availableAccountIds.length === 0} aria-pressed={selectedStatusGroup === "available" && selectionMatches(availableAccountIds)} onClick={() => selectAccountGroup("available", availableAccountIds)}>
+                <strong>{visibleAvailabilityStats.available}</strong>可用
+              </button>
+              <button type="button" className={selectedStatusGroup === "unavailable" && selectionMatches(unavailableAccountIds) ? "temp-account-stat-active" : ""} disabled={props.deleting !== null || unavailableAccountIds.length === 0} aria-pressed={selectedStatusGroup === "unavailable" && selectionMatches(unavailableAccountIds)} onClick={() => selectAccountGroup("unavailable", unavailableAccountIds)}>
+                <strong>{visibleAvailabilityStats.unavailable}</strong>不可用
+              </button>
+              <button type="button" className={selectedStatusGroup === "unknown" && selectionMatches(uncheckedAccountIds) ? "temp-account-stat-active" : ""} disabled={props.deleting !== null || uncheckedAccountIds.length === 0} aria-pressed={selectedStatusGroup === "unknown" && selectionMatches(uncheckedAccountIds)} onClick={() => selectAccountGroup("unknown", uncheckedAccountIds)}>
+                <strong>{visibleAvailabilityStats.unknown}</strong>未检查
+              </button>
               {props.checking !== null ? <span><strong>{visibleCheckingCount}</strong>检测中</span> : null}
               {props.checking !== null ? <span><strong>{visibleQueuedCount}</strong>等待检测</span> : null}
             </div>
@@ -325,29 +351,20 @@ export function TemporaryAccountsView(props: {
               ) : null}
               <div className="temp-account-check-control">
                 <span className="temp-account-control-label temp-account-control-label-placeholder" aria-hidden="true">检查</span>
-                <ActionButton className="temp-account-check-action" type="button" tone="ghost" disabled={props.checking !== null || visibleAccounts.length === 0} onClick={() => props.onCheck()}>
-                  <RefreshCw className={`h-4 w-4 ${props.checking === "all" ? "animate-spin" : ""}`} />
-                  检查 {currentTypeLabel}
+                <ActionButton
+                  className="temp-account-check-action"
+                  type="button"
+                  tone="ghost"
+                  disabled={props.checking !== null || visibleAccounts.length === 0}
+                  onClick={selectedVisibleAccountIds.length > 0 ? props.onCheckSelected : () => props.onCheck()}
+                >
+                  <RefreshCw className={`h-4 w-4 ${props.checking !== null ? "animate-spin" : ""}`} />
+                  {selectedVisibleAccountIds.length > 0 ? `检查已选 ${selectedVisibleAccountIds.length}` : `检查 ${currentTypeLabel}`}
                 </ActionButton>
               </div>
             </div>
             <div className="temp-account-toolbar-actions">
-              <div className="temp-account-selection-group" role="group" aria-label="选择账号">
-                <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || visibleAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(visibleAccountIds)}>
-                  全部 <strong>{visibleAccountIds.length}</strong>
-                </ActionButton>
-                <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || unavailableAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(unavailableAccountIds)}>
-                  不可用 <strong>{unavailableAccountIds.length}</strong>
-                </ActionButton>
-                <ActionButton type="button" tone="ghost" disabled={props.deleting !== null || uncheckedAccountIds.length === 0} onClick={() => props.onSelectedAccountIds(uncheckedAccountIds)}>
-                  未检查 <strong>{uncheckedAccountIds.length}</strong>
-                </ActionButton>
-              </div>
               <div className="temp-account-bulk-actions">
-                <ActionButton type="button" disabled={props.checking !== null || props.deleting !== null || selectedVisibleAccountIds.length === 0} onClick={props.onCheckSelected}>
-                  <RefreshCw className={`h-4 w-4 ${props.checking === "selected" ? "animate-spin" : ""}`} />
-                  复检{selectedVisibleAccountIds.length > 0 ? ` ${selectedVisibleAccountIds.length}` : ""}
-                </ActionButton>
                 <ActionButton type="button" tone="danger" disabled={props.deleting !== null || selectedVisibleAccountIds.length === 0} onClick={props.onDeleteSelected}>
                   <Trash2 className="h-4 w-4" />
                   删除{selectedVisibleAccountIds.length > 0 ? ` ${selectedVisibleAccountIds.length}` : ""}
@@ -435,7 +452,7 @@ export function TemporaryAccountsView(props: {
                                 <button
                                   className={`account-status account-status-${checking ? "checking" : queued ? "queued" : availability}`}
                                   type="button"
-                                  disabled={props.checking !== null || props.deleting !== null}
+                                  disabled={checking || queued || props.deleting !== null || (props.checking !== null && props.checking !== "individual")}
                                   onClick={() => props.onCheckAccount(account.id)}
                                   title={checking ? "正在检测账号" : queued ? "账号等待检测" : "重新检查账号"}
                                   aria-label={`${checking ? "正在检测" : queued ? "等待检测" : "重新检查"} ${account.label}`}

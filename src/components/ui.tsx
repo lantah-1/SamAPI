@@ -143,7 +143,8 @@ export function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>
           align="start"
           side="bottom"
           sideOffset={6}
-          avoidCollisions={false}
+          avoidCollisions
+          collisionPadding={12}
           onOpenAutoFocus={(event) => event.preventDefault()}
           onClick={(event) => event.stopPropagation()}
           onKeyDown={(event) => event.stopPropagation()}

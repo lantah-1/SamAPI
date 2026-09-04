@@ -142,12 +142,21 @@ export function SitesView(props: {
         <div className="site-list">
           {props.snapshot.sites.map((site) => {
             const enabled = site.enabled !== false;
+            const enabledAddresses = site.addresses.filter((address) => address.enabled);
+            const proxyModes = enabledAddresses.map((address) => normalizedRouteProxy(address.proxy).mode);
+            const proxyModeCounts = proxyModes.reduce<Partial<Record<RouteProxyConfig["mode"], number>>>((counts, mode) => {
+              counts[mode] = (counts[mode] || 0) + 1;
+              return counts;
+            }, {});
+            const proxySummary = (Object.keys(proxyModeCounts) as RouteProxyConfig["mode"][])
+              .map((mode) => `${routeProxyModeLabels[mode]}${proxyModes.length > 1 ? ` ${proxyModeCounts[mode]}` : ""}`)
+              .join("、");
             return (
               <article key={site.id} className="record">
                 <div>
                   <div className="record-title">{site.name}</div>
                   <div className="record-meta">
-                    {siteTypeLabels[site.siteType || "unknown"]} / {site.addresses.length} 个地址 / {enabled ? "已启用" : "已停用"}
+                    {siteTypeLabels[site.siteType || "unknown"]} / {site.addresses.length} 个地址 / {enabled ? "已启用" : "已停用"} / 代理：{proxySummary || "无启用地址"}
                   </div>
                 </div>
                 <div className="record-actions">
@@ -176,13 +185,14 @@ export function SitesView(props: {
 
       {props.editorOpen ? (
         <div className="modal-backdrop" role="presentation">
-          <form onSubmit={props.onSubmit} className="modal-panel" role="dialog" aria-modal="true" aria-label="站点编辑">
-            <div className="form-head">
+          <form onSubmit={props.onSubmit} className="modal-panel site-editor-modal" role="dialog" aria-modal="true" aria-label="站点编辑">
+            <div className="form-head site-editor-head">
               <h2>{props.draft.id ? "编辑站点" : "新增站点"}</h2>
               <ActionButton type="button" tone="ghost" onClick={props.onClose} title="关闭">
                 <X className="h-4 w-4" />
               </ActionButton>
             </div>
+            <div className="site-editor-body">
             <div className="form-grid">
               <label>
                 名称
@@ -280,7 +290,8 @@ export function SitesView(props: {
                 );
               })}
             </div>
-            <div className="mt-4 flex flex-wrap justify-between gap-2">
+            </div>
+            <div className="site-editor-actions">
               <ActionButton
                 type="button"
                 tone="ghost"

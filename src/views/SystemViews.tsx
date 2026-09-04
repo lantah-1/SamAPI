@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Braces,
   Check,
   ChevronDown,
@@ -6,6 +7,7 @@ import {
   ChevronUp,
   Copy,
   Database,
+  Download,
   KeyRound,
   LockKeyhole,
   Map,
@@ -22,6 +24,8 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import type {
+  AppBackup,
+  AppBackupImportResult,
   AppSettings,
   AppSnapshot,
   AppThemeId,
@@ -330,27 +334,82 @@ export function SettingsView(props: {
   onSave: (settings: Partial<AppSettings>) => void;
   onPasswordChange: (currentPassword: string, nextPassword: string) => Promise<void>;
   onThemeChange: (themeId: AppThemeId) => void;
+  onExportBackup: () => Promise<AppBackup>;
+  onImportBackup: (backup: AppBackup) => Promise<AppBackupImportResult>;
 }) {
   const [maxRequestLogs, setMaxRequestLogs] = useState(String(props.snapshot.settings.maxRequestLogs));
   const [requestTimeoutSeconds, setRequestTimeoutSeconds] = useState(String(props.snapshot.settings.requestTimeoutSeconds || 60));
   const [adminSessionTtlMinutes, setAdminSessionTtlMinutes] = useState(String(props.snapshot.settings.adminSessionTtlMinutes || 30));
   const [themeId, setThemeId] = useState<AppThemeId>(props.snapshot.settings.themeId || "fresh");
+  const [retryCodeCounts, setRetryCodeCounts] = useState(props.snapshot.settings.upstreamRetryCodeCounts);
+  const [retryStatusCode, setRetryStatusCode] = useState("");
+  const [retryCount, setRetryCount] = useState("");
+  const [retryError, setRetryError] = useState("");
   const [currentPassword, setCurrentPassword] = useState("");
   const [nextPassword, setNextPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [passwordError, setPasswordError] = useState("");
+  const [backupError, setBackupError] = useState("");
+  const [pendingBackup, setPendingBackup] = useState<AppBackup | null>(null);
+  const backupFileRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     setMaxRequestLogs(String(props.snapshot.settings.maxRequestLogs));
     setRequestTimeoutSeconds(String(props.snapshot.settings.requestTimeoutSeconds || 60));
     setAdminSessionTtlMinutes(String(props.snapshot.settings.adminSessionTtlMinutes || 30));
     setThemeId(props.snapshot.settings.themeId || "fresh");
-  }, [props.snapshot.settings.adminSessionTtlMinutes, props.snapshot.settings.maxRequestLogs, props.snapshot.settings.requestTimeoutSeconds, props.snapshot.settings.themeId]);
+    setRetryCodeCounts(props.snapshot.settings.upstreamRetryCodeCounts);
+  }, [props.snapshot.settings.adminSessionTtlMinutes, props.snapshot.settings.maxRequestLogs, props.snapshot.settings.requestTimeoutSeconds, props.snapshot.settings.themeId, props.snapshot.settings.upstreamRetryCodeCounts]);
 
   const chooseTheme = (nextThemeId: AppThemeId) => {
     setThemeId(nextThemeId);
     props.onThemeChange(nextThemeId);
   };
+
+  const addRetryCodeCount = () => {
+    setRetryError("");
+    const statusCode = Number(retryStatusCode);
+    const count = Number(retryCount);
+    if (!Number.isInteger(statusCode) || statusCode < 400 || statusCode > 599) {
+      setRetryError("状态码需要是 400-599 之间的整数");
+      return;
+    }
+    if (!Number.isInteger(count) || count < 0) {
+      setRetryError("重试次数需要是不小于 0 的整数");
+      return;
+    }
+    setRetryCodeCounts((current) => {
+      const next = current.filter((item) => item.statusCode !== statusCode);
+      next.push({ statusCode, count });
+      return next.sort((a, b) => a.statusCode - b.statusCode);
+    });
+    setRetryStatusCode("");
+    setRetryCount("");
+  };
+
+  const removeRetryCodeCount = (statusCode: number) => {
+    setRetryCodeCounts((current) => current.filter((item) => item.statusCode !== statusCode));
+  };
+
+  const updateRetryCount = (statusCode: number, count: number) => {
+    setRetryCodeCounts((current) => current.map((item) => (item.statusCode === statusCode ? { statusCode, count } : item)));
+  };
+
+  // number 输入框的步进按钮 / 上下方向键 / 滚轮会按 step 调整值（如 500 → 499），
+  // 状态码和重试次数都禁止这种隐式步进，只允许直接输入数字。
+  const preventNumberStep = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "ArrowUp" || event.key === "ArrowDown") event.preventDefault();
+  };
+
+  const preventNumberWheel = (event: React.WheelEvent<HTMLInputElement>) => {
+    event.currentTarget.blur();
+  };
+
+  // 只保留数字字符：去掉 e/E、+、-、小数点，避免 1e3 或 2.5 之类被 Number() 解析。
+  const digitsOnlyOnChange =
+    (setter: (value: string) => void) => (event: React.ChangeEvent<HTMLInputElement>) => {
+      setter(event.target.value.replace(/[^\d]/g, ""));
+    };
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -358,7 +417,8 @@ export function SettingsView(props: {
       maxRequestLogs: Number(maxRequestLogs),
       requestTimeoutSeconds: Number(requestTimeoutSeconds),
       adminSessionTtlMinutes: Number(adminSessionTtlMinutes),
-      themeId
+      themeId,
+      upstreamRetryCodeCounts: retryCodeCounts
     });
   };
 
@@ -368,8 +428,8 @@ export function SettingsView(props: {
       setPasswordError("请输入当前管理密码");
       return;
     }
-    if (nextPassword.trim().length < 8) {
-      setPasswordError("新管理密码至少需要 8 个字符");
+    if (nextPassword.length < 4 || !nextPassword.trim()) {
+      setPasswordError("新管理密码至少需要 4 个字符");
       return;
     }
     if (nextPassword !== confirmPassword) {
@@ -386,7 +446,75 @@ export function SettingsView(props: {
     }
   };
 
+  const exportBackup = async () => {
+    setBackupError("");
+    try {
+      const backup = await props.onExportBackup();
+      const date = backup.exportedAt.slice(0, 10) || new Date().toISOString().slice(0, 10);
+      const url = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `samapi-backup-${date}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setBackupError(error instanceof Error ? error.message : "导出备份失败");
+    }
+  };
+
+  const chooseBackupFile = async (files: FileList | null) => {
+    setBackupError("");
+    setPendingBackup(null);
+    const file = files?.[0];
+    if (!file) return;
+    try {
+      if (file.size > 20 * 1024 * 1024) throw new Error("备份文件不能超过 20 MB");
+      const parsed = JSON.parse(await file.text()) as Partial<AppBackup>;
+      if (parsed.format !== "samapi-backup" || parsed.version !== 1 || !parsed.data) {
+        throw new Error("请选择由 SamAPI 导出的有效备份文件");
+      }
+      const data = parsed.data as Partial<AppBackup["data"]>;
+      if (
+        !Array.isArray(data.sites) ||
+        !Array.isArray(data.apiKeys) ||
+        !Array.isArray(data.providerApiKeyGroups) ||
+        !Array.isArray(data.temporaryAccountGroups) ||
+        !Array.isArray(data.headerTemplates) ||
+        !Array.isArray(data.routes) ||
+        !Array.isArray(data.routeDisplayGroups)
+      ) {
+        throw new Error("备份文件结构不完整或已损坏");
+      }
+      setPendingBackup(parsed as AppBackup);
+    } catch (error) {
+      setBackupError(error instanceof Error ? error.message : "读取备份文件失败");
+    } finally {
+      if (backupFileRef.current) backupFileRef.current.value = "";
+    }
+  };
+
+  const importBackup = async () => {
+    if (!pendingBackup) return;
+    setBackupError("");
+    try {
+      await props.onImportBackup(pendingBackup);
+      setPendingBackup(null);
+    } catch (error) {
+      setBackupError(error instanceof Error ? error.message : "导入备份失败");
+    }
+  };
+
+  const backupCounts = pendingBackup ? {
+    sites: pendingBackup.data.sites.length,
+    routes: pendingBackup.data.routes.length,
+    providerKeys: pendingBackup.data.providerApiKeyGroups.length,
+    temporaryAccounts: pendingBackup.data.temporaryAccountGroups.reduce((total, group) => total + group.accounts.length, 0)
+  } : null;
+
   return (
+    <>
     <section className="panel settings-panel p-4">
       <div className="form-head">
         <div>
@@ -399,6 +527,41 @@ export function SettingsView(props: {
         </ActionButton>
       </div>
       <form onSubmit={submit} className="form-grid">
+        <div className="settings-section form-span-2">
+          <div className="settings-section-head">
+            <div>
+              <h3>数据备份</h3>
+              <p>导出或恢复全部业务配置。请求日志与管理员密码不会被导出，也不会在导入时被覆盖。</p>
+            </div>
+          </div>
+          <div className="settings-backup-box">
+            <div className="settings-backup-icon" aria-hidden="true"><Database className="h-5 w-5" /></div>
+            <div className="settings-backup-copy">
+              <strong>完整配置备份</strong>
+              <span>包含站点、路由、上下游密钥、临时账号、请求头模板和系统设置。</span>
+            </div>
+            <span className="settings-backup-warning"><ShieldCheck className="h-4 w-4" />文件包含明文凭据，请存放在安全位置。</span>
+            <div className="settings-backup-actions">
+              <ActionButton type="button" tone="ghost" disabled={props.busy} onClick={() => void exportBackup()}>
+                <Download className="h-4 w-4" />
+                导出备份
+              </ActionButton>
+              <ActionButton type="button" tone="ghost" disabled={props.busy} onClick={() => backupFileRef.current?.click()}>
+                <Upload className="h-4 w-4" />
+                导入备份
+              </ActionButton>
+              <input
+                ref={backupFileRef}
+                className="settings-backup-file"
+                type="file"
+                accept=".json,application/json"
+                onChange={(event) => void chooseBackupFile(event.target.files)}
+              />
+            </div>
+          </div>
+          {backupError ? <div className="auth-error mt-3" role="alert">{backupError}</div> : null}
+        </div>
+
         <div className="settings-section form-span-2">
           <div className="settings-section-head">
             <div>
@@ -539,6 +702,86 @@ export function SettingsView(props: {
             />
           </label>
         </div>
+        <div className="settings-section form-span-2">
+          <div className="settings-section-head">
+            <div>
+              <h3>上游错误码重试配置</h3>
+              <p>上游返回对应状态码时，在换下一个目标地址之前重试的次数。只有在这里配置过的错误码才会重试；未配置的错误码不重试。配置 0 表示禁用该错误码的重试（立即换下一个目标地址）。</p>
+            </div>
+          </div>
+          <div className="settings-retry-add-row">
+            <label>
+              状态码
+              <TextInput
+                type="number"
+                min={400}
+                max={599}
+                step={1}
+                placeholder="如 502"
+                value={retryStatusCode}
+                onChange={digitsOnlyOnChange(setRetryStatusCode)}
+                onKeyDown={preventNumberStep}
+                onWheel={preventNumberWheel}
+              />
+            </label>
+            <label>
+              重试次数
+              <TextInput
+                type="number"
+                min={0}
+                step={1}
+                placeholder="不设上限"
+                value={retryCount}
+                onChange={digitsOnlyOnChange(setRetryCount)}
+                onKeyDown={preventNumberStep}
+                onWheel={preventNumberWheel}
+              />
+            </label>
+            <ActionButton type="button" tone="ghost" disabled={props.busy} onClick={addRetryCodeCount}>
+              <Plus className="h-4 w-4" />
+              添加
+            </ActionButton>
+          </div>
+          {retryError ? <div className="auth-error mt-3" role="alert">{retryError}</div> : null}
+          {retryCodeCounts.length > 0 ? (
+            <div className="settings-retry-list">
+              {retryCodeCounts.map((item) => (
+                <div key={item.statusCode} className="settings-retry-row">
+                  <span className="settings-retry-code">HTTP {item.statusCode}</span>
+                  <label className="settings-retry-count-label">
+                    重试次数
+                    <TextInput
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={String(item.count)}
+                      onChange={digitsOnlyOnChange((value) => {
+                        const count = Number(value);
+                        if (value === "" || Number.isInteger(count)) {
+                          updateRetryCount(item.statusCode, value === "" ? 0 : count);
+                        }
+                      })}
+                      onKeyDown={preventNumberStep}
+                      onWheel={preventNumberWheel}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="action action-ghost settings-retry-remove"
+                    title="删除配置"
+                    aria-label={`删除 HTTP ${item.statusCode} 的重试配置`}
+                    onClick={() => removeRetryCodeCount(item.statusCode)}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    删除
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="settings-retry-empty">还没有配置错误码重试次数。</p>
+          )}
+        </div>
         <div className="flex justify-end">
           <ActionButton type="submit">
             <Save className="h-4 w-4" />
@@ -547,6 +790,35 @@ export function SettingsView(props: {
         </div>
       </form>
     </section>
+    {pendingBackup && backupCounts ? (
+      <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !props.busy) setPendingBackup(null);
+      }}>
+        <section className="modal-panel settings-import-modal" role="dialog" aria-modal="true" aria-label="确认导入备份">
+          <div className="settings-import-symbol" aria-hidden="true"><AlertTriangle className="h-6 w-6" /></div>
+          <div>
+            <h2>确认覆盖现有配置？</h2>
+            <p className="settings-import-description">导入会用备份中的业务配置替换当前配置，此操作无法在页面中撤销。当前请求日志和管理员密码将保留。</p>
+          </div>
+          <div className="settings-import-summary">
+            <span><strong>{backupCounts.sites}</strong> 个站点</span>
+            <span><strong>{backupCounts.routes}</strong> 条路由</span>
+            <span><strong>{backupCounts.providerKeys}</strong> 个上游密钥分组</span>
+            <span><strong>{backupCounts.temporaryAccounts}</strong> 个临时账号</span>
+          </div>
+          <div className="settings-import-meta">备份时间：{new Date(pendingBackup.exportedAt).toLocaleString("zh-CN")}</div>
+          {backupError ? <div className="auth-error" role="alert">{backupError}</div> : null}
+          <div className="settings-import-actions">
+            <ActionButton type="button" tone="ghost" disabled={props.busy} onClick={() => setPendingBackup(null)}>取消</ActionButton>
+            <ActionButton type="button" tone="danger" disabled={props.busy} onClick={() => void importBackup()}>
+              <Upload className="h-4 w-4" />
+              {props.busy ? "正在导入..." : "确认导入并覆盖"}
+            </ActionButton>
+          </div>
+        </section>
+      </div>
+    ) : null}
+    </>
   );
 }
 

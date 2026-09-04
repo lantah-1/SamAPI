@@ -12,7 +12,8 @@ import type {
   TemporaryAccountAvailability,
   TemporaryAccountImportMode,
   TemporaryAccountProviderType,
-  TemporaryAccountQuotaStage
+  TemporaryAccountQuotaStage,
+  UpstreamRetryCodeCount
 } from "../../shared/types.js";
 
 export const ENDPOINTS = ["messages", "chat/completions", "responses"] as const;
@@ -34,7 +35,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   requestTimeoutSeconds: 60,
   themeId: "fresh",
   adminSessionTtlMinutes: 30,
-  temporaryAccountStrategy: "sequential"
+  temporaryAccountStrategy: "sequential",
+  upstreamRetryCodeCounts: []
 };
 
 export function now() {
@@ -77,6 +79,23 @@ export function normalizeProviderModelSyncStatus(value: unknown): "success" | "f
   return undefined;
 }
 
+export function normalizeUpstreamRetryCodeCounts(value: unknown): UpstreamRetryCodeCount[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<number>();
+  const output: UpstreamRetryCodeCount[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) continue;
+    const statusCode = Number(item.statusCode);
+    const count = Number(item.count);
+    if (!Number.isInteger(statusCode) || statusCode < 100 || statusCode > 599) continue;
+    if (!Number.isInteger(count) || count < 0) continue;
+    if (seen.has(statusCode)) continue;
+    seen.add(statusCode);
+    output.push({ statusCode, count });
+  }
+  return output.sort((a, b) => a.statusCode - b.statusCode);
+}
+
 export function normalizeSettings(input?: Partial<AppSettings>): AppSettings {
   const maxRequestLogs = Number(input?.maxRequestLogs ?? DEFAULT_SETTINGS.maxRequestLogs);
   const requestTimeoutSeconds = Number(input?.requestTimeoutSeconds ?? DEFAULT_SETTINGS.requestTimeoutSeconds);
@@ -92,7 +111,8 @@ export function normalizeSettings(input?: Partial<AppSettings>): AppSettings {
     adminSessionTtlMinutes: Number.isFinite(adminSessionTtlMinutes)
       ? Math.min(60 * 24 * 30, Math.max(1, Math.floor(adminSessionTtlMinutes)))
       : DEFAULT_SETTINGS.adminSessionTtlMinutes,
-    temporaryAccountStrategy
+    temporaryAccountStrategy,
+    upstreamRetryCodeCounts: normalizeUpstreamRetryCodeCounts(input?.upstreamRetryCodeCounts)
   };
 }
 
@@ -400,6 +420,9 @@ export function accountHasUsableQuota(account: TemporaryAccount) {
 
 export function temporaryAccountCanBeUsed(account: TemporaryAccount) {
   if (account.availability === "unavailable") return false;
+  // An unchecked account may carry stale quota data from an import or a failed
+  // health check. Let the real API request determine whether it can be used.
+  if (account.availability !== "available") return true;
   return accountHasUsableQuota(account);
 }
 

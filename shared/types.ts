@@ -418,12 +418,19 @@ export interface RequestLogPage {
   offset: number;
 }
 
+export interface UpstreamRetryCodeCount {
+  statusCode: number;
+  count: number;
+}
+
 export interface AppSettings {
   maxRequestLogs: number;
   requestTimeoutSeconds: number;
   themeId: AppThemeId;
   adminSessionTtlMinutes: number;
   temporaryAccountStrategy: GroupRouteStrategy;
+  /** 上游返回对应错误码时的重试次数配置；仅配置过的错误码会重试，0 表示禁用。 */
+  upstreamRetryCodeCounts: UpstreamRetryCodeCount[];
 }
 
 export interface AuthSession {
@@ -441,6 +448,28 @@ export interface AppDatabase {
   routeDisplayGroups: RouteDisplayGroup[];
   settings: AppSettings;
   adminPasswordHash?: string;
+}
+
+export interface AppBackupData extends Omit<AppDatabase, "adminPasswordHash"> {}
+
+export interface AppBackup {
+  format: "samapi-backup";
+  version: 1;
+  exportedAt: string;
+  data: AppBackupData;
+}
+
+export interface AppBackupImportResult {
+  ok: true;
+  importedAt: string;
+  counts: {
+    sites: number;
+    apiKeys: number;
+    providerApiKeyGroups: number;
+    temporaryAccounts: number;
+    headerTemplates: number;
+    routes: number;
+  };
 }
 
 export interface AppSnapshot extends Omit<AppDatabase, "providerApiKeyGroups" | "adminPasswordHash"> {

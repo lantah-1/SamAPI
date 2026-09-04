@@ -5,8 +5,10 @@ export function NavButton(props: { item: (typeof allNavItems)[number]; active: b
   const Icon = props.item.icon;
   return (
     <button
+      type="button"
       onClick={() => props.onClick(props.item.id)}
       title={props.item.label}
+      aria-current={props.active ? "page" : undefined}
       className={`nav-button ${props.active ? "nav-button-active" : ""} ${props.className || ""}`}
     >
       <Icon className="h-5 w-5" />

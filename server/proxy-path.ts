@@ -17,7 +17,7 @@ export function normalizedProxyPath(pathname: string) {
 export function proxyPathInfo(pathname: string): { supported: boolean; kind: ProxyKind; routeNameFromPath?: string } {
   const normalized = normalizedProxyPath(pathname);
   if (normalized === "/proxy") return { supported: true, kind: "generic" };
-  if (["/proxy/models", "/proxy/v1/models", "/proxy/v1beta/models"].includes(normalized)) return { supported: true, kind: "models" };
+  if (["/proxy/models", "/proxy/v1/models"].includes(normalized)) return { supported: true, kind: "models" };
   if (["/proxy/messages", "/proxy/v1/messages"].includes(normalized)) return { supported: true, kind: "messages" };
   if (
     [
@@ -35,7 +35,7 @@ export function proxyPathInfo(pathname: string): { supported: boolean; kind: Pro
     return { supported: true, kind: "responses" };
   }
 
-  const geminiMatch = normalized.match(/^\/proxy\/(?:v1|v1beta)\/models\/([^/]+):(generateContent|streamGenerateContent)$/);
+  const geminiMatch = normalized.match(/^\/proxy\/v1\/models\/([^/]+):(generateContent|streamGenerateContent)$/);
   if (geminiMatch) {
     return {
       supported: true,
@@ -55,7 +55,7 @@ export function isSupportedProxyPath(pathname: string) {
 }
 
 export function unsupportedProxyMessage() {
-  return "代理入口支持 /proxy、/proxy/v1/models、/proxy/v1/messages、/proxy/v1/chat/completions、/proxy/v1/responses 和 /proxy/v1beta/models/{model}:generateContent";
+  return "代理入口支持 /proxy、/proxy/v1/models、/proxy/v1/messages、/proxy/v1/chat/completions、/proxy/v1/responses 和 /proxy/v1/models/{model}:generateContent";
 }
 
 export function proxyKindLabel(kind: ProxyKind, pathname: string) {

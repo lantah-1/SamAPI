@@ -1,4 +1,5 @@
 import http from "node:http";
+import { setTimeout as sleep } from "node:timers/promises";
 import { URL } from "node:url";
 import type { JsonStore } from "../store.js";
 import {
@@ -65,7 +66,7 @@ import {
   stripGrokEncryptedReasoning
 } from "../providers/grok.js";
 import type { ProxyExecutionCandidate } from "../routing.js";
-import type { RequestLog, RequestLogStatus, RequestLogUpstreamRequest, RouteRecord, SiteAddress } from "../../shared/types.js";
+import type { RequestLog, RequestLogProxy, RequestLogStatus, RequestLogUpstreamRequest, RouteRecord, SiteAddress, UpstreamRetryCodeCount } from "../../shared/types.js";
 
 function chainSummary(input: {
   downstreamModel?: string;
@@ -92,20 +93,54 @@ function isClientAbortError(signal: AbortSignal, error: unknown) {
   return /客户端已断开连接|\b(?:this|the) operation was aborted\b/i.test(message);
 }
 
-const UPSTREAM_429_RETRY_COUNT = 5;
+export interface UpstreamRetryEvent {
+  proxy: RequestLogProxy;
+  statusCode: number;
+  contentType?: string;
+  text?: string;
+  durationMs: number;
+}
 
-async function fetchWith429Retry(
+/**
+ * 计算某个状态码应重试的次数。
+ * - 成功响应（<400）永不重试。
+ * - 已配置的错误码（设置页「错误码重试配置」）使用配置的次数，0 表示不重试。
+ * - 未配置的错误码不重试。
+ */
+export function upstreamRetryCountForStatus(retryCounts: UpstreamRetryCodeCount[], statusCode: number) {
+  if (statusCode < 400) return 0;
+  const configured = retryCounts.find((item) => item.statusCode === statusCode);
+  return configured ? Math.max(0, configured.count) : 0;
+}
+
+async function fetchWithUpstreamRetry(
   target: Parameters<typeof fetchWithRouteProxy>[0],
   init: Parameters<typeof fetchWithRouteProxy>[1],
   routeProxyConfig: Parameters<typeof fetchWithRouteProxy>[2],
-  timeoutMs: Parameters<typeof fetchWithRouteProxy>[3]
-) {
+  timeoutMs: Parameters<typeof fetchWithRouteProxy>[3],
+  retryCounts: UpstreamRetryCodeCount[],
+  onRetry?: (event: UpstreamRetryEvent, retryNumber: number) => void | Promise<void>
+): Promise<{ response: Response; proxy: RequestLogProxy }> {
   let result = await fetchWithRouteProxy(target, init, routeProxyConfig, timeoutMs);
-  for (let retry = 0; retry < UPSTREAM_429_RETRY_COUNT && result.response.status === 429; retry += 1) {
+  // 429（限流）、500（上游服务错误）等瞬时故障会按设置页的配置重试，未配置的状态码不重试。
+  // 每次重试都先读取响应体并立即通知调用方记录日志，再随机等待 1-3 秒
+  // 发起下一次重试，避免对仍处于故障/限流中的上游连续冲击；返回不需要重试的状态码时立即停止。
+  for (let retry = 0; retry < upstreamRetryCountForStatus(retryCounts, result.response.status); retry += 1) {
+    const attemptStartedAt = Date.now();
+    const text = await result.response.text().catch(() => "");
+    await onRetry?.({
+      proxy: result.proxy,
+      statusCode: result.response.status,
+      contentType: result.response.headers.get("content-type") || undefined,
+      text,
+      durationMs: Date.now() - attemptStartedAt
+    }, retry + 1);
     result.response.body?.cancel().catch(() => {});
+    // 重试前随机等待 1000-3000ms。
+    await sleep(Math.floor(1000 + Math.random() * 2000));
     result = await fetchWithRouteProxy(target, init, routeProxyConfig, timeoutMs);
   }
-  return result;
+  return { response: result.response, proxy: result.proxy };
 }
 
 
@@ -228,8 +263,36 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
       requestHeaders: maskRequestHeaders(request.headers)
     };
 
+    // Create the log before reading the request body. A client can keep the body open for a
+    // while, and the request should still be visible as "pending" during that time.
+    const initialProxyInfo = proxyPathInfo(url.pathname);
+    const initialDownstreamEndpoint = proxyKindLabel(initialProxyInfo.kind, url.pathname);
+    const pendingLog = store.recordRequestLog({
+      ...baseLog,
+      routeName: initialProxyInfo.kind === "models" ? "proxy-models" : "unknown",
+      model: initialProxyInfo.kind === "models" ? "模型列表" : "unknown",
+      requestBody: undefined,
+      status: "pending",
+      statusCode: 0,
+      durationMs: 0,
+      downstream: {
+        model: initialProxyInfo.kind === "models" ? "模型列表" : "unknown",
+        endpoint: initialDownstreamEndpoint,
+        userAgent: baseLog.userAgent,
+        path: url.pathname,
+        method: request.method || "POST"
+      },
+      summary: chainSummary({
+        downstreamModel: initialProxyInfo.kind === "models" ? "模型列表" : "unknown",
+        downstreamEndpoint: initialDownstreamEndpoint,
+        downstreamUa: baseLog.userAgent,
+        status: "pending"
+      })
+    });
+    const pendingLogId = pendingLog.id;
+
     if (request.method === "HEAD") {
-      store.recordRequestLog({
+      store.updateRequestLog(pendingLogId, {
         ...baseLog,
         routeName: "proxy-healthcheck",
         providerName: "健康检查",
@@ -250,7 +313,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
     try {
       body = await readJson(request);
     } catch (error) {
-      store.recordRequestLog({
+      store.updateRequestLog(pendingLogId, {
         ...baseLog,
         requestBody: undefined,
         status: "failed",
@@ -279,10 +342,30 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
       method: request.method || "POST"
     };
 
+    // Refresh the early pending entry with the parsed body and resolved route context.
+    store.updateRequestLog(pendingLogId, {
+      ...requestLogBase,
+      ...routeLogContext,
+      requestBody: body,
+      status: "pending",
+      statusCode: 0,
+      durationMs: Date.now() - startedAt,
+      downstream: downstreamLog,
+      summary: chainSummary({
+        downstreamModel: downstreamLog.model,
+        downstreamEndpoint,
+        downstreamUa,
+        routeModel: routeLogContext.model,
+        routeEndpoint: routeLogContext.endpoint,
+        routeUa: downstreamUa,
+        status: "pending"
+      })
+    });
+
     const apiKey = requestApiKey(request, url);
     const authenticatedApiKey = store.verifyApiKey(apiKey);
     if (!authenticatedApiKey) {
-      store.recordRequestLog({
+      store.updateRequestLog(pendingLogId, {
         ...requestLogBase,
         ...routeLogContext,
         requestBody: body,
@@ -305,7 +388,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
 
     if (proxyInfo.kind === "models") {
       if (request.method !== "GET") {
-        store.recordRequestLog({
+        store.updateRequestLog(pendingLogId, {
           ...requestLogBase,
           routeName: "proxy-models",
           providerName: "模型列表",
@@ -328,7 +411,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
         payload.data = payload.data.filter((item) => allowed.has(item.id));
       }
       const modelIds = payload.data.map((item) => item.id).filter((item): item is string => typeof item === "string");
-      store.recordRequestLog({
+      store.updateRequestLog(pendingLogId, {
         ...requestLogBase,
         routeName: "proxy-models",
         providerName: "模型列表",
@@ -546,12 +629,48 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
           };
           const attemptStartedAt = Date.now();
           try {
-            let { response: upstream, proxy: attemptProxy } = await fetchWith429Retry(CODEX_BACKEND_RESPONSES_URL, {
+            const recordCodexRetry = (retryEvent: UpstreamRetryEvent, retryNumber: number) => {
+              store.recordRequestLog({
+                ...requestLogBase,
+                routeId: route.id,
+                routeName: route.name,
+                endpoint: route.endpoint,
+                providerName: candidate.site.name,
+                providerId: candidate.site.id,
+                addressLabel: "Codex Backend",
+                model: candidate.model,
+                requestBody: body,
+                status: "failed",
+                statusCode: retryEvent.statusCode,
+                durationMs: Date.now() - attemptStartedAt,
+                requestHeaders: {
+                  ...requestLogBase.requestHeaders,
+                  ...codexAuthLog
+                },
+                upstreamUrl: CODEX_BACKEND_RESPONSES_URL,
+                upstreamContentType: retryEvent.contentType,
+                responsePreview: retryEvent.text ? responsePreview(retryEvent.text) : undefined,
+                errorMessage: `上游返回 ${retryEvent.statusCode}，正在重试第 ${retryNumber} 次`,
+                downstream: downstreamLog,
+                routeTarget: codexRouteTargetLog,
+                proxy: retryEvent.proxy,
+                summary: chainSummary({
+                  downstreamModel: downstreamLog.model,
+                  downstreamEndpoint,
+                  downstreamUa,
+                  routeModel: candidate.model,
+                  routeEndpoint: route.endpoint,
+                  routeUa: codexRouteUa,
+                  status: "failed"
+                })
+              });
+            };
+            let { response: upstream, proxy: attemptProxy } = await fetchWithUpstreamRetry(CODEX_BACKEND_RESPONSES_URL, {
               method: "POST",
               headers: codexHeaders,
               body: JSON.stringify(codexForwardedBody),
               signal: clientAbort.signal
-            }, candidateProxy, upstreamTimeoutMs);
+            }, candidateProxy, upstreamTimeoutMs, store.getDb().settings.upstreamRetryCodeCounts, recordCodexRetry);
             // Recover an invalid/expired task exactly once. The expected ID prevents concurrent
             // requests from registering a second task after another request already recovered it.
             if (agentIdentity && upstream.status === 401) {
@@ -567,9 +686,9 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                 });
                 codexHeaders = codexTemporaryHeaders(codexAccount, headers, true);
                 setHeader(codexHeaders, "Authorization", agentIdentityAuthorization(codexAccount));
-                ({ response: upstream, proxy: attemptProxy } = await fetchWith429Retry(CODEX_BACKEND_RESPONSES_URL, {
+                ({ response: upstream, proxy: attemptProxy } = await fetchWithUpstreamRetry(CODEX_BACKEND_RESPONSES_URL, {
                   method: "POST", headers: codexHeaders, body: JSON.stringify(codexForwardedBody), signal: clientAbort.signal
-                }, candidateProxy, upstreamTimeoutMs));
+                }, candidateProxy, upstreamTimeoutMs, store.getDb().settings.upstreamRetryCodeCounts, recordCodexRetry));
               }
             }
             const contentType = upstream.headers.get("content-type") || undefined;
@@ -585,7 +704,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                   "Access-Control-Allow-Origin": "*"
                 });
                 response.flushHeaders();
-                const streamLog = store.recordRequestLog({
+                store.updateRequestLog(pendingLogId, {
                   ...requestLogBase,
                   routeId: route.id,
                   routeName: route.name,
@@ -646,7 +765,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                     contentType,
                     responsePreview: responsePreview(streamPreviewText)
                   });
-                  store.updateRequestLog(streamLog.id, {
+                  store.updateRequestLog(pendingLogId, {
                     ...requestLogBase,
                     routeId: route.id,
                     routeName: route.name,
@@ -713,7 +832,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                     responsePreview: responsePreview(JSON.stringify({ error: errorMessage })),
                     errorMessage
                   });
-                  store.updateRequestLog(streamLog.id, {
+                  store.updateRequestLog(pendingLogId, {
                     ...requestLogBase,
                     routeId: route.id,
                     routeName: route.name,
@@ -780,7 +899,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                 contentType,
                 responsePreview: responsePreview(adapted.text || codexCollected.preview)
               });
-              store.recordRequestLog({
+              store.updateRequestLog(pendingLogId, {
                 ...requestLogBase,
                 routeId: route.id,
                 routeName: route.name,
@@ -900,12 +1019,47 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
           const target = addressTargets[targetIndex];
           const attemptStartedAt = Date.now();
           try {
-            const { response: upstream, proxy: attemptProxy } = await fetchWith429Retry(target, {
+            const { response: upstream, proxy: attemptProxy } = await fetchWithUpstreamRetry(target, {
               method: request.method || "POST",
               headers,
               body: JSON.stringify(forwardedBody),
               signal: clientAbort.signal
-            }, address.proxy, upstreamTimeoutMs);
+            }, address.proxy, upstreamTimeoutMs, store.getDb().settings.upstreamRetryCodeCounts, (retryEvent, retryNumber) => {
+              store.recordRequestLog({
+                ...requestLogBase,
+                routeId: route.id,
+                routeName: route.name,
+                endpoint: route.endpoint,
+                providerName: candidate.site.name,
+                providerId: candidate.site.id,
+                addressLabel: address.label,
+                model: candidate.model,
+                requestBody: body,
+                status: "failed",
+                statusCode: retryEvent.statusCode,
+                durationMs: Date.now() - attemptStartedAt,
+                requestHeaders: {
+                  ...requestLogBase.requestHeaders,
+                  ...upstreamAuthLog
+                },
+                upstreamUrl: target,
+                upstreamContentType: retryEvent.contentType,
+                responsePreview: retryEvent.text ? responsePreview(retryEvent.text) : undefined,
+                errorMessage: `上游返回 ${retryEvent.statusCode}，正在重试第 ${retryNumber} 次`,
+                downstream: downstreamLog,
+                routeTarget: routeTargetLog,
+                proxy: retryEvent.proxy,
+                summary: chainSummary({
+                  downstreamModel: downstreamLog.model,
+                  downstreamEndpoint,
+                  downstreamUa,
+                  routeModel: candidate.model,
+                  routeEndpoint: route.endpoint,
+                  routeUa,
+                  status: "failed"
+                })
+              });
+            });
             const contentType = upstream.headers.get("content-type") || undefined;
 
             // Grok cross-provider reasoning fix: on the "could not decrypt encrypted_content" error we
@@ -936,7 +1090,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                   "Access-Control-Allow-Origin": "*"
                 });
                 response.flushHeaders();
-                const streamLog = store.recordRequestLog({
+                store.updateRequestLog(pendingLogId, {
                   ...requestLogBase,
                   routeId: route.id,
                   routeName: route.name,
@@ -997,7 +1151,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                     contentType,
                     responsePreview: responsePreview(streamPreviewText)
                   });
-                  store.updateRequestLog(streamLog.id, {
+                  store.updateRequestLog(pendingLogId, {
                     ...requestLogBase,
                     routeId: route.id,
                     routeName: route.name,
@@ -1063,7 +1217,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                     responsePreview: responsePreview(JSON.stringify({ error: errorMessage })),
                     errorMessage
                   });
-                  store.updateRequestLog(streamLog.id, {
+                  store.updateRequestLog(pendingLogId, {
                     ...requestLogBase,
                     routeId: route.id,
                     routeName: route.name,
@@ -1167,7 +1321,7 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
                 contentType,
                 responsePreview: responsePreview(adapted.text)
               });
-              store.recordRequestLog({
+              store.updateRequestLog(pendingLogId, {
                 ...requestLogBase,
                 routeId: route.id,
                 routeName: route.name,
@@ -1301,42 +1455,40 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
           providerName: failedCandidate?.site.name || (route.type === "group" ? "分组路由" : "未匹配"),
           userAgent: failedRouteUa
         };
-      if (upstreamAttempts.length === 0) {
-        store.recordRequestLog({
-          ...requestLogBase,
-          routeId: route.id,
-          routeName: route.name,
-          endpoint: route.endpoint,
-          providerName: failedCandidate?.site.name || "未匹配",
-          providerId: failedCandidate?.site.id,
-          addressLabel: failedAddress?.label,
-          model: failedCandidate?.model || (route.type === "group" ? route.name : route.model),
-          requestBody: body,
-          status: "failed",
-          statusCode: lastFailure?.statusCode || 502,
-          durationMs: Date.now() - startedAt,
-          requestHeaders: {
-            ...requestLogBase.requestHeaders,
-            ...(lastAttemptContext?.upstreamAuthLog || {})
-          },
-          upstreamUrl: lastFailure?.target,
-          upstreamContentType: lastFailure?.contentType,
-          responsePreview: lastFailure?.text ? responsePreview(lastFailure.text) : undefined,
-          errorMessage: message,
-          downstream: downstreamLog,
-          routeTarget: failedRouteTargetLog,
-          proxy: requestLogProxyForRoute(failedAddress?.proxy),
-          summary: chainSummary({
-            downstreamModel: downstreamLog.model,
-            downstreamEndpoint,
-            downstreamUa,
-            routeModel: failedRouteTargetLog.model,
-            routeEndpoint: route.endpoint,
-            routeUa: failedRouteUa,
-            status: "failed"
-          })
-        });
-      }
+      store.updateRequestLog(pendingLogId, {
+        ...requestLogBase,
+        routeId: route.id,
+        routeName: route.name,
+        endpoint: route.endpoint,
+        providerName: failedCandidate?.site.name || "未匹配",
+        providerId: failedCandidate?.site.id,
+        addressLabel: failedAddress?.label,
+        model: failedCandidate?.model || (route.type === "group" ? route.name : route.model),
+        requestBody: body,
+        status: "failed",
+        statusCode: lastFailure?.statusCode || 502,
+        durationMs: Date.now() - startedAt,
+        requestHeaders: {
+          ...requestLogBase.requestHeaders,
+          ...(lastAttemptContext?.upstreamAuthLog || {})
+        },
+        upstreamUrl: lastFailure?.target,
+        upstreamContentType: lastFailure?.contentType,
+        responsePreview: lastFailure?.text ? responsePreview(lastFailure.text) : undefined,
+        errorMessage: message,
+        downstream: downstreamLog,
+        routeTarget: failedRouteTargetLog,
+        proxy: requestLogProxyForRoute(failedAddress?.proxy),
+        summary: chainSummary({
+          downstreamModel: downstreamLog.model,
+          downstreamEndpoint,
+          downstreamUa,
+          routeModel: failedRouteTargetLog.model,
+          routeEndpoint: route.endpoint,
+          routeUa: failedRouteUa,
+          status: "failed"
+        })
+      });
       if (lastFailure?.text) {
         const upstreamUrl = lastFailure.target;
         response.writeHead(lastFailure.statusCode, {
@@ -1358,14 +1510,24 @@ export function createProxyHandler({ store, markTemporaryAccountAttempt, markCan
         : error instanceof Error
           ? error.message
           : "Proxy failed";
-      store.recordRequestLog({
+      store.updateRequestLog(pendingLogId, {
         ...requestLogBase,
         ...routeLogContext,
         requestBody: body,
         status: clientCancelled ? "cancelled" : "failed",
         statusCode: clientCancelled ? 499 : 502,
         durationMs: Date.now() - startedAt,
-        errorMessage: message
+        errorMessage: message,
+        downstream: downstreamLog,
+        summary: chainSummary({
+          downstreamModel: downstreamLog.model,
+          downstreamEndpoint,
+          downstreamUa,
+          routeModel: routeLogContext.model,
+          routeEndpoint: routeLogContext.endpoint,
+          routeUa: downstreamUa,
+          status: clientCancelled ? "cancelled" : "failed"
+        })
       });
       if (clientCancelled) {
         if (!response.writableEnded) response.destroy();

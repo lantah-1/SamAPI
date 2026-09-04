@@ -1,6 +1,8 @@
 import type {
   ApiKeyCreated,
   ApiKeyRecord,
+  AppBackup,
+  AppBackupImportResult,
   AppBootstrap,
   AppSettings,
   AuthSession,
@@ -112,6 +114,12 @@ export const api = {
   }),
   bootstrap: () => request<AppBootstrap>("/api/bootstrap"),
   listSettings: () => request<AppSettings>("/api/settings"),
+  exportBackup: () => request<AppBackup>("/api/backup"),
+  importBackup: (backup: AppBackup) =>
+    request<AppBackupImportResult>("/api/backup", {
+      method: "POST",
+      body: JSON.stringify(backup)
+    }),
   listSites: () => request<Site[]>("/api/sites"),
   saveSite: (site: Partial<Site>) =>
     request<Site>(site.id ? `/api/sites/${site.id}` : "/api/sites", {

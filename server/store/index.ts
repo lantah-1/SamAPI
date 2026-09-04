@@ -5,6 +5,8 @@ import path from "node:path";
 import type {
   ApiKeyCreated,
   ApiKeyRecord,
+  AppBackup,
+  AppBackupImportResult,
   AppDatabase,
   AppSettings,
   GroupRoute,
@@ -128,6 +130,106 @@ export class JsonStore {
 
   getDb() {
     return this.db;
+  }
+
+  exportBackup(): AppBackup {
+    const { adminPasswordHash: _adminPasswordHash, ...data } = this.db;
+    return {
+      format: "samapi-backup",
+      version: 1,
+      exportedAt: now(),
+      data: structuredClone(data)
+    };
+  }
+
+  importBackup(input: unknown): AppBackupImportResult {
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("备份文件内容无效");
+    const backup = input as Partial<AppBackup>;
+    if (backup.format !== "samapi-backup") throw new Error("不是 SamAPI 备份文件");
+    if (backup.version !== 1) throw new Error(`不支持的备份版本：${String(backup.version ?? "未知")}`);
+    if (!backup.data || typeof backup.data !== "object" || Array.isArray(backup.data)) throw new Error("备份文件缺少配置数据");
+
+    const data = backup.data as Partial<AppDatabase>;
+    const collectionNames = [
+      "sites",
+      "apiKeys",
+      "providerApiKeyGroups",
+      "temporaryAccountGroups",
+      "headerTemplates",
+      "routes",
+      "routeDisplayGroups"
+    ] as const;
+    for (const name of collectionNames) {
+      if (!Array.isArray(data[name])) throw new Error(`备份文件中的 ${name} 数据无效`);
+    }
+
+    const next: AppDatabase = {
+      sites: structuredClone(data.sites!),
+      apiKeys: structuredClone(data.apiKeys!),
+      providerApiKeyGroups: structuredClone(data.providerApiKeyGroups!).map((group) => this.normalizeProviderApiKeyGroup(group)),
+      temporaryAccountGroups: structuredClone(data.temporaryAccountGroups!),
+      headerTemplates: structuredClone(data.headerTemplates!),
+      routes: structuredClone(data.routes!),
+      routeDisplayGroups: structuredClone(data.routeDisplayGroups!),
+      settings: normalizeSettings(data.settings),
+      adminPasswordHash: this.db.adminPasswordHash
+    };
+
+    for (const site of next.sites) {
+      if (!site?.id || !site.name?.trim() || !Array.isArray(site.addresses)) throw new Error("备份文件包含无效的供应商数据");
+      site.siteType = normalizeSiteType(site.siteType);
+      site.enabled = site.enabled !== false;
+      site.addresses = site.addresses.map((address) => this.normalizeAddress(address));
+    }
+    for (const key of next.apiKeys) {
+      if (!key?.id || !key.name || !key.keyHash) throw new Error("备份文件包含无效的下游 API Key");
+      key.models = normalizeModelList(key.models);
+      key.enabled = key.enabled !== false;
+    }
+    for (const group of next.providerApiKeyGroups) {
+      if (!group?.id || !group.siteId || !Array.isArray(group.apiKeys)) throw new Error("备份文件包含无效的上游密钥分组");
+      group.apiKeys = group.apiKeys.map((key, index) => this.normalizeProviderApiKeyEntry(key, index));
+    }
+    for (const group of next.temporaryAccountGroups) {
+      if (!group?.id || !group.siteId || !Array.isArray(group.accounts)) throw new Error("备份文件包含无效的临时账号分组");
+      group.providerType = normalizeTemporaryAccountProviderType(group.providerType || group.name);
+      group.strategy = normalizeGroupStrategy(group.strategy);
+      group.enabled = group.enabled !== false;
+      for (const account of group.accounts) {
+        if (!account?.id || typeof account.secret !== "string") throw new Error("备份文件包含无效的临时账号");
+        account.models = normalizeModelList(account.models);
+        account.enabled = account.enabled !== false;
+        account.availability = normalizeTemporaryAccountAvailability(account.availability);
+        account.quotaStages = Array.isArray(account.quotaStages) ? account.quotaStages : [];
+      }
+    }
+    for (const template of next.headerTemplates) {
+      if (!template?.id || !template.name || typeof template.headersText !== "string") throw new Error("备份文件包含无效的请求头模板");
+    }
+    for (const route of next.routes) {
+      if (!route?.id || !route.name || (route.type !== "switch" && route.type !== "group")) throw new Error("备份文件包含无效的路由");
+    }
+    for (const group of next.routeDisplayGroups) {
+      if (!group?.id || !group.name || !Array.isArray(group.routeIds)) throw new Error("备份文件包含无效的路由展示分组");
+    }
+
+    const retainedLogs = this.requestLogs.slice(0, next.settings.maxRequestLogs);
+    this.replaceSqliteDatabase(next, retainedLogs);
+    this.db = next;
+    this.requestLogs = retainedLogs;
+
+    return {
+      ok: true,
+      importedAt: now(),
+      counts: {
+        sites: next.sites.length,
+        apiKeys: next.apiKeys.length,
+        providerApiKeyGroups: next.providerApiKeyGroups.length,
+        temporaryAccounts: next.temporaryAccountGroups.reduce((total, group) => total + group.accounts.length, 0),
+        headerTemplates: next.headerTemplates.length,
+        routes: next.routes.length
+      }
+    };
   }
 
   listProviderApiKeyGroups() {
@@ -308,9 +410,8 @@ export class JsonStore {
   }
 
   updateAdminPasswordHash(password: string) {
-    const normalized = password.trim();
-    if (normalized.length < 8) throw new Error("新管理密码至少需要 8 个字符");
-    this.db.adminPasswordHash = hashSecret(normalized);
+    if (password.length < 4 || !password.trim()) throw new Error("新管理密码至少需要 4 个字符");
+    this.db.adminPasswordHash = hashSecret(password);
     this.persist();
   }
 

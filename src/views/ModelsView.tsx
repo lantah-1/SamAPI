@@ -72,8 +72,8 @@ export function ModelsView(props: {
               return (
                 <article key={group.id} className="record">
                   <div className="min-w-0 w-full">
-                    <div className="form-head">
-                      <div className="min-w-0">
+                    <div className="form-head model-record-head">
+                      <div className="model-record-summary">
                         <div className="record-title">{site?.name || group.groupName}</div>
                         <div className="record-meta">
                           {group.apiKeys.length} 个 Key · {models.length} 个模型

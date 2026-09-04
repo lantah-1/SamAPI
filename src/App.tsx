@@ -9,6 +9,7 @@ import {
   KeyRound,
   LockKeyhole,
   Map,
+  Menu,
   Pencil,
   Plus,
   RefreshCw,
@@ -25,6 +26,7 @@ import { ApiError, api, isUnauthorizedError } from "./api";
 import type {
   ApiKeyCreated,
   AppSettings,
+  AppBackup,
   AppSnapshot,
   AppThemeId,
   EndpointKind,
@@ -84,6 +86,8 @@ import {
   temporaryAccountProviderLabels,
   temporaryAccountSourceLabels,
   navItems,
+  mobilePrimarySections,
+  sectionMeta,
   settingsNavItem,
   themeOptions
 } from "./app/constants";
@@ -149,6 +153,7 @@ export default function App() {
   const [temporaryAccountsLoading, setTemporaryAccountsLoading] = useState(false);
   const [temporaryAccountsError, setTemporaryAccountsError] = useState("");
   const [section, setSection] = useState<Section>("routes");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [routeDraft, setRouteDraft] = useState<RouteDraft>({});
   const [routeEditorOpen, setRouteEditorOpen] = useState(false);
   const [siteDraft, setSiteDraft] = useState<Partial<Site>>(emptySite());
@@ -194,6 +199,7 @@ export default function App() {
   const toastStartedAtRef = useRef(0);
   const toastRemainingMsRef = useRef(0);
   const appScrollbarTimerRef = useRef<number | undefined>(undefined);
+  const temporaryAccountIndividualCheckIdsRef = useRef<Set<string>>(new Set());
   const appScrollbarDragRef = useRef<{
     maxScrollTop: number;
     maxThumbTop: number;
@@ -657,11 +663,15 @@ export default function App() {
     setBusy(true);
     try {
       await work();
-      await load({
+      setToast(message);
+      // The mutation response confirms the write. Refresh the snapshot in the background so a
+      // long-running proxy request cannot make an unrelated configuration save appear stuck.
+      void load({
         includeRequestLogs: section === "logs",
         includeTemporaryAccounts: temporaryAccountsLoaded
+      }).catch((error) => {
+        if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "保存后刷新失败");
       });
-      setToast(message);
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "操作失败");
     } finally {
@@ -681,7 +691,36 @@ export default function App() {
       setAuthError("");
       setToast("");
     } catch (error) {
-      if (handleUnauthorized(error)) return;
+      handleUnauthorized(error);
+      throw error;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const exportBackup = async () => {
+    setBusy(true);
+    try {
+      const backup = await api.exportBackup();
+      setToast("配置备份已导出");
+      return backup;
+    } catch (error) {
+      handleUnauthorized(error);
+      throw error;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const importBackup = async (backup: AppBackup) => {
+    setBusy(true);
+    try {
+      const result = await api.importBackup(backup);
+      await load({ includeRequestLogs: section === "logs", includeTemporaryAccounts: true });
+      setToast(`备份导入完成：${result.counts.sites} 个站点，${result.counts.routes} 条路由`);
+      return result;
+    } catch (error) {
+      handleUnauthorized(error);
       throw error;
     } finally {
       setBusy(false);
@@ -816,7 +855,7 @@ export default function App() {
             results[index] = item;
             applyTemporaryAccountCheckItem(item);
           } catch (error) {
-            // Keep checking remaining accounts — one proxy blip shouldn't abort the whole batch.
+            // Keep checking remaining accounts; one proxy blip should not abort the whole batch.
             // Auth failures still surface via toast after the run finishes.
             if (isUnauthorizedError(error)) {
               errors.unshift(error);
@@ -920,9 +959,10 @@ export default function App() {
   };
 
   const checkTemporaryAccount = async (id: string) => {
-    if (temporaryAccountChecking) return;
-    setTemporaryAccountChecking(id);
-    setTemporaryAccountCheckingIds([id]);
+    if (temporaryAccountIndividualCheckIdsRef.current.has(id)) return;
+    temporaryAccountIndividualCheckIdsRef.current.add(id);
+    setTemporaryAccountChecking("individual");
+    setTemporaryAccountCheckingIds((current) => (current.includes(id) ? current : [...current, id]));
     try {
       const result = await api.checkTemporaryAccount(id);
       const item = result.results[0];
@@ -939,9 +979,9 @@ export default function App() {
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号刷新失败");
     } finally {
-      setTemporaryAccountChecking(null);
-      setTemporaryAccountCheckingIds([]);
-      setTemporaryAccountQueuedIds([]);
+      temporaryAccountIndividualCheckIdsRef.current.delete(id);
+      setTemporaryAccountCheckingIds((current) => current.filter((accountId) => accountId !== id));
+      if (temporaryAccountIndividualCheckIdsRef.current.size === 0) setTemporaryAccountChecking(null);
     }
   };
 
@@ -1263,13 +1303,18 @@ export default function App() {
     }
   };
 
+  const navigateToSection = (nextSection: Section) => {
+    setSection(nextSection);
+    setMobileNavOpen(false);
+  };
+
   if (authStatus !== "signed-in") {
     return <AuthLanding status={authStatus} busy={authBusy} error={authError} onLogin={login} />;
   }
 
   if (!snapshot) {
     return (
-      <main className="min-h-screen bg-paper text-ink grid place-items-center">
+      <main className="min-h-[100dvh] bg-paper text-ink grid place-items-center">
         <div className="flex items-center gap-3 text-sm font-semibold">
           <RefreshCw className="h-4 w-4 animate-spin" />
           Loading SamAPI
@@ -1279,7 +1324,7 @@ export default function App() {
   }
 
   return (
-    <main className="min-h-screen bg-paper text-ink">
+    <main className="min-h-[100dvh] bg-paper text-ink">
       <div className="grain" />
       {toast ? (
         <div
@@ -1297,7 +1342,7 @@ export default function App() {
           </button>
         </div>
       ) : null}
-      <div className="app-shell mx-auto flex min-h-screen w-full max-w-[1500px] gap-4 p-4 md:p-6">
+      <div className="app-shell mx-auto flex min-h-[100dvh] w-full max-w-[1500px] gap-4 p-4 md:p-6">
         <aside className="app-nav panel flex w-[84px] shrink-0 flex-col items-center gap-3 p-3 lg:w-64 lg:items-stretch">
           <div className="app-brand mb-2 flex h-12 items-center gap-3 lg:px-2">
             <div className="app-brand-mark grid h-10 w-10 place-items-center rounded-lg">
@@ -1308,9 +1353,26 @@ export default function App() {
               <div className="text-xs text-ink/55">Local model gateway</div>
             </div>
           </div>
-          {navItems.map((item) => (
-            <NavButton key={item.id} item={item} active={section === item.id} onClick={setSection} />
-          ))}
+          <nav className="app-nav-groups" aria-label="主导航">
+            <div className="app-nav-group">
+              <div className="app-nav-group-label">编排</div>
+              {navItems.filter((item) => ["routes", "sites"].includes(item.id)).map((item) => (
+                <NavButton key={item.id} item={item} active={section === item.id} onClick={navigateToSection} className="mobile-primary-nav" />
+              ))}
+            </div>
+            <div className="app-nav-group">
+              <div className="app-nav-group-label">资源</div>
+              {navItems.filter((item) => ["providerKeys", "models", "temporaryAccounts", "keys", "headers"].includes(item.id)).map((item) => (
+                <NavButton key={item.id} item={item} active={section === item.id} onClick={navigateToSection} className={mobilePrimarySections.includes(item.id) ? "mobile-primary-nav" : ""} />
+              ))}
+            </div>
+            <div className="app-nav-group">
+              <div className="app-nav-group-label">观测与接入</div>
+              {navItems.filter((item) => ["logs", "docs"].includes(item.id)).map((item) => (
+                <NavButton key={item.id} item={item} active={section === item.id} onClick={navigateToSection} className={mobilePrimarySections.includes(item.id) ? "mobile-primary-nav" : ""} />
+              ))}
+            </div>
+          </nav>
           <div className="app-database hidden rounded-lg border border-ink/10 bg-white/50 p-3 text-xs leading-5 text-ink/60 lg:block">
             <div className="mb-1 flex items-center gap-2 font-semibold text-ink">
               <Database className="h-4 w-4" />
@@ -1319,17 +1381,28 @@ export default function App() {
             <div className="break-all">{snapshot.dbPath}</div>
           </div>
           <div className="app-bottom-actions">
-            <NavButton item={settingsNavItem} active={section === settingsNavItem.id} onClick={setSection} className="app-settings-nav" />
+            <NavButton item={settingsNavItem} active={section === settingsNavItem.id} onClick={navigateToSection} className="app-settings-nav app-nav-secondary" />
           </div>
+          <button
+            type="button"
+            className={`nav-button mobile-more-button ${mobileNavOpen ? "nav-button-active" : ""}`}
+            aria-expanded={mobileNavOpen}
+            aria-controls="mobile-navigation-menu"
+            onClick={() => setMobileNavOpen((open) => !open)}
+          >
+            <Menu className="h-5 w-5" />
+            <span className="app-nav-label">更多</span>
+          </button>
         </aside>
 
         <section className="app-content flex min-w-0 flex-1 flex-col gap-4">
           <header className="app-header panel flex min-h-16 items-center justify-between gap-4 px-4 py-3">
             <div className="app-header-title">
-              <div className="text-xs font-bold text-rust">Control Plane</div>
+              <div className="app-header-category">{sectionMeta[section].category}</div>
               <h1 className="font-display text-2xl font-black md:text-3xl">
                 {allNavItems.find((item) => item.id === section)?.label}
               </h1>
+              <p className="app-header-description">{sectionMeta[section].description}</p>
             </div>
             {canAddInSection || section === "logs" ? (
               <div className="app-header-actions flex items-center gap-2">
@@ -1349,12 +1422,42 @@ export default function App() {
                 {canAddInSection ? (
                   <ActionButton type="button" onClick={openNewForSection}>
                     <Plus className="h-4 w-4" />
-                    添加
+                    {sectionMeta[section].addLabel || "添加"}
                   </ActionButton>
                 ) : null}
               </div>
             ) : null}
           </header>
+
+          {mobileNavOpen ? (
+            <div className="mobile-nav-backdrop" role="presentation" onMouseDown={(event) => {
+              if (event.target === event.currentTarget) setMobileNavOpen(false);
+            }}>
+              <section id="mobile-navigation-menu" className="mobile-nav-menu" role="dialog" aria-modal="true" aria-label="全部功能">
+                <div className="mobile-nav-menu-head">
+                  <div>
+                    <h2>全部功能</h2>
+                    <p>按工作内容选择要进入的页面</p>
+                  </div>
+                  <button type="button" className="mobile-nav-close" onClick={() => setMobileNavOpen(false)} aria-label="关闭全部功能">
+                    <X className="h-5 w-5" />
+                  </button>
+                </div>
+                <div className="mobile-nav-menu-grid">
+                  {allNavItems.map((item) => {
+                    const Icon = item.icon;
+                    return (
+                      <button key={item.id} type="button" className={section === item.id ? "mobile-nav-menu-item mobile-nav-menu-item-active" : "mobile-nav-menu-item"} onClick={() => navigateToSection(item.id)}>
+                        <span className="mobile-nav-menu-icon"><Icon className="h-5 w-5" /></span>
+                        <span><strong>{item.label}</strong><small>{sectionMeta[item.id].description}</small></span>
+                        <ChevronRight className="h-4 w-4" />
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+            </div>
+          ) : null}
 
           <div className="app-scroll-frame" onMouseEnter={revealAppScrollbar} onMouseMove={revealAppScrollbar} onMouseLeave={hideAppScrollbar}>
             <div ref={appScrollRef} className="app-scroll" onScroll={revealAppScrollbar}>
@@ -1526,6 +1629,8 @@ export default function App() {
                   setSnapshot((current) => (current ? { ...current, settings: { ...current.settings, themeId } } : current));
                   mutate(async () => api.updateSettings({ themeId }), "主题已切换");
                 }}
+                onExportBackup={exportBackup}
+                onImportBackup={importBackup}
               />
             )}
             {section === "docs" && <DocsView snapshot={snapshot} onCopy={copyText} />}

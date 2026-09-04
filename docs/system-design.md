@@ -182,12 +182,12 @@ Content-Type: application/json
 
 - `GET /proxy/models`
 - `GET /proxy/v1/models`
-- `GET /proxy/v1beta/models`
 - `POST /proxy`
 - `POST /proxy/v1/messages`
 - `POST /proxy/v1/chat/completions`
 - `POST /proxy/v1/responses`
-- `POST /proxy/v1beta/models/:routeName:generateContent`
+- `POST /proxy/v1/models/:routeName:generateContent`
+- `POST /proxy/v1/models/:routeName:streamGenerateContent`
 
 代理处理流程：
 

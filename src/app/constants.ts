@@ -133,4 +133,19 @@ export const navItems = [
 
 export const settingsNavItem = { id: "settings", label: "系统设置", icon: Settings } satisfies { id: Section; label: string; icon: typeof Route };
 export const allNavItems = [...navItems, settingsNavItem];
+
+export const sectionMeta: Record<Section, { category: string; description: string; addLabel?: string }> = {
+  routes: { category: "流量编排", description: "配置模型名称、转发目标与故障切换策略。", addLabel: "新建路由" },
+  sites: { category: "上游资源", description: "管理供应商地址、代理方式与可用状态。", addLabel: "添加站点" },
+  providerKeys: { category: "上游资源", description: "集中维护供应商凭据与密钥分组。", addLabel: "添加密钥组" },
+  models: { category: "上游资源", description: "同步并控制各供应商对外开放的模型。" },
+  temporaryAccounts: { category: "账号资源", description: "导入、检查和调度临时模型账号。", addLabel: "导入账号" },
+  keys: { category: "访问控制", description: "签发下游客户端使用的访问密钥。", addLabel: "创建密钥" },
+  headers: { category: "访问控制", description: "复用转发请求所需的请求头配置。", addLabel: "新建模板" },
+  logs: { category: "运行状态", description: "查看请求链路、耗时与失败原因。" },
+  docs: { category: "开发接入", description: "复制代理地址、客户端配置与调用示例。" },
+  settings: { category: "系统", description: "调整界面、日志保留与安全配置。" }
+};
+
+export const mobilePrimarySections: Section[] = ["routes", "sites", "temporaryAccounts", "logs"];
 export const LOGS_PAGE_SIZE = 3;
