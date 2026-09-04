@@ -329,11 +329,15 @@ export function formatQuotaValue(value: TemporaryAccount["quotaStages"][number][
 }
 
 export function temporaryAccountQuotaText(stage: TemporaryAccount["quotaStages"][number]) {
+  const creditExpiryText = stage.resetCreditExpiresAt?.length
+    ? `重置卡到期 ${stage.resetCreditExpiresAt.map(formatTime).join("、")}`
+    : "";
   const parts = [
     formatQuotaValue(stage.remaining, stage.unit) ? `剩余 ${formatQuotaValue(stage.remaining, stage.unit)}` : "",
     formatQuotaValue(stage.used, stage.unit) ? `已用 ${formatQuotaValue(stage.used, stage.unit)}` : "",
     formatQuotaValue(stage.total, stage.unit) ? `总量 ${formatQuotaValue(stage.total, stage.unit)}` : "",
-    stage.resetAt ? `${formatTime(stage.resetAt)} 重置` : ""
+    stage.resetAt ? `${formatTime(stage.resetAt)} 重置` : "",
+    creditExpiryText
   ].filter(Boolean);
   return `${stage.label}${parts.length > 0 ? `：${parts.join(" / ")}` : ""}`;
 }

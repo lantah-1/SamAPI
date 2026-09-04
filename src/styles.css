@@ -1943,6 +1943,20 @@ textarea.field:focus {
   opacity: 0.55;
 }
 
+.temp-account-reset-expiries {
+  display: grid;
+  gap: 0.2rem;
+  margin-top: 0.38rem;
+  color: var(--muted-strong);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+.temp-account-reset-expiries span:first-child {
+  color: var(--ink);
+  font-weight: 820;
+}
+
 .temp-account-quota-track {
   overflow: hidden;
   height: 8px;

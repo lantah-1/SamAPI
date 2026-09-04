@@ -439,13 +439,15 @@ export function TemporaryAccountsView(props: {
                                   {displayedQuotaStages.map((stage, index) => {
                                     const percent = temporaryAccountQuotaPercent(stage);
                                     const resetCount = Number(stage.remaining);
-                                    const canReset = stage.label === "主动重置次数" && Number.isFinite(resetCount) && resetCount > 0;
+                                    const isResetCreditStage = stage.label === "主动重置次数";
+                                    const canReset = isResetCreditStage && Number.isFinite(resetCount) && resetCount > 0;
+                                    const resetCreditExpiryTimes = stage.resetCreditExpiresAt || [];
                                     return (
                                       <div key={`${account.id}-${stage.label}-${index}`} className={`temp-account-quota temp-account-quota-${availability}`} title={temporaryAccountQuotaText(stage)}>
                                         <div className="temp-account-quota-head">
                                           <span>{stage.label}</span>
                                           <div className="temp-account-quota-value">
-                                            <strong>{formatQuotaPercent(percent)}</strong>
+                                            <strong>{isResetCreditStage && Number.isFinite(resetCount) ? `${resetCount} 次` : formatQuotaPercent(percent)}</strong>
                                             {canReset ? (
                                               <button
                                                 type="button"
@@ -461,10 +463,21 @@ export function TemporaryAccountsView(props: {
                                             ) : null}
                                           </div>
                                         </div>
-                                        <div className="temp-account-quota-track" aria-label={temporaryAccountQuotaText(stage)}>
-                                          <div className="temp-account-quota-fill" style={{ width: `${percent ?? 0}%` }} />
-                                        </div>
-                                        <div className="temp-account-quota-text">{temporaryAccountQuotaText(stage)}</div>
+                                        {!isResetCreditStage ? (
+                                          <div className="temp-account-quota-track" aria-label={temporaryAccountQuotaText(stage)}>
+                                            <div className="temp-account-quota-fill" style={{ width: `${percent ?? 0}%` }} />
+                                          </div>
+                                        ) : null}
+                                        {resetCreditExpiryTimes.length > 0 ? (
+                                          <div className="temp-account-reset-expiries">
+                                            {resetCreditExpiryTimes.slice(0, 3).map((expiresAt, creditIndex) => (
+                                              <span key={`${expiresAt}-${creditIndex}`}>{creditIndex === 0 ? "最早到期" : `第 ${creditIndex + 1} 张`} · {formatTime(expiresAt)}</span>
+                                            ))}
+                                            {resetCreditExpiryTimes.length > 3 ? <span>另有 {resetCreditExpiryTimes.length - 3} 张，悬停查看全部</span> : null}
+                                          </div>
+                                        ) : (
+                                          <div className="temp-account-quota-text">{temporaryAccountQuotaText(stage)}</div>
+                                        )}
                                       </div>
                                     );
                                   })}

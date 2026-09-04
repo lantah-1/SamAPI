@@ -194,6 +194,8 @@ export interface TemporaryAccountQuotaStage {
   used?: number | string;
   unit?: string;
   resetAt?: string;
+  /** 可用重置卡的到期时间；卡 ID 不会暴露给前端。 */
+  resetCreditExpiresAt?: string[];
 }
 
 export interface TemporaryAccountGroup {

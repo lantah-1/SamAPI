@@ -9,6 +9,8 @@ import {
 import { agentIdentityAuthorization, ensureOpenAiAgentIdentityTask, isOpenAiAgentIdentityAccount, isOpenAiAgentIdentityTaskInvalid } from "./providers/openai-agent-identity.js";
 import {
   codexUsageCheckResult,
+  earliestCodexResetCredit,
+  fetchCodexResetCredits,
   fetchCodexUsage,
   refreshCodexTemporaryAccountToken,
   resetCodexTemporaryAccount
@@ -116,6 +118,7 @@ export function createAccountCheck(store: JsonStore) {
       if (refreshedTokenPatch) {
         tokenPatch = refreshedTokenPatch;
         const refreshedAccount = { ...account, ...tokenPatch };
+        activeAccount = refreshedAccount;
         attempt = await fetchCodexUsage(refreshedAccount, tokenPatch.secret, proxyConfig);
       }
     }
@@ -167,7 +170,15 @@ export function createAccountCheck(store: JsonStore) {
       };
     }
 
-    const parsed = codexUsageCheckResult(payload);
+    let resetCreditDetails;
+    try {
+      resetCreditDetails = agentIdentity
+        ? await fetchCodexResetCredits(activeAccount, agentIdentityAuthorization(activeAccount), proxyConfig, true)
+        : await fetchCodexResetCredits(activeAccount, activeAccount.secret, proxyConfig);
+    } catch {
+      // Usage data remains useful if the optional reset-credit detail endpoint is unavailable.
+    }
+    const parsed = codexUsageCheckResult(payload, resetCreditDetails);
     const errorMessage = parsed.availability === "available" ? undefined : "Codex 额度已耗尽或当前不允许请求";
     return {
       patch: {
@@ -417,17 +428,24 @@ export function createAccountCheck(store: JsonStore) {
       });
     }
     const accountProxy = proxyConfig || siteProxyForTemporaryAccountGroup(group.id);
+    const resetWithEarliestCredit = async (candidate: TemporaryAccount, accessToken: string, authorizationIsComplete = false) => {
+      const details = await fetchCodexResetCredits(candidate, accessToken, accountProxy, authorizationIsComplete, true);
+      const credit = earliestCodexResetCredit(details);
+      if (!credit) throw new Error("未获取到未过期的 Codex 重置卡详情，未执行额度重置");
+      await resetCodexTemporaryAccount(candidate, accessToken, accountProxy, authorizationIsComplete, credit.id);
+    };
     if (agentIdentity) {
-      await resetCodexTemporaryAccount(activeAccount, agentIdentityAuthorization(activeAccount), accountProxy, true);
+      await resetWithEarliestCredit(activeAccount, agentIdentityAuthorization(activeAccount), true);
     } else {
       try {
-        await resetCodexTemporaryAccount(activeAccount, activeAccount.secret, accountProxy);
+        await resetWithEarliestCredit(activeAccount, activeAccount.secret);
       } catch (error) {
         if (![401, 403].some((status) => String(error).includes(`HTTP ${status}`)) || !account.refreshToken) throw error;
         const refreshed = await refreshCodexTemporaryAccountToken(account, accountProxy);
         if (!refreshed) throw error;
         activeAccount = { ...activeAccount, ...refreshed };
-        await resetCodexTemporaryAccount(activeAccount, activeAccount.secret, accountProxy);
+        store.updateTemporaryAccountCheckResult(account.id, refreshed);
+        await resetWithEarliestCredit(activeAccount, activeAccount.secret);
       }
     }
     return checkTemporaryAccount(group.id, activeAccount, accountProxy).then((item) => ({

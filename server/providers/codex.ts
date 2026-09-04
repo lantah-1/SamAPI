@@ -10,6 +10,7 @@ import {
 } from "../util/text.js";
 import { sseJsonObjectsFromReadable } from "../convert/stream.js";
 import {
+  CODEX_RESET_CREDITS_LIST_URL,
   CODEX_RESET_CREDITS_URL,
   CODEX_OAUTH_CLIENT_ID,
   CODEX_OAUTH_TOKEN_URL,
@@ -32,6 +33,16 @@ interface CodexRateLimitRecord {
   limit_reached?: unknown;
   primary_window?: unknown;
   secondary_window?: unknown;
+}
+
+export interface CodexResetCredit {
+  id: string;
+  expiresAt: string;
+}
+
+export interface CodexResetCreditDetails {
+  availableCount?: number;
+  credits: CodexResetCredit[];
 }
 
 
@@ -143,7 +154,67 @@ export function codexRateLimitIsAvailable(rawRateLimit: unknown) {
   return true;
 }
 
-export function codexUsageCheckResult(payload: unknown) {
+function stringField(record: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function resetCreditAvailableCount(value: unknown) {
+  const count = typeof value === "number" ? value : typeof value === "string" ? Number(value.trim()) : NaN;
+  return Number.isInteger(count) && count >= 0 ? count : undefined;
+}
+
+export function codexResetCreditDetails(payload: unknown): CodexResetCreditDetails {
+  let availableCount: number | undefined;
+  let rawCredits: unknown[] = [];
+  if (Array.isArray(payload)) {
+    rawCredits = payload;
+  } else if (isRecord(payload)) {
+    availableCount = resetCreditAvailableCount(payload.available_count ?? payload.availableCount);
+    for (const key of ["credits", "rate_limit_reset_credits", "items", "data"] as const) {
+      if (Array.isArray(payload[key])) {
+        rawCredits = payload[key];
+        break;
+      }
+    }
+  }
+  let availableCreditCount = 0;
+  const credits = rawCredits.flatMap((item): CodexResetCredit[] => {
+    if (!isRecord(item)) return [];
+    const resetType = stringField(item, "reset_type", "resetType");
+    if (resetType && resetType.toLowerCase() !== "codex_rate_limits") return [];
+    const status = stringField(item, "status");
+    if (status && status.toLowerCase() !== "available") return [];
+    availableCreditCount += 1;
+    const id = stringField(item, "id", "credit_id", "creditId");
+    const expiresAt = stringField(item, "expires_at", "expiresAt");
+    return id && Number.isFinite(Date.parse(expiresAt)) ? [{ id, expiresAt }] : [];
+  });
+  return {
+    availableCount: availableCount ?? (rawCredits.length > 0 ? availableCreditCount : undefined),
+    credits: credits.sort((left, right) => {
+      const leftTime = Date.parse(left.expiresAt);
+      const rightTime = Date.parse(right.expiresAt);
+      if (!Number.isFinite(leftTime)) return 1;
+      if (!Number.isFinite(rightTime)) return -1;
+      return leftTime - rightTime;
+    })
+  };
+}
+
+export function earliestCodexResetCredit(details: CodexResetCreditDetails | undefined, now = Date.now()) {
+  return details ? [...details.credits]
+    .filter((credit) => {
+      const expiresAt = Date.parse(credit.expiresAt);
+      return Number.isFinite(expiresAt) && expiresAt > now;
+    })
+    .sort((left, right) => Date.parse(left.expiresAt) - Date.parse(right.expiresAt))[0] : undefined;
+}
+
+export function codexUsageCheckResult(payload: unknown, resetCreditDetails?: CodexResetCreditDetails) {
   const stages: TemporaryAccountQuotaStage[] = [];
   if (!isRecord(payload)) return { availability: "available" as const, stages };
 
@@ -162,12 +233,15 @@ export function codexUsageCheckResult(payload: unknown) {
   }
 
   const resetCredits = isRecord(payload.rate_limit_reset_credits) ? payload.rate_limit_reset_credits : undefined;
-  const availableCount = typeof resetCredits?.available_count === "number" ? resetCredits.available_count : undefined;
+  const availableCount = resetCreditDetails?.availableCount ?? resetCreditAvailableCount(resetCredits?.available_count);
   if (availableCount != null) {
     stages.push({
       label: "主动重置次数",
       remaining: availableCount,
-      unit: "次"
+      unit: "次",
+      resetCreditExpiresAt: resetCreditDetails?.credits
+        .filter((credit) => Date.parse(credit.expiresAt) > Date.now())
+        .map((credit) => credit.expiresAt)
     });
   }
 
@@ -183,11 +257,35 @@ export async function fetchCodexUsage(account: TemporaryAccount, accessToken = a
   return fetchTemporaryAccountCheckText(CODEX_USAGE_URL, { headers }, proxyConfig);
 }
 
+export async function fetchCodexResetCredits(
+  account: TemporaryAccount,
+  accessToken = account.secret,
+  proxyConfig?: RouteProxyConfig,
+  authorizationIsComplete = false,
+  strict = false
+) {
+  const headers = codexQuotaHeaders(account, accessToken);
+  if (authorizationIsComplete) headers.Authorization = accessToken;
+  const { response, text } = await fetchTemporaryAccountCheckText(CODEX_RESET_CREDITS_LIST_URL, { headers }, proxyConfig);
+  if (!response.ok) {
+    if (!strict) return undefined;
+    const detail = extractUpstreamError(text) || `HTTP ${response.status}`;
+    throw new Error(`获取 Codex 重置卡详情失败：HTTP ${response.status} ${detail}`);
+  }
+  try {
+    return codexResetCreditDetails(text ? JSON.parse(text) : []);
+  } catch {
+    if (strict) throw new Error("获取 Codex 重置卡详情失败：上游返回内容不是合法 JSON");
+    return undefined;
+  }
+}
+
 export async function resetCodexTemporaryAccount(
   account: TemporaryAccount,
   accessToken = account.secret,
   proxyConfig?: RouteProxyConfig,
-  authorizationIsComplete = false
+  authorizationIsComplete = false,
+  creditId?: string
 ) {
   const headers = codexQuotaHeaders(account, accessToken);
   if (authorizationIsComplete) headers.Authorization = accessToken;
@@ -196,7 +294,10 @@ export async function resetCodexTemporaryAccount(
   const { response, text } = await fetchTemporaryAccountCheckText(CODEX_RESET_CREDITS_URL, {
     method: "POST",
     headers,
-    body: JSON.stringify({ redeem_request_id: redeemRequestId })
+    body: JSON.stringify({
+      redeem_request_id: redeemRequestId,
+      ...(creditId ? { credit_id: creditId } : {})
+    })
   }, proxyConfig);
   if (!response.ok) {
     const detail = extractUpstreamError(text) || `HTTP ${response.status}`;
