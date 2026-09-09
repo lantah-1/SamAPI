@@ -475,7 +475,8 @@ textarea {
   width: 100%;
 }
 
-.auth-error {
+.auth-error,
+.error-banner {
   border: 1px solid color-mix(in srgb, var(--danger) 22%, transparent);
   border-radius: 8px;
   background: var(--danger-soft);
@@ -2955,10 +2956,6 @@ textarea.field:focus {
   gap: 0.75rem;
 }
 
-.settings-retry-add-row .action {
-  min-height: 42px;
-}
-
 .settings-retry-list {
   display: flex;
   flex-direction: column;
@@ -3414,6 +3411,74 @@ textarea.field:focus {
   gap: 1rem;
 }
 
+.consumption-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.8rem; margin: 1rem 0; }
+.consumption-metrics .metric span { font-size: clamp(1.2rem, 2.3vw, 1.9rem); margin: 0.55rem 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.consumption-metrics small { display: block; font-size: 0.7rem; font-weight: 500; line-height: 1.6; }
+.consumption-filters { display: flex; flex-wrap: wrap; gap: 0.8rem; align-items: end; }
+.consumption-filters label { flex: 1 1 180px; }
+.consumption-filters label, .consumption-price-form label { display: grid; min-width: 0; gap: 0.35rem; color: var(--muted); font-size: 0.78rem; font-weight: 650; }
+.consumption-filters .select-shell { width: 100%; }
+.consumption-table-scroll { min-width: 0; max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; }
+.consumption-table { width: 100%; border-collapse: collapse; text-align: right; font-size: 0.78rem; font-variant-numeric: tabular-nums; }
+.consumption-table th, .consumption-table td { border-bottom: 1px solid var(--line); padding: 0.8rem 0.6rem; white-space: nowrap; }
+.consumption-table thead { color: var(--muted); font-size: 0.72rem; }
+.consumption-table th:first-child { text-align: left; }
+.consumption-table th[scope="row"] { font-weight: 650; min-width: 9rem; max-width: 350px; white-space: normal; overflow-wrap: anywhere; }
+.consumption-table small { display: block; margin-top: 0.25rem; color: var(--muted); font-size: 0.69rem; font-weight: 500; }
+.consumption-details > summary { cursor: pointer; font-size: 0.85rem; font-weight: 700; }
+.consumption-details > summary small { margin-left: 0.5rem; color: var(--muted); font-weight: 500; }
+.consumption-price-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.8rem; align-items: end; margin: 1rem 0; }
+.consumption-price-form .action { justify-self: start; }
+.managed-provider-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.6rem; }
+.managed-provider-tabs button { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; border: 1px solid var(--line); background: var(--subtle-fill); color: var(--muted); border-radius: 8px; padding: 0.9rem; text-align: left; }
+.managed-provider-tabs strong { font-size: 0.9rem; }
+.managed-provider-tabs small { font-size: 0.7rem; white-space: nowrap; }
+.managed-provider-tabs .managed-provider-active { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 6%, var(--surface-solid)); }
+.managed-account-header { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; }
+.managed-account-heading { min-width: 0; }
+.managed-account-header-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.managed-account-toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 0.65rem; margin: 1rem 0; }
+.managed-account-toolbar > .field { flex: 1 1 210px; width: auto; }
+.managed-account-toolbar > .select-shell { flex: 0 1 130px; }
+.managed-policy { display: flex; min-width: 0; align-items: center; gap: 0.6rem; color: var(--muted); font-size: 0.75rem; }
+.managed-policy > span:first-child { flex: 0 0 auto; white-space: nowrap; }
+.managed-policy .select-shell { width: 160px; }
+.managed-account-selection { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; color: var(--muted); font-size: 0.74rem; padding: 0.7rem 0; border-bottom: 1px solid var(--line); }
+.managed-account-selection > span { margin-left: auto; }
+.managed-account-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 0.85rem; align-items: start; padding: 1.1rem 0; border-bottom: 1px solid var(--line); }
+.managed-account-row-select { display: grid; place-items: center; align-self: start; margin-top: 0.3rem; border-radius: 8px; cursor: pointer; }
+.managed-account-row-select input { margin: 0; accent-color: var(--accent); }
+.managed-account-row-select:has(input:disabled) { cursor: not-allowed; }
+.managed-account-row-select:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.managed-account-title { display: flex; align-items: center; flex-wrap: wrap; gap: 0.65rem; }
+.managed-account-title strong { font-size: 0.9rem; overflow-wrap: anywhere; }
+.managed-account-title > span { color: var(--muted); font-size: 0.68rem; }
+.managed-account-title .managed-account-preferred { display: inline-flex; align-items: center; gap: 0.3rem; color: var(--accent); font-weight: 700; }
+.managed-account-meta { margin: 0.4rem 0; color: var(--muted); font-size: 0.74rem; overflow-wrap: anywhere; }
+.managed-account-health { display: flex; flex-wrap: wrap; align-items: center; gap: 0.65rem; }
+.managed-account-health small { color: var(--muted); font-size: 0.68rem; }
+.managed-account-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: end; gap: 0.4rem; max-width: 330px; }
+.managed-account-actions .action { font-size: 0.7rem; padding: 0.42rem 0.5rem; min-height: 30px; }
+.managed-account-actions .toggle-row { font-size: 0.7rem; margin: 0 0.3rem; }
+.managed-account-details { margin-top: 0.5rem; color: var(--muted); font-size: 0.73rem; }
+.managed-account-details summary { cursor: pointer; width: fit-content; }
+.managed-account-details p { margin-top: 0.5rem; }
+.managed-account-models { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.7rem 0; }
+.managed-account-models code { background: var(--subtle-fill); border: 1px solid var(--line); border-radius: 4px; padding: 0.2rem 0.4rem; overflow-wrap: anywhere; }
+.managed-account-disabled .managed-account-content { opacity: 0.6; }
+.managed-account-notice { display: flex; align-items: center; gap: 0.6rem; color: var(--accent); background: var(--subtle-fill); border-radius: 6px; padding: 0.65rem 0.8rem; margin: 0.6rem 0; font-size: 0.77rem; }
+.managed-account-notice svg { flex: 0 0 auto; }
+@media (max-width: 1050px) { .consumption-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 600px) { .consumption-filters label { flex-basis: 100%; } .consumption-filters .action { width: 100%; } }
+@media (max-width: 1000px) {
+  .managed-account-header { grid-template-columns: minmax(0, 1fr) 44px; align-items: start; }
+  .managed-account-header-actions { grid-column: 1 / -1; }
+  .managed-account-refresh { grid-column: 2; grid-row: 1; }
+  .managed-account-row { grid-template-columns: auto minmax(0, 1fr); }
+  .managed-account-actions { grid-column: 2; justify-content: start; max-width: none; }
+}
+@media (max-width: 600px) { .managed-provider-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); } .managed-account-toolbar > .field { flex-basis: 100%; } .managed-policy { flex: 1 1 180px; } .managed-policy .select-shell { width: 100%; } .managed-provider-tabs button { padding: 0.7rem; } }
+
 .usage-summary-grid {
   display: grid;
   gap: 0.8rem;
@@ -3798,6 +3863,94 @@ textarea.field:focus {
   line-height: 1.35;
 }
 
+.log-call-list {
+  display: grid;
+  gap: 1rem;
+  margin-top: 0.8rem;
+  padding: 0;
+  list-style: none;
+}
+
+.log-call {
+  min-width: 0;
+  padding-left: 0.9rem;
+  border-left: 2px solid var(--accent);
+}
+
+.log-call-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.log-call-heading strong {
+  color: var(--ink);
+}
+
+.log-upstream-attempt,
+.log-tool-result {
+  margin-top: 0.65rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+}
+
+.log-upstream-target {
+  margin-top: 0.4rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.log-upstream-url {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.log-flow-details summary {
+  cursor: pointer;
+  padding-block: 0.55rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.log-flow-details summary .status-badge {
+  margin-left: 0.5rem;
+}
+
+.log-flow-details pre {
+  margin-top: 0.4rem;
+}
+
+.log-shared-headers > summary,
+.log-call-chain > summary {
+  padding-block: 0.1rem;
+}
+
+.log-shared-headers > summary .log-sub-value,
+.log-call-chain > summary .log-sub-value {
+  display: inline;
+  margin-left: 0.5rem;
+  white-space: normal;
+}
+
+.log-final-result {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--line));
+}
+
+.log-final-upstream {
+  margin-block: 0.5rem;
+}
+
+.detail-block.log-final-result pre {
+  max-height: min(50vh, 480px);
+  margin-top: 0.65rem;
+  color: var(--ink);
+}
+
 .log-detail-modal {
   display: flex;
   width: min(1100px, 100%);
@@ -3851,6 +4004,12 @@ textarea.field:focus {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 0.75rem;
+}
+
+.log-message + .log-message {
+  margin-top: 0.85rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--line);
 }
 
 .detail-block {
@@ -5130,8 +5289,13 @@ textarea.field:focus {
 
   .field,
   .select-trigger,
-  .action {
+  .action,
+  .toggle-row {
     min-height: 44px;
+  }
+
+  .action {
+    min-width: 44px;
   }
 
   .select-option {
@@ -5302,12 +5466,120 @@ textarea.field:focus {
 
   .record-actions .action,
   .model-card-actions .action,
+  .managed-account-actions .action,
   .temp-account-toolbar-actions .action,
   .settings-backup-actions .action {
     min-height: 44px;
   }
 
+  .managed-account-header {
+    gap: 0.75rem;
+  }
+
+  .managed-account-header-actions {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .managed-account-header-actions .action {
+    min-width: 0;
+    padding-inline: 0.5rem;
+  }
+
+  .managed-account-header-actions .action:only-child {
+    grid-column: 1 / -1;
+  }
+
+  .managed-account-header-actions .action svg {
+    display: none;
+  }
+
+  .managed-account-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+    align-items: center;
+    gap: 0.6rem;
+  }
+
+  .managed-account-toolbar > .field,
+  .managed-account-toolbar > .action {
+    grid-column: 1 / -1;
+  }
+
+  .managed-account-toolbar > .action {
+    justify-self: start;
+  }
+
+  .managed-account-toolbar .field {
+    margin-top: 0;
+  }
+
+  .managed-account-toolbar > .field,
+  .managed-account-toolbar > .select-shell {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .managed-policy {
+    gap: 0.5rem;
+  }
+
+  .managed-policy .select-shell {
+    flex: 1 1 0;
+    min-width: 0;
+    width: auto;
+  }
+
+  .managed-account-selection {
+    gap: 0.5rem;
+    padding-block: 0.35rem;
+  }
+
+  .managed-account-row {
+    column-gap: 0.5rem;
+  }
+
+  .managed-account-row-select {
+    margin-top: -0.65rem;
+  }
+
+  .managed-account-actions {
+    grid-column: 1 / -1;
+    gap: 0.5rem;
+  }
+
+  .managed-account-actions .action,
+  .managed-account-actions .toggle-row {
+    flex: 1 1 auto;
+    min-width: 44px;
+    font-size: 0.78rem;
+  }
+
+  .managed-account-actions .action {
+    padding: 0.44rem 0.62rem;
+  }
+
+  .managed-account-actions .toggle-row {
+    justify-content: center;
+    margin: 0;
+  }
+
+  .consumption-price-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .consumption-price-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .consumption-price-form .action {
+    justify-self: stretch;
+  }
+
   .temp-account-row-select,
+  .managed-account-row-select,
+  .managed-account-refresh,
   .temp-account-delete,
   .temp-account-enable,
   .group-priority-drag-handle,
@@ -5320,7 +5592,8 @@ textarea.field:focus {
     height: 44px;
   }
 
-  .temp-account-row-select input[type="checkbox"] {
+  .temp-account-row-select input[type="checkbox"],
+  .managed-account-row-select input[type="checkbox"] {
     width: 18px;
     height: 18px;
   }
@@ -5342,6 +5615,16 @@ textarea.field:focus {
 
   .app-header-actions .action:not(.app-header-icon-action) svg {
     display: none;
+  }
+}
+
+@media (max-width: 375px) {
+  .managed-account-header-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .managed-account-header-actions .action-primary {
+    grid-column: 1 / -1;
   }
 }
 

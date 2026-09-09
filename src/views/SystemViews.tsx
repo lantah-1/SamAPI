@@ -22,6 +22,7 @@ import {
   X
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useLogAutoScroll } from "../app/useLogAutoScroll";
 import type { FormEvent } from "react";
 import type {
   AppBackup,
@@ -38,7 +39,9 @@ import type {
   ProviderApiKeyGroupView,
   ProviderModelGroupOption,
   RequestLog,
+  RequestLogPhase,
   RequestLogSummary,
+  RequestLogStatus,
   RouteProxyConfig,
   RouteRecord,
   RouteType,
@@ -100,9 +103,7 @@ import {
   temporaryAccountQuotaPercent,
   temporaryAccountQuotaText,
   temporaryAccountTypeLabel,
-  uniqueMembers,
-  upstreamRequestSummary,
-  upstreamRequestBody
+  uniqueMembers
 } from "../app/utils";
 import { ActionButton, SelectInput, TextInput } from "../components/ui";
 
@@ -124,10 +125,11 @@ export function LogsView(props: {
 }) {
   const logs = props.snapshot.requestLogs;
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
-  const successCount = logs.filter((log) => log.status === "success").length;
-  const failedCount = logs.filter((log) => log.status === "failed").length;
-  const cancelledCount = logs.filter((log) => log.status === "cancelled").length;
-  const pendingCount = logs.filter((log) => log.status === "pending").length;
+  const successCount = logs.filter((log) => log.phase === "returned").length;
+  const waitingToolsCount = logs.filter((log) => log.phase === "waiting-tools").length;
+  const failedCount = logs.filter((log) => log.result.status === "failed").length;
+  const cancelledCount = logs.filter((log) => log.result.status === "cancelled").length;
+  const pendingCount = logs.filter((log) => log.result.status === "pending").length;
   const hasMore = logs.length < props.total;
 
   useEffect(() => {
@@ -145,7 +147,7 @@ export function LogsView(props: {
       <div>
         <h2>请求日志</h2>
         <div className="mt-1 text-xs font-bold text-ink/55">
-          已加载 {logs.length} / 共 {props.total} 条 / 成功 {successCount} / 失败 {failedCount}{cancelledCount ? ` / 已取消 ${cancelledCount}` : ""}{pendingCount ? ` / 请求中 ${pendingCount}` : ""} / 5 秒刷新
+          已加载 {logs.length} / 共 {props.total} 次用户输入 / 已返回 {successCount} / 失败 {failedCount}{cancelledCount ? ` / 已取消 ${cancelledCount}` : ""}{pendingCount ? ` / 进行中 ${pendingCount}` : ""}{waitingToolsCount ? ` / 等待工具 ${waitingToolsCount}` : ""} / 2 秒刷新
         </div>
       </div>
       <div className="flex flex-wrap items-center justify-end gap-2">
@@ -184,41 +186,19 @@ export function LogsView(props: {
   );
 }
 
-function logStatusLabel(status: RequestLogSummary["status"]) {
+function logStatusLabel(status: RequestLogStatus) {
   if (status === "success") return "成功";
   if (status === "pending") return "请求中";
   if (status === "cancelled") return "已取消";
   return "失败";
 }
 
-function compactFailureReason(message?: string) {
-  const text = (message || "")
-    .replace(/\s+/g, " ")
-    .replace(/^上游地址均不可用[：:]\s*/, "")
-    .trim();
-  if (!text) return "";
-  const firstReason = text.split(/[；;]/)[0]?.trim() || text;
-  return firstReason.length > 96 ? `${firstReason.slice(0, 95)}...` : firstReason;
-}
-
-function LogContextItem(props: { label: string; value?: string }) {
-  const value = props.value || "未记录";
-  return (
-    <span className="log-context-item" title={`${props.label}: ${value}`}>
-      <span className="log-context-label">{props.label}</span>
-      <span className="log-context-value">{value}</span>
-    </span>
-  );
+function logPhaseLabel(phase: RequestLogPhase) {
+  return ({ running: "进行中", "waiting-tools": "等待工具回传", returned: "已返回", failed: "失败", cancelled: "已取消" })[phase];
 }
 
 function LogSummaryRow(props: { log: RequestLogSummary; selected: boolean; onOpen: (id: string) => void; onCopy: (value: string) => void }) {
   const { log } = props;
-  const downstream = log.downstream;
-  const routeTarget = log.routeTarget;
-  const downstreamPath = downstream.path || downstream.endpoint || "-";
-  const targetProvider = routeTarget.providerName || log.providerName || "-";
-  const proxyLabel = log.proxy ? routeProxyModeLabels[log.proxy.mode] : "直连";
-  const failureReason = log.status === "failed" ? compactFailureReason(log.errorMessage) : "";
   return (
     <article className={`log-row ${props.selected ? "log-row-selected" : ""}`}>
       <button type="button" className="log-copy-id" title={`复制日志 ID: ${log.id}`} aria-label="复制日志 ID" onClick={() => props.onCopy(log.id)}>
@@ -227,41 +207,22 @@ function LogSummaryRow(props: { log: RequestLogSummary; selected: boolean; onOpe
       <button type="button" className="log-summary log-summary-card" onClick={() => props.onOpen(log.id)}>
         <span className="log-flow-cell">
           <span className="log-flow-block">
-            <span className="summary-node-label">下游请求</span>
-            <span className="log-main-value" title={downstream.model || log.routeName || "-"}>
-              {downstream.model || log.routeName || "-"}
-            </span>
-            <span className="log-sub-value" title={downstreamPath}>
-              {downstreamPath}
-            </span>
+            <span className="summary-node-label">当次用户输入</span>
+            <span className="log-main-value" title={log.msg}>{log.msg || "无用户消息"}</span>
+            <span className="log-sub-value">{log.requestCount} 次接口调用 · {log.attemptCount} 次上游请求{log.toolCount ? ` · ${log.toolCount} 个工具` : ""}</span>
           </span>
           <span className="log-flow-block">
-            <span className="summary-node-label">转发目标</span>
-            <span className="log-main-value" title={routeTarget.model || log.model || "-"}>
-              {routeTarget.model || log.model || "-"}
-            </span>
-            <span className="log-sub-value" title={targetProvider}>
-              {targetProvider}
-            </span>
+            <span className="summary-node-label">结果上游</span>
+            <span className="log-main-value" title={log.upstream?.model}>{log.upstream?.model || "尚未转发"}</span>
+            <span className="log-sub-value" title={log.upstream?.url}>{log.upstream?.provider || "—"}</span>
           </span>
         </span>
         <span className="log-state-cell">
           <span className="log-state-line">
-            <span className={`status-badge status-${log.status}`}>{logStatusLabel(log.status)}</span>
-            <span className="log-time-value">{formatTime(log.createdAt)}</span>
+            <span className={`status-badge status-${log.phase === "waiting-tools" ? "pending" : log.result.status}`}>{logPhaseLabel(log.phase)}</span>
+            <span className="log-time-value" title={`开始：${formatTime(log.createdAt)}`}>{formatTime(log.updatedAt)}</span>
           </span>
-          {failureReason ? (
-            <span className="log-error-snippet" title={log.errorMessage}>
-              {failureReason}
-            </span>
-          ) : null}
-        </span>
-        <span className="log-context-row">
-          <LogContextItem label="请求头" value={log.headerTemplateName || "未使用"} />
-          <LogContextItem label="代理" value={proxyLabel} />
-          <LogContextItem label="客户端" value={log.clientDevice || "未知客户端"} />
-          <LogContextItem label="来源 IP" value={log.clientIp || "未知"} />
-          <LogContextItem label="API Key" value={log.apiKeyName} />
+          {log.result.status === "failed" && log.result.body ? <span className="log-error-snippet" title={log.result.body}>{log.result.body}</span> : null}
         </span>
       </button>
     </article>
@@ -270,16 +231,18 @@ function LogSummaryRow(props: { log: RequestLogSummary; selected: boolean; onOpe
 
 export function LogDetailModal(props: { log: RequestLog | null; loading: boolean; error: string; onClose: () => void; onDelete: (id: string) => void }) {
   const log = props.log;
+  const scrollRef = useLogAutoScroll(log?.id, log?.revision);
+  const awaitingResult = log?.phase === "running" || log?.phase === "waiting-tools";
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="modal-panel log-detail-modal" role="dialog" aria-modal="true" aria-label="日志详情">
         <div className="form-head">
           <div>
-            <h2>日志详情</h2>
+            <h2>本次消息的调用日志</h2>
             {log ? (
               <div className="log-detail-heading-meta">
                 <div className="log-detail-id" title={log.id}>ID: {log.id}</div>
-                <div className="mt-1 text-xs font-bold text-ink/55">{log.routeName} / {formatTime(log.createdAt)}</div>
+                <div className="mt-1 text-xs font-bold text-ink/55">开始 {formatTime(log.createdAt)} · 更新 {formatTime(log.updatedAt)}</div>
               </div>
             ) : (
               <div className="mt-1 text-xs font-bold text-ink/55">正在获取完整日志</div>
@@ -289,29 +252,76 @@ export function LogDetailModal(props: { log: RequestLog | null; loading: boolean
             <X className="h-4 w-4" />
           </ActionButton>
         </div>
-        <div className="log-detail-modal-body">
+        <div className="log-detail-modal-body" ref={scrollRef}>
           {props.loading ? <div className="empty-state">正在加载日志详情...</div> : null}
           {props.error ? <div className="empty-state">{props.error}</div> : null}
           {log && !props.loading ? (
             <>
-              <div className="detail-grid">
-              <LogSummaryDetail log={log} />
-              <DownstreamHeadersDetail log={log} />
-              <DetailBlock title="下游 Body" value={log.requestBody} />
-              <ForwardingTargetDetail log={log} />
-              <UpstreamRequestDetail log={log} />
-              <DetailBlock
-                title="返回"
-                wide
-                value={{
-                  status: log.status,
-                  statusCode: log.statusCode,
-                  durationMs: log.durationMs,
-                  contentType: log.upstreamContentType,
-                  preview: log.responsePreview,
-                  error: log.errorMessage || undefined
-                }}
-              />
+              <div className="detail-grid" key={log.id}>
+                <div className="detail-block detail-wide">
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <div className="detail-title">当次用户输入</div>
+                    <span className={`status-badge status-${log.phase === "waiting-tools" ? "pending" : log.result.status}`}>{logPhaseLabel(log.phase)}</span>
+                  </div>
+                  <pre>{log.msg[0] || "此请求未携带用户输入"}</pre>
+                </div>
+                <section className="detail-block detail-wide log-final-result" aria-label={awaitingResult ? "当前结果" : "最终结果"}>
+                  <div className="log-call-heading">
+                    <strong>{awaitingResult ? "当前结果" : "最终结果"}</strong>
+                    <span className={`status-badge status-${log.phase === "waiting-tools" ? "pending" : log.result.status}`}>{logPhaseLabel(log.phase)}{log.result.statusCode ? ` · ${log.result.statusCode}` : ""}</span>
+                  </div>
+                  {log.upstream ? (
+                    <div className="log-final-upstream">
+                      <div className="log-upstream-target">{log.upstream.provider} · {log.upstream.model}</div>
+                      <div className="log-upstream-url">{log.upstream.url}</div>
+                    </div>
+                  ) : null}
+                  {awaitingResult ? <p className="log-sub-value">{log.phase === "waiting-tools" ? "等待工具回传，后续结果会自动更新。" : "内容随接口返回自动更新。"}</p> : null}
+                  <pre>{log.result.body || (awaitingResult ? "等待上游返回…" : log.phase === "failed" ? "请求失败，未收到返回内容。" : log.phase === "cancelled" ? "请求已取消，未收到返回内容。" : "上游未返回文本内容。")}</pre>
+                </section>
+                <details className="detail-block detail-wide log-flow-details log-shared-headers">
+                  <summary>下游请求头 <span className="log-sub-value">本轮首个请求</span></summary>
+                  <pre>{prettyJson(log.requestHeaders)}</pre>
+                </details>
+                <details className="detail-block detail-wide log-flow-details log-call-chain">
+                  <summary>调用过程 <span className="log-sub-value">{log.calls.length} 次接口调用 · {log.calls.reduce((count, call) => count + call.attempts.length, 0)} 次上游请求{log.tools.length ? ` · ${log.tools.length} 个工具` : ""}</span></summary>
+                  <ol className="log-call-list">
+                    {log.calls.map((call, index) => (
+                      <li className="log-call" key={call.id}>
+                        <div className="log-call-heading">
+                          <strong>接口调用 {index + 1}</strong>
+                          <span>{formatTime(call.createdAt)}</span>
+                          <span className={`status-badge status-${call.result.status}`}>{logStatusLabel(call.result.status)}</span>
+                        </div>
+                        {call.attempts.map((attempt, attemptIndex) => (
+                          <section className="log-upstream-attempt" key={attempt.id}>
+                            <div className="log-call-heading">
+                              <strong>上游请求 {attemptIndex + 1}</strong>
+                              <span className={`status-badge status-${attempt.result.status}`}>{logStatusLabel(attempt.result.status)}{attempt.result.statusCode ? ` · ${attempt.result.statusCode}` : ""}</span>
+                            </div>
+                            <div className="log-upstream-target">{attempt.upstream?.provider} · {attempt.upstream?.model}</div>
+                            <div className="log-upstream-url">{attempt.upstream?.url}</div>
+                            <details className="log-flow-details">
+                              <summary>上游结果</summary>
+                              <pre>{attempt.result.body || (attempt.result.status === "pending" ? "等待上游返回…" : "无返回内容")}</pre>
+                            </details>
+                          </section>
+                        ))}
+                        {!call.attempts.length ? <pre>{call.result.body || "正在接收请求，等待转发…"}</pre> : null}
+                        {log.tools.filter((tool) => tool.requestId === call.id).map((tool) => (
+                          <details className="log-tool-result log-flow-details" key={tool.id}>
+                            <summary>
+                              <span>工具调用 · {tool.name}</span>
+                              <span className={`status-badge status-${tool.status}`}>{tool.status === "pending" ? "等待回传" : tool.status === "failed" ? "工具报错" : tool.status === "cancelled" ? "未完成" : "已回传"}</span>
+                            </summary>
+                            {tool.resultRequestId ? <div className="log-sub-value">在接口调用 {log.calls.findIndex((item) => item.id === tool.resultRequestId) + 1} 中回传 · {formatTime(tool.updatedAt)}</div> : null}
+                            <pre>{tool.result || (tool.status === "pending" ? "工具结果会在客户端回传后显示。" : "工具未返回文本内容")}</pre>
+                          </details>
+                        ))}
+                      </li>
+                    ))}
+                  </ol>
+                </details>
               </div>
               <div className="mt-3 flex justify-end">
                 <ActionButton tone="danger" onClick={() => props.onDelete(log.id)}>
@@ -707,6 +717,7 @@ export function SettingsView(props: {
             <div>
               <h3>上游错误码重试配置</h3>
               <p>上游返回对应状态码时，在换下一个目标地址之前重试的次数。只有在这里配置过的错误码才会重试；未配置的错误码不重试。配置 0 表示禁用该错误码的重试（立即换下一个目标地址）。</p>
+              <p>每次请求独立计算重试次数，所有重试追加在原会话日志中。599 包括连接失败、响应超时、空响应、错误响应及开始输出前的流错误。同一请求已发送实际内容，或客户端已取消时，不再重试。</p>
             </div>
           </div>
           <div className="settings-retry-add-row">
@@ -822,69 +833,6 @@ export function SettingsView(props: {
   );
 }
 
-function SummaryField(props: { label: string; value?: string | number }) {
-  return (
-    <div className="summary-field">
-      <span>{props.label}</span>
-      <strong>{props.value || "-"}</strong>
-    </div>
-  );
-}
-
-function LogSummaryDetail(props: { log: RequestLog }) {
-  const { log } = props;
-  const downstream = log.downstream || { model: log.routeName, endpoint: log.path, userAgent: log.userAgent, path: log.path };
-  const routeTarget = log.routeTarget || {
-    routeName: log.routeName,
-    model: log.model,
-    endpoint: log.endpoint,
-    providerName: log.providerName
-  };
-  return (
-    <div className="detail-block detail-wide summary-card">
-      <div className="summary-card-head">
-        <div>
-          <div className="detail-title">总结</div>
-        </div>
-        <span className={`status-badge status-${log.status}`}>{logStatusLabel(log.status)}</span>
-      </div>
-      <div className="summary-flow">
-        <section className="summary-node">
-          <div className="summary-node-label">下游请求</div>
-          <div className="summary-node-main">{downstream.model || log.routeName || "-"}</div>
-          <SummaryField label="Path" value={downstream.path || log.path} />
-          <SummaryField label="UA" value={downstream.userAgent || log.userAgent || "unknown ua"} />
-          <SummaryField label="客户端" value={log.clientDevice} />
-          <SummaryField label="IP" value={log.clientIp} />
-          <SummaryField label="API Key" value={log.apiKeyName} />
-        </section>
-        <div className="summary-arrow">
-          <ChevronRight className="h-4 w-4" />
-        </div>
-        <section className="summary-node">
-          <div className="summary-node-label">路由目标</div>
-          <div className="summary-node-main">{routeTarget.model || log.model || "-"}</div>
-          <SummaryField label="路由" value={routeTarget.routeName || log.routeName} />
-          <SummaryField label="Endpoint" value={routeTarget.endpoint || log.endpoint} />
-          <SummaryField label="供应商" value={routeTarget.providerName || log.providerName} />
-          <SummaryField label="UA" value={routeTarget.userAgent || "fetch default"} />
-          <SummaryField label="代理" value={log.proxy ? routeProxyModeLabels[log.proxy.mode] : "直连"} />
-        </section>
-        <div className="summary-arrow">
-          <ChevronRight className="h-4 w-4" />
-        </div>
-        <section className="summary-node summary-result">
-          <div className="summary-node-label">返回</div>
-          <div className="summary-node-main">{log.statusCode}</div>
-          <SummaryField label="状态" value={logStatusLabel(log.status)} />
-          <SummaryField label="耗时" value={`${log.durationMs}ms`} />
-          <SummaryField label="时间" value={formatTime(log.createdAt)} />
-        </section>
-      </div>
-    </div>
-  );
-}
-
 function DetailBlock(props: { title: string; value: unknown; wide?: boolean }) {
   return (
     <div className={`detail-block${props.wide ? " detail-wide" : ""}`}>
@@ -892,52 +840,6 @@ function DetailBlock(props: { title: string; value: unknown; wide?: boolean }) {
       <pre>{prettyJson(props.value)}</pre>
     </div>
   );
-}
-
-function SectionedDetailBlock(props: { title: string; summary: unknown; detail: unknown }) {
-  return (
-    <div className="detail-block detail-wide sectioned-detail">
-      <div className="detail-title">{props.title}</div>
-      <section className="detail-section">
-        <div className="detail-section-title">总结</div>
-        <pre>{prettyJson(props.summary)}</pre>
-      </section>
-      <section className="detail-section">
-        <div className="detail-section-title">详细</div>
-        <pre>{prettyJson(props.detail)}</pre>
-      </section>
-    </div>
-  );
-}
-
-function DownstreamHeadersDetail(props: { log: RequestLog }) {
-  const log = props.log;
-  const downstream = log.downstream || { model: log.routeName, userAgent: log.userAgent };
-  const { endpoint: _endpoint, ...downstreamWithoutEndpoint } = downstream;
-  const summary = {
-    ...downstreamWithoutEndpoint,
-    method: log.method,
-    path: log.path,
-    clientIp: log.clientIp
-  };
-
-  return <SectionedDetailBlock title="下游请求头" summary={summary} detail={log.requestHeaders} />;
-}
-
-function ForwardingTargetDetail(props: { log: RequestLog }) {
-  const log = props.log;
-  const forwardingTarget = {
-    ...(log.routeTarget || { routeName: log.routeName, model: log.model, endpoint: log.endpoint, providerName: log.providerName }),
-    upstreamUrl: log.upstreamUrl,
-    proxy_mode: log.proxy?.mode || "direct"
-  };
-
-  return <DetailBlock title="转发目标" value={forwardingTarget} wide />;
-}
-
-function UpstreamRequestDetail(props: { log: RequestLog }) {
-  const log = props.log;
-  return <SectionedDetailBlock title="上游请求" summary={upstreamRequestSummary(log)} detail={upstreamRequestBody(log)} />;
 }
 
 function UsageCopyRow(props: { label: string; value: string; note: string; onCopy: (value: string) => void }) {

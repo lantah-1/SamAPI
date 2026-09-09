@@ -1,5 +1,6 @@
 import http from "node:http";
 import type { JsonStore } from "./store.js";
+import { createAccountCheck } from "./account-check.js";
 import {
   clientDeviceFromUserAgent,
   compactPreview,
@@ -144,11 +145,7 @@ export function createModelDiscovery(store: JsonStore) {
       status: input.status,
       statusCode: input.statusCode,
       durationMs: Math.max(0, Date.now() - input.startedAt),
-      requestHeaders: {
-        ...maskRequestHeaders(input.request.headers),
-        "upstream-accept": "application/json",
-        ...(input.usesApiKey !== false && maskedApiKey ? { "upstream-authorization": `Bearer ${maskedApiKey}` } : {})
-      },
+      requestHeaders: maskRequestHeaders(input.request.headers),
       requestBody: {
         siteId: input.siteId || undefined,
         siteName: input.site?.name,
@@ -298,6 +295,16 @@ export function createModelDiscovery(store: JsonStore) {
   }
 
   async function discoverProviderModels(siteId: string, apiKey: string, apiKeyName: string, request: http.IncomingMessage, kind = "api-key") {
+    if (kind === "account-pool") {
+      const provider = store.accountProviderForSite(siteId);
+      const site = store.getDb().sites.find((item) => item.id === siteId);
+      if (!provider || !site) throw new Error("账号池不存在，请在账号管理中添加账号");
+      const result = await createAccountCheck(store).checkTemporaryAccounts(undefined, undefined, provider);
+      if (!result.available) throw new Error(result.results[0]?.errorMessage || "账号池没有可用账号");
+      const models = [...new Set(store.managedAccounts().providers.find((item) => item.provider === provider)?.accounts.filter((account) => account.enabled && account.availability === "available").flatMap((account) => account.models) || [])].sort();
+      const address = site.addresses.find((item) => item.enabled);
+      return { siteId, siteName: site.name, addressId: address?.id || "", addressLabel: address?.label || "官方 API", models };
+    }
     const discoveryStartedAt = Date.now();
     const apiKeyValue = apiKey.trim();
     const apiKeyNameValue = apiKeyName.trim();

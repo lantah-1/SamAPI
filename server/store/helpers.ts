@@ -28,6 +28,7 @@ export const TEMPORARY_ACCOUNT_PROVIDER_LABELS: Record<TemporaryAccountProviderT
   gpt: "GPT",
   grok: "Grok",
   claude: "Claude",
+  deepseek: "DeepSeek",
   gemini: "Gemini"
 };
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -400,6 +401,7 @@ export function normalizeTemporaryAccountProviderType(value: unknown): Temporary
   if (value === "grok") return "grok";
   if (value === "claude") return "claude";
   if (value === "gemini") return "gemini";
+  if (value === "deepseek") return "deepseek";
   return "gpt";
 }
 

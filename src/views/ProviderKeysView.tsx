@@ -139,7 +139,9 @@ export function ProviderKeysView(props: {
                         名称
                         <TextInput value={apiKey.label} onChange={(event) => updateApiKey(index, { label: event.target.value })} />
                       </label>
-                      {selectedSiteIsOfficialGrok ? (
+                      {apiKey.kind === "account-pool" ? (
+                        <label>账号来源<span className="field-hint">使用「账号管理」中的供应商账号池，凭据、启停与默认账号均在账号管理中维护。</span></label>
+                      ) : selectedSiteIsOfficialGrok ? (
                         <label>
                           账号来源
                           <span className="field-hint">固定使用已导入的 Grok OAuth 临时账号池；模型请到「模型管理」页维护。</span>

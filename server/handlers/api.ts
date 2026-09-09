@@ -4,6 +4,10 @@ import type { JsonStore } from "../store.js";
 import { isRecord } from "../util/text.js";
 import { notFound, readJson, routeParam, sendJson } from "../http.js";
 import { ModelDiscoveryOptionsError } from "../model-discovery.js";
+import type { ModelPriceInput, UsageFilters } from "../../shared/usage.js";
+import { createModelPriceSync, type ModelPriceSync } from "../model-price-sync.js";
+import type { ManagedAccountInput } from "../../shared/accounts.js";
+import { accountProvider, temporaryAccountGroupView, temporaryAccountView } from "../accounts.js";
 import type {
   ProviderModelSyncOptions,
   ProviderModelSyncResult,
@@ -34,6 +38,7 @@ function temporaryAccountProviderTypeFromBody(body: unknown): TemporaryAccountPr
 
 interface ApiHandlerDeps {
   store: JsonStore;
+  modelPriceSync?: ModelPriceSync;
   hasAdminSession: (request: http.IncomingMessage) => boolean;
   renewAdminSession: (response: http.ServerResponse) => { expiresAt: string };
   verifyAdminPassword: (password: string) => boolean;
@@ -52,6 +57,7 @@ interface ApiHandlerDeps {
 }
 
 export function createApiHandler(deps: ApiHandlerDeps) {
+  const modelPriceSync = deps.modelPriceSync || createModelPriceSync(deps.store);
   const {
     store,
     hasAdminSession,
@@ -151,6 +157,28 @@ export function createApiHandler(deps: ApiHandlerDeps) {
         return sendJson(response, 200, { authenticated: false }, { "Set-Cookie": clearAdminSessionCookie() });
       }
 
+      if (parts[1] === "usage") {
+        const filters: UsageFilters = {
+          apiKeyId: url.searchParams.get("apiKeyId") || undefined,
+          from: url.searchParams.get("from") || undefined,
+          to: url.searchParams.get("to") || undefined,
+          timezoneOffsetMinutes: Number(url.searchParams.get("timezoneOffsetMinutes") || 0)
+        };
+        if (parts[2] === "prices") {
+          if (parts[3] === "sync" && !parts[4]) {
+            if (method === "GET") return sendJson(response, 200, modelPriceSync.status(), { "Cache-Control": "no-store" });
+            if (method === "POST") return sendJson(response, 200, await modelPriceSync.sync(), { "Cache-Control": "no-store" });
+            return notFound(response);
+          }
+          if (method === "GET" && !parts[3]) return sendJson(response, 200, store.listModelPrices());
+          if (method === "POST" && !parts[3]) return sendJson(response, 200, store.saveModelPrice(await readJson(request) as unknown as ModelPriceInput));
+          if (method === "DELETE" && parts[3]) { store.deleteModelPrice(routeParam(parts, 3)); return sendJson(response, 200, { ok: true }); }
+        }
+        if (method === "POST" && parts[2] === "price-unpriced") return sendJson(response, 200, { updated: store.priceUnpricedUsage() });
+        if (method === "GET" && !parts[2]) return sendJson(response, 200, store.usageReport(filters), { "Cache-Control": "no-store" });
+        return notFound(response);
+      }
+
       if (parts[1] === "logs") {
         if (method === "GET" && parts[2]) {
           const log = store.getRequestLog(routeParam(parts, 2));
@@ -240,6 +268,50 @@ export function createApiHandler(deps: ApiHandlerDeps) {
         }
       }
 
+      if (parts[1] === "accounts") {
+        if (method === "GET" && !parts[2]) return sendJson(response, 200, store.managedAccounts(), { "Cache-Control": "no-store" });
+        if (method === "POST" && !parts[2]) return sendJson(response, 201, store.createManagedAccount(await readJson(request) as unknown as ManagedAccountInput));
+        if (parts[2] === "oauth") {
+          if (method === "POST" && parts[3] === "start") return sendJson(response, 201, await startCodexOAuth());
+          if (method === "GET" && parts[3] === "status") {
+            const state = url.searchParams.get("state") || "";
+            const status = state ? codexOAuthStatus(state) : undefined;
+            return status ? sendJson(response, 200, status) : sendJson(response, 404, { error: "登录会话不存在或已过期" });
+          }
+        }
+        if (method === "POST" && parts[2] === "import") {
+          const result = store.importTemporaryAccounts({ ...await readJson(request), providerType: "gpt" });
+          return sendJson(response, 201, { ...result, group: temporaryAccountGroupView(result.group) });
+        }
+        if (method === "POST" && parts[2] === "check") {
+          const body = await readJson(request);
+          return sendJson(response, 200, await checkTemporaryAccounts(undefined, undefined, accountProvider(body.provider)));
+        }
+        if (parts[2] === "providers") {
+          const provider = accountProvider(parts[3]);
+          if (method === "PATCH" && !parts[4]) return sendJson(response, 200, store.setManagedAccountPolicy(provider, await readJson(request)));
+          if (method === "POST" && parts[4] === "route") return sendJson(response, 201, store.createManagedAccountRoute(provider, await readJson(request)));
+        }
+        if (method === "DELETE" && parts[2] === "batch") {
+          const body = await readJson(request);
+          const ids: string[] = Array.isArray(body.ids) ? body.ids.map(String) : [];
+          if (ids.some((id) => { const target = store.temporaryAccountCheckTarget(id); return !target || target.group.providerType === "grok"; })) throw new Error("账号不存在");
+          store.deleteTemporaryAccounts(ids);
+          return sendJson(response, 200, { ok: true });
+        }
+        if (parts[2] && !["providers", "oauth"].includes(parts[2])) {
+          const id = routeParam(parts, 2);
+          const target = store.temporaryAccountCheckTarget(id);
+          if (!target || target.group.providerType === "grok") return sendJson(response, 404, { error: "账号不存在" });
+          if (method === "PATCH" && !parts[3]) return sendJson(response, 200, store.updateManagedAccount(id, await readJson(request)));
+          if (method === "DELETE" && !parts[3]) { store.deleteTemporaryAccount(id); return sendJson(response, 200, { ok: true }); }
+          if (method === "POST" && parts[3] === "prefer") return sendJson(response, 200, store.setManagedAccountPolicy(target.group.providerType || "gpt", { preferredAccountId: id }));
+          if (method === "POST" && parts[3] === "check") return sendJson(response, 200, await checkSingleTemporaryAccount(id));
+          if (method === "POST" && parts[3] === "reset") return sendJson(response, 200, await resetSingleTemporaryAccount(id));
+        }
+        return notFound(response);
+      }
+
       if (parts[1] === "temporary-accounts") {
         if (method === "POST" && parts[2] === "oauth" && parts[3] === "start") {
           return sendJson(response, 201, await startCodexOAuth());
@@ -250,13 +322,13 @@ export function createApiHandler(deps: ApiHandlerDeps) {
           const status = codexOAuthStatus(state);
           return status ? sendJson(response, 200, status) : sendJson(response, 404, { error: "OAuth session 不存在或已过期" });
         }
-        if (method === "GET") return sendJson(response, 200, store.getDb().temporaryAccountGroups);
+        if (method === "GET") return sendJson(response, 200, store.getDb().temporaryAccountGroups.map(temporaryAccountGroupView));
         if (method === "POST" && parts[2] === "import") {
           const body = await readJson(request);
           const imported = store.importTemporaryAccounts(body);
           // Availability checks run client-side after the list previews imported accounts.
           const group = store.getDb().temporaryAccountGroups.find((item) => item.id === imported.group.id) || imported.group;
-          return sendJson(response, 201, { ...imported, group });
+          return sendJson(response, 201, { ...imported, group: temporaryAccountGroupView(group) });
         }
         if (method === "POST" && parts[2] === "check") {
           const body = await readJson(request);
@@ -277,13 +349,13 @@ export function createApiHandler(deps: ApiHandlerDeps) {
             const body = await readJson(request);
             return sendJson(response, 200, await resetSingleTemporaryAccount(accountId, temporaryAccountCheckProxyFromBody(body)));
           }
-          if (method === "PATCH") return sendJson(response, 200, store.updateTemporaryAccount(accountId, await readJson(request)));
+          if (method === "PATCH") return sendJson(response, 200, temporaryAccountView(store.updateTemporaryAccount(accountId, await readJson(request))));
           if (method === "DELETE") {
             store.deleteTemporaryAccount(accountId);
             return sendJson(response, 200, { ok: true });
           }
         }
-        if (method === "PATCH") return sendJson(response, 200, store.updateTemporaryAccountGroup(routeParam(parts, 2), await readJson(request)));
+        if (method === "PATCH") return sendJson(response, 200, temporaryAccountGroupView(store.updateTemporaryAccountGroup(routeParam(parts, 2), await readJson(request))));
         if (method === "DELETE") {
           store.deleteTemporaryAccountGroup(routeParam(parts, 2));
           return sendJson(response, 200, { ok: true });

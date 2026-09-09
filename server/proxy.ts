@@ -203,21 +203,18 @@ export function isUpstreamHeadersTimeout(error: unknown) {
 function requestHeadersTimeoutSignal(parentSignal: AbortSignal | undefined, timeoutMs: number) {
   const controller = new AbortController();
   let timedOut = false;
-  const onParentAbort = () => controller.abort(parentSignal?.reason);
-  if (parentSignal) {
-    if (parentSignal.aborted) onParentAbort();
-    else parentSignal.addEventListener("abort", onParentAbort, { once: true });
-  }
+  // Stop only the header timer once headers arrive. The client's cancellation must
+  // remain connected until the response body finishes (including idle SSE streams).
+  const signal = parentSignal ? AbortSignal.any([parentSignal, controller.signal]) : controller.signal;
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
   }, timeoutMs);
   return {
-    signal: controller.signal,
+    signal,
     timedOut: () => timedOut,
     cleanup: () => {
       clearTimeout(timer);
-      parentSignal?.removeEventListener("abort", onParentAbort);
     }
   };
 }
@@ -226,7 +223,8 @@ export async function fetchWithRouteProxy(
   target: Parameters<typeof fetch>[0],
   init: RequestInit,
   routeProxyConfig?: RouteProxyConfig,
-  timeoutMs = UPSTREAM_HEADERS_TIMEOUT_MS
+  timeoutMs = UPSTREAM_HEADERS_TIMEOUT_MS,
+  options: { retryNetworkErrors?: boolean } = {}
 ) {
   let resolvedProxy = routeProxy(routeProxyConfig);
   const proxyInit = resolvedProxy.url ? { ...init, dispatcher: proxyAgentFor(resolvedProxy.url) } as RequestInit & { dispatcher: ProxyAgent } : init;
@@ -255,6 +253,7 @@ export async function fetchWithRouteProxy(
     if (!routeProxyConfig || routeProxyConfig.mode === "direct" || !isNetworkError(error)) throw error;
     clearProxyAgent(resolvedProxy.url);
     resolvedProxy = routeProxy(routeProxyConfig, true);
+    if (options.retryNetworkErrors === false) throw error;
     const retryInit = resolvedProxy.url ? { ...init, dispatcher: proxyAgentFor(resolvedProxy.url) } as RequestInit & { dispatcher: ProxyAgent } : init;
     const response = await run(retryInit);
     return { response, proxy: { ...resolvedProxy, url: maskedProxyUrlValue(resolvedProxy.url), retried: true } satisfies RequestLogProxy };

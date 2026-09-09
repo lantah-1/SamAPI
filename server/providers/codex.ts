@@ -8,7 +8,7 @@ import {
   numberField,
   setHeader
 } from "../util/text.js";
-import { sseJsonObjectsFromReadable } from "../convert/stream.js";
+import { sseJsonObjectsFromReadable, streamEventErrorMessage } from "../convert/stream.js";
 import {
   CODEX_RESET_CREDITS_LIST_URL,
   CODEX_RESET_CREDITS_URL,
@@ -77,12 +77,14 @@ export async function refreshCodexTemporaryAccountToken(account: TemporaryAccoun
   if (!accessToken) throw new Error("刷新 Codex token 失败：响应缺少 access_token");
   const refreshToken = typeof payload.refresh_token === "string" && payload.refresh_token.trim() ? payload.refresh_token.trim() : undefined;
   const idToken = typeof payload.id_token === "string" && payload.id_token.trim() ? payload.id_token.trim() : undefined;
+  const expiresIn = typeof payload.expires_in === "number" && Number.isFinite(payload.expires_in) && payload.expires_in > 0 && payload.expires_in < 365 * 86400 ? payload.expires_in : undefined;
   return {
     secret: accessToken,
     refreshToken,
     idToken,
     accountId: codexAccountIdFromIdToken(idToken) || account.accountId,
-    email: emailFromIdToken(idToken) || account.email
+    email: emailFromIdToken(idToken) || account.email,
+    tokenExpiresAt: expiresIn ? new Date(Date.now() + expiresIn * 1000).toISOString() : undefined
   };
 }
 
@@ -345,15 +347,21 @@ export function codexTemporaryRequestBody(body: unknown, model: string) {
 export async function collectCodexResponsesBody(stream: ReadableStream<Uint8Array>) {
   let preview = "";
   let completedResponse: unknown;
-  for await (const event of sseJsonObjectsFromReadable(stream)) {
-    const chunk = `data: ${JSON.stringify(event)}\n\n`;
-    preview += chunk;
-    if (preview.length > 1200) preview = preview.slice(0, 1200);
-    if (isRecord(event) && event.type === "response.completed" && isRecord(event.response)) {
-      completedResponse = event.response;
-    } else if (isRecord(event) && isRecord(event.response)) {
-      completedResponse = event.response;
+  try {
+    for await (const event of sseJsonObjectsFromReadable(stream)) {
+      const errorMessage = streamEventErrorMessage(event);
+      if (errorMessage) throw new Error(errorMessage);
+      const chunk = `data: ${JSON.stringify(event)}\n\n`;
+      preview += chunk;
+      if (preview.length > 1200) preview = preview.slice(0, 1200);
+      if (isRecord(event) && ["response.completed", "response.incomplete"].includes(String(event.type)) && isRecord(event.response)) {
+        completedResponse = event.response;
+        break;
+      }
     }
+  } finally {
+    // Release both completed and failed streams, even when the upstream leaves the socket open.
+    await stream.cancel().catch(() => {});
   }
   if (!completedResponse) throw new Error("Codex 上游未返回 response.completed");
   return {

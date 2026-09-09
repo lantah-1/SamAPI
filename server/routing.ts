@@ -72,17 +72,20 @@ export function createRouting(store: JsonStore) {
   }
 
   function preferredStableCandidateKey(route: GroupRoute, candidates: ProxyExecutionCandidate[]) {
+    const respectAccountPolicy = (key: string) => {
+      const previous = candidates.find((candidate) => candidateKey(candidate) === key || candidateLogKey(candidate) === key);
+      if (previous?.temporaryAccount || previous?.temporaryApiKeyAccount) {
+        const current = candidates.find((candidate) => candidate.site.id === previous.site.id && candidate.model === previous.model);
+        if (current) return candidateKey(current);
+      }
+      return key;
+    };
     const runtimeKey = routeRuntimeState.get(route.id)?.stableCandidateKey;
-    if (runtimeKey && candidates.some((candidate) => candidateKey(candidate) === runtimeKey)) return runtimeKey;
+    if (runtimeKey && candidates.some((candidate) => candidateKey(candidate) === runtimeKey)) return respectAccountPolicy(runtimeKey);
 
-    const recentSuccess = store
-      .listRequestLogs()
-      .find((log) => log.routeId === route.id && log.status === "success" && log.providerId && log.model);
-    if (!recentSuccess?.providerId || !recentSuccess.model) return undefined;
-
-    return candidates.find((candidate) => candidateLogKey(candidate) === `${recentSuccess.providerId}::${recentSuccess.model}`)
-      ? `${recentSuccess.providerId}::${recentSuccess.model}`
-      : undefined;
+    const savedKey = store.getRouteLastSuccess(route.id);
+    return savedKey && candidates.some((candidate) => candidateKey(candidate) === savedKey || candidateLogKey(candidate) === savedKey)
+      ? respectAccountPolicy(savedKey) : undefined;
   }
 
   function orderedGroupCandidates(route: GroupRoute, candidates: ProxyExecutionCandidate[]) {
@@ -113,6 +116,7 @@ export function createRouting(store: JsonStore) {
     routeRuntimeState.set(route.id, {
       stableCandidateKey: candidateKey(candidate)
     });
+    store.setRouteLastSuccess(route.id, candidateKey(candidate));
   }
 
   function routeMemberKey(member: { siteId: string; apiKeyId: string; model: string }) {
@@ -151,10 +155,13 @@ export function createRouting(store: JsonStore) {
       const officialProviderApiKey = store.resolveProviderApiKey(site.id, route.model);
       const useChatGptOfficial = officialProviderApiKey?.kind === "chatgpt-official";
       const useGrokOfficial = officialProviderApiKey?.kind === "grok-official";
+      const managedProvider = store.accountProviderForSite(site.id);
       const temporaryAccounts = useChatGptOfficial || store.isOfficialOpenAiSite(site.id)
         ? store.resolveTemporaryOpenAiAccounts(route.model)
         : useGrokOfficial
           ? store.resolveTemporaryProviderAccounts("grok", route.model)
+        : managedProvider
+          ? store.resolveTemporaryProviderAccounts(managedProvider, route.model)
         : resolveTemporaryProviderAccountsForRoute(site, route.model);
       if (temporaryAccounts.length > 0) {
         const candidates: ProxyExecutionCandidate[] = temporaryAccounts.map((temporaryAccount, index) => {
@@ -181,7 +188,7 @@ export function createRouting(store: JsonStore) {
           site,
           addresses,
           model: route.model,
-          providerApiKey: useChatGptOfficial || useGrokOfficial ? undefined : officialProviderApiKey,
+          providerApiKey: useChatGptOfficial || useGrokOfficial || officialProviderApiKey?.kind === "account-pool" ? undefined : officialProviderApiKey,
           headerTemplate: routeHeaderTemplate(route),
           index: 0
         }
@@ -239,6 +246,14 @@ export function createRouting(store: JsonStore) {
             headerTemplate,
             index: candidates.length
           });
+        }
+        continue;
+      }
+      if (apiKey.kind === "account-pool") {
+        const provider = store.accountProviderForSite(site.id);
+        if (!provider) continue;
+        for (const account of store.resolveTemporaryProviderAccounts(provider, member.model)) {
+          candidates.push({ site, addresses, model: member.model, providerApiKey: account, temporaryApiKeyAccount: account, headerTemplate, index: candidates.length });
         }
         continue;
       }

@@ -12,7 +12,7 @@ import type {
   TemporaryAccountProviderType
 } from "../../shared/types";
 
-export type Section = "routes" | "sites" | "providerKeys" | "models" | "temporaryAccounts" | "keys" | "headers" | "logs" | "settings" | "docs";
+export type Section = "routes" | "sites" | "providerKeys" | "models" | "accounts" | "temporaryAccounts" | "keys" | "headers" | "logs" | "usage" | "settings" | "docs";
 export type AuthStatus = "checking" | "signed-out" | "signed-in";
 
 export interface RouteDraft {

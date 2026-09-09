@@ -11,13 +11,15 @@
     "build:server": "tsc -p tsconfig.server.build.json",
     "start": "node build/server/index.js",
     "preview": "vite preview --host 0.0.0.0",
-    "typecheck": "tsc -b --pretty false"
+    "typecheck": "tsc -b --pretty false",
+    "test": "TSX_TSCONFIG_PATH=tsconfig.app.json node --import tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "@radix-ui/react-popover": "^1.1.19",
     "@vitejs/plugin-react": "^5.0.0",
     "@zenmux/rosetta-ai": "^1.0.1",
     "better-sqlite3": "^12.11.1",
+    "cheerio": "^1.2.0",
     "concurrently": "^9.2.0",
     "jszip": "^3.10.1",
     "libsodium-wrappers": "^0.7.13",

@@ -2,7 +2,6 @@ import type {
   AppSnapshot,
   GroupRoute,
   GroupRouteMember,
-  RequestLog,
   RouteProxyConfig,
   RouteRecord,
   RouteType,
@@ -378,28 +377,6 @@ export function prettyJson(value: unknown) {
   if (value === undefined || value === null || value === "") return "-";
   if (typeof value === "string") return value;
   return JSON.stringify(value, null, 2);
-}
-
-export function upstreamRequestSummary(log: RequestLog) {
-  const request = log.upstreamRequest;
-  if (!request) return "-";
-  const {
-    requestBody: _requestBody,
-    status: _status,
-    statusCode: _statusCode,
-    durationMs: _durationMs,
-    contentType: _contentType,
-    responsePreview: _responsePreview,
-    errorMessage: _errorMessage,
-    ...summary
-  } = request;
-  return summary;
-}
-
-export function upstreamRequestBody(log: RequestLog) {
-  const request = log.upstreamRequest;
-  if (!request || request.requestBody === undefined) return "-";
-  return request.requestBody;
 }
 
 export function apiOrigin() {

@@ -57,6 +57,7 @@ import type {
 } from "../shared/types";
 
 import { AuthLanding } from "./components/AuthLanding";
+import { MainNavigation } from "./components/MainNavigation";
 import { NavButton } from "./components/NavButton";
 import { ActionButton, SelectInput, TextInput } from "./components/ui";
 import {
@@ -72,6 +73,8 @@ import {
   SitesView,
   TemporaryAccountsView
 } from "./views";
+import { UsageView } from "./views/UsageView";
+import { AccountsView } from "./views/AccountsView";
 import { updateSiteChromeFromTheme } from "./app/chrome";
 import {
   LOGS_PAGE_SIZE,
@@ -85,8 +88,6 @@ import {
   temporaryAccountAvailabilityLabels,
   temporaryAccountProviderLabels,
   temporaryAccountSourceLabels,
-  navItems,
-  mobilePrimarySections,
   sectionMeta,
   settingsNavItem,
   themeOptions
@@ -136,9 +137,7 @@ import {
   temporaryAccountQuotaText,
   temporaryAccountTypeLabel,
   toastDurationMs,
-  uniqueMembers,
-  upstreamRequestSummary,
-  upstreamRequestBody
+  uniqueMembers
 } from "./app/utils";
 
 // Keep UI progressive checks aligned with server default; high concurrency stresses local proxies.
@@ -182,15 +181,18 @@ export default function App() {
   const [selectedLogDetail, setSelectedLogDetail] = useState<RequestLog | null>(null);
   const [selectedLogLoading, setSelectedLogLoading] = useState(false);
   const [selectedLogError, setSelectedLogError] = useState("");
+  const requestLogsRef = useRef<RequestLogSummary[]>([]);
+  const logsRefreshInFlight = useRef(false);
+  const logsLoadingMoreRef = useRef(false);
+  requestLogsRef.current = snapshot?.requestLogs || [];
   const [busy, setBusy] = useState(false);
   const [modelSyncing, setModelSyncing] = useState(false);
   const [modelSyncingGroupId, setModelSyncingGroupId] = useState<string | null>(null);
   const [temporaryAccountChecking, setTemporaryAccountChecking] = useState<string | null>(null);
-  const [temporaryAccountOAuthBusy, setTemporaryAccountOAuthBusy] = useState(false);
   const [temporaryAccountCheckingIds, setTemporaryAccountCheckingIds] = useState<string[]>([]);
   const [temporaryAccountQueuedIds, setTemporaryAccountQueuedIds] = useState<string[]>([]);
   const [temporaryAccountResetting, setTemporaryAccountResetting] = useState<string | null>(null);
-  const [temporaryAccountCheckProviderType, setTemporaryAccountCheckProviderType] = useState<Extract<TemporaryAccountProviderType, "gpt" | "grok">>("gpt");
+  const [temporaryAccountCheckProviderType, setTemporaryAccountCheckProviderType] = useState<Extract<TemporaryAccountProviderType, "gpt" | "grok">>("grok");
   const [temporaryAccountUpdating, setTemporaryAccountUpdating] = useState<string | null>(null);
   const [temporaryAccountDeleting, setTemporaryAccountDeleting] = useState<string | null>(null);
   const [selectedTemporaryAccountIds, setSelectedTemporaryAccountIds] = useState<string[]>([]);
@@ -465,7 +467,8 @@ export default function App() {
 
   const loadMoreLogs = async () => {
     const offset = snapshot?.requestLogs.length || 0;
-    if (logsLoadingMore || offset >= logsTotal) return;
+    if (logsLoadingMore || logsRefreshInFlight.current || offset >= logsTotal) return;
+    logsLoadingMoreRef.current = true;
     setLogsLoadingMore(true);
     try {
       const result = await api.listLogs(LOGS_PAGE_SIZE, offset);
@@ -478,57 +481,38 @@ export default function App() {
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "日志加载失败");
     } finally {
+      logsLoadingMoreRef.current = false;
       setLogsLoadingMore(false);
     }
   };
 
   const refreshLogs = async (showSuccess = false) => {
+    if (logsRefreshInFlight.current || logsLoadingMoreRef.current) return;
+    logsRefreshInFlight.current = true;
     setLogsRefreshing(true);
     try {
-      const latestCreatedAt = snapshot?.requestLogs[0]?.createdAt;
-      if (!latestCreatedAt) {
-        const result = await api.listLogs(LOGS_PAGE_SIZE, 0);
-        setSnapshot((current) => (current ? { ...current, requestLogs: result.items } : current));
-        setLogsTotal(result.total);
-        if (showSuccess) setToast("日志已刷新");
-        return;
-      }
-      const [result, latestPage] = await Promise.all([
-        api.listNewLogs(latestCreatedAt),
-        api.listLogs(LOGS_PAGE_SIZE, 0)
-      ]);
-      const mergedLatest = [...result.items, ...latestPage.items].filter((log, index, items) => items.findIndex((item) => item.id === log.id) === index);
-      if (mergedLatest.length > 0) {
-        setSnapshot((current) => {
-          if (!current) return current;
-          const existingIds = new Set(current.requestLogs.map((log) => log.id));
-          const latestIds = new Set(mergedLatest.map((log) => log.id));
-          const newItems = mergedLatest.filter((log) => !existingIds.has(log.id));
-          const updatedItems = current.requestLogs.map((log) => mergedLatest.find((item) => item.id === log.id) || log);
-          return { ...current, requestLogs: [...newItems, ...updatedItems.filter((log) => !latestIds.has(log.id) || existingIds.has(log.id))] };
-        });
-      }
-      setLogsTotal(latestPage.total);
-      if (showSuccess) setToast(result.items.length > 0 ? `日志已刷新，新增 ${result.items.length} 条` : "日志已刷新");
+      const visibleCount = Math.max(LOGS_PAGE_SIZE, requestLogsRef.current.length);
+      const first = await api.listLogs(Math.min(100, visibleCount), 0);
+      const offsets: number[] = [];
+      for (let offset = first.items.length; offset < Math.min(first.total, visibleCount); offset += 100) offsets.push(offset);
+      const rest = await Promise.all(offsets.map((offset) => api.listLogs(Math.min(100, visibleCount - offset), offset)));
+      const items = [...new globalThis.Map([first, ...rest].flatMap((page) => page.items).map((log) => [log.id, log])).values()];
+      setSnapshot((current) => current ? { ...current, requestLogs: items } : current);
+      setLogsTotal(first.total);
+      if (showSuccess) setToast("日志已刷新");
     } catch (error) {
       if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "日志刷新失败");
     } finally {
+      logsRefreshInFlight.current = false;
       setLogsRefreshing(false);
     }
   };
 
-  const openLogDetail = async (id: string) => {
+  const openLogDetail = (id: string) => {
     setSelectedLogId(id);
     setSelectedLogDetail(null);
     setSelectedLogError("");
     setSelectedLogLoading(true);
-    try {
-      setSelectedLogDetail(await api.getLog(id));
-    } catch (error) {
-      if (!handleUnauthorized(error)) setSelectedLogError(error instanceof Error ? error.message : "日志详情加载失败");
-    } finally {
-      setSelectedLogLoading(false);
-    }
   };
 
   const closeLogDetail = () => {
@@ -543,7 +527,7 @@ export default function App() {
       await api.deleteLog(id);
       setSnapshot((current) => (current ? { ...current, requestLogs: current.requestLogs.filter((log) => log.id !== id) } : current));
       setLogsTotal((current) => Math.max(0, current - 1));
-      if (selectedLogId === id) closeLogDetail();
+      if (selectedLogId === id || selectedLogDetail?.id === id) closeLogDetail();
     }, "日志已删除");
   };
 
@@ -650,9 +634,24 @@ export default function App() {
     if (authStatus !== "signed-in" || section !== "logs" || !logsAutoRefresh) return;
     const interval = window.setInterval(() => {
       refreshLogs();
-    }, 5000);
+    }, 2000);
     return () => window.clearInterval(interval);
-  }, [authStatus, section, logsAutoRefresh, snapshot?.requestLogs[0]?.createdAt]);
+  }, [authStatus, section, logsAutoRefresh]);
+
+  const selectedLogRevision = logsAutoRefresh ? snapshot?.requestLogs.find((log) => log.id === (selectedLogDetail?.id || selectedLogId))?.revision : undefined;
+  useEffect(() => {
+    if (!selectedLogId) return;
+    let cancelled = false;
+    api.getLog(selectedLogId).then((log) => {
+      if (cancelled) return;
+      setSelectedLogDetail(log);
+      setSelectedLogError("");
+      if (log.id !== selectedLogId) setSelectedLogId(log.id);
+    }).catch((error: unknown) => {
+      if (!cancelled && !handleUnauthorized(error)) setSelectedLogError(error instanceof Error ? error.message : "日志详情加载失败");
+    }).finally(() => { if (!cancelled) setSelectedLogLoading(false); });
+    return () => { cancelled = true; };
+  }, [selectedLogId, selectedLogRevision]);
 
   const selectedSite = useMemo(
     () => snapshot?.sites.find((site) => site.id === routeDraft.siteId),
@@ -886,55 +885,6 @@ export default function App() {
     };
   };
 
-  const loginTemporaryChatGptAccount = async () => {
-    if (temporaryAccountOAuthBusy) return;
-    const loginWindow = window.open("about:blank", "samapi-chatgpt-oauth", "popup=yes,width=720,height=820");
-    setTemporaryAccountOAuthBusy(true);
-    setTemporaryAccountCheckProviderType("gpt");
-    try {
-      const session = await api.startTemporaryAccountOAuth();
-      if (loginWindow) {
-        loginWindow.location.href = session.authorizationUrl;
-      } else {
-        const opened = window.open(session.authorizationUrl, "_blank", "noopener,noreferrer");
-        if (!opened) throw new Error("浏览器阻止了登录窗口，请允许 SamAPI 打开弹窗后重试");
-      }
-      setToast("已打开 ChatGPT 登录页面，正在等待授权完成...");
-      const deadline = Date.now() + 10 * 60 * 1000;
-      let accountId = "";
-      while (Date.now() < deadline) {
-        await new Promise((resolve) => window.setTimeout(resolve, 1500));
-        const status = await api.temporaryAccountOAuthStatus(session.state);
-        if (status.status === "pending") continue;
-        if (status.status === "error") throw new Error(status.error || "ChatGPT 授权失败");
-        accountId = status.accountId || "";
-        break;
-      }
-      if (!accountId) throw new Error("ChatGPT 登录等待超时，请重新登录");
-      loginWindow?.close();
-      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
-      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
-      setTemporaryAccountsLoaded(true);
-      setTemporaryAccountsLoading(false);
-      setToast("ChatGPT 登录成功，正在检查账号额度...");
-      setTemporaryAccountChecking(accountId);
-      setTemporaryAccountCheckingIds([accountId]);
-      const result = await api.checkTemporaryAccount(accountId);
-      const item = result.results[0];
-      if (item) applyTemporaryAccountCheckItem(item);
-      const refreshedGroups = await api.listTemporaryAccountGroups();
-      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups: refreshedGroups } : current));
-      setToast(`ChatGPT 登录成功：${item ? temporaryAccountAvailabilityLabels[item.availability] : "账号已添加"}`);
-    } catch (error) {
-      loginWindow?.close();
-      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "ChatGPT 登录失败");
-    } finally {
-      setTemporaryAccountOAuthBusy(false);
-      setTemporaryAccountChecking(null);
-      setTemporaryAccountCheckingIds([]);
-      setTemporaryAccountQueuedIds([]);
-    }
-  };
 
   const checkTemporaryAccounts = async () => {
     const accountIds = (snapshot?.temporaryAccountGroups || [])
@@ -1127,7 +1077,7 @@ export default function App() {
   };
 
   const openNewTemporaryAccounts = () => {
-    setTemporaryAccountDraft(emptyTemporaryAccountImport());
+    setTemporaryAccountDraft({ ...emptyTemporaryAccountImport(), providerType: "grok", name: "Grok 临时账号" });
     setTemporaryAccountEditorOpen(true);
   };
 
@@ -1373,26 +1323,7 @@ export default function App() {
               <div className="text-xs text-ink/55">Local model gateway</div>
             </div>
           </div>
-          <nav className="app-nav-groups" aria-label="主导航">
-            <div className="app-nav-group">
-              <div className="app-nav-group-label">编排</div>
-              {navItems.filter((item) => ["routes", "sites"].includes(item.id)).map((item) => (
-                <NavButton key={item.id} item={item} active={section === item.id} onClick={navigateToSection} className="mobile-primary-nav" />
-              ))}
-            </div>
-            <div className="app-nav-group">
-              <div className="app-nav-group-label">资源</div>
-              {navItems.filter((item) => ["providerKeys", "models", "temporaryAccounts", "keys", "headers"].includes(item.id)).map((item) => (
-                <NavButton key={item.id} item={item} active={section === item.id} onClick={navigateToSection} className={mobilePrimarySections.includes(item.id) ? "mobile-primary-nav" : ""} />
-              ))}
-            </div>
-            <div className="app-nav-group">
-              <div className="app-nav-group-label">观测与接入</div>
-              {navItems.filter((item) => ["logs", "docs"].includes(item.id)).map((item) => (
-                <NavButton key={item.id} item={item} active={section === item.id} onClick={navigateToSection} className={mobilePrimarySections.includes(item.id) ? "mobile-primary-nav" : ""} />
-              ))}
-            </div>
-          </nav>
+          <MainNavigation section={section} onNavigate={navigateToSection} />
           <div className="app-database hidden rounded-lg border border-ink/10 bg-white/50 p-3 text-xs leading-5 text-ink/60 lg:block">
             <div className="mb-1 flex items-center gap-2 font-semibold text-ink">
               <Database className="h-4 w-4" />
@@ -1543,6 +1474,7 @@ export default function App() {
                 onEditModels={openEditProviderModels}
               />
             )}
+            {section === "accounts" && <AccountsView onChanged={() => load({ includeTemporaryAccounts: temporaryAccountsLoaded })} onUnauthorized={handleUnauthorized} onNotify={setToast} />}
             {section === "temporaryAccounts" && (
               <TemporaryAccountsView
                 snapshot={snapshot}
@@ -1550,8 +1482,6 @@ export default function App() {
                 editorOpen={temporaryAccountEditorOpen}
                 busy={busy}
                 checking={temporaryAccountChecking}
-                oauthBusy={temporaryAccountOAuthBusy}
-                onOAuthLogin={loginTemporaryChatGptAccount}
                 checkingAccountIds={temporaryAccountCheckingIds}
                 queuedAccountIds={temporaryAccountQueuedIds}
                 checkProviderType={temporaryAccountCheckProviderType}
@@ -1640,6 +1570,7 @@ export default function App() {
                 onCopy={copyText}
               />
             )}
+            {section === "usage" && <UsageView sites={snapshot.sites} onUnauthorized={handleUnauthorized} />}
             {section === "settings" && (
               <SettingsView
                 snapshot={snapshot}

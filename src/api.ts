@@ -1,3 +1,5 @@
+import type { ModelPrice, ModelPriceInput, ModelPriceSyncReport, UsageFilters, UsageReport } from "../shared/usage";
+import type { AccountProvider, ManagedAccount, ManagedAccountInput, ManagedAccountPatch, ManagedAccountsSnapshot } from "../shared/accounts";
 import type {
   ApiKeyCreated,
   ApiKeyRecord,
@@ -97,6 +99,25 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  managedAccounts: () => request<ManagedAccountsSnapshot>("/api/accounts"),
+  createManagedAccount: (body: ManagedAccountInput) => request<ManagedAccount>("/api/accounts", { method: "POST", body: JSON.stringify(body) }),
+  updateManagedAccount: (id: string, body: ManagedAccountPatch) => request<ManagedAccount>(`/api/accounts/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteManagedAccount: (id: string) => request<{ ok: true }>(`/api/accounts/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  deleteManagedAccounts: (ids: string[]) => request<{ ok: true }>("/api/accounts/batch", { method: "DELETE", body: JSON.stringify({ ids }) }),
+  preferManagedAccount: (id: string) => request<ManagedAccountsSnapshot>(`/api/accounts/${encodeURIComponent(id)}/prefer`, { method: "POST" }),
+  managedAccountPolicy: (provider: AccountProvider, strategy: string) => request<ManagedAccountsSnapshot>(`/api/accounts/providers/${provider}`, { method: "PATCH", body: JSON.stringify({ strategy }) }),
+  checkManagedAccount: (id: string) => request<TemporaryAccountCheckResult>(`/api/accounts/${encodeURIComponent(id)}/check`, { method: "POST" }),
+  resetManagedAccount: (id: string) => request<TemporaryAccountCheckResult>(`/api/accounts/${encodeURIComponent(id)}/reset`, { method: "POST" }),
+  importManagedAccounts: (body: TemporaryAccountImportInput) => request<TemporaryAccountImportResult>("/api/accounts/import", { method: "POST", body: JSON.stringify(body) }),
+  startAccountOAuth: () => request<{ state: string; authorizationUrl: string; redirectUri: string }>("/api/accounts/oauth/start", { method: "POST" }),
+  accountOAuthStatus: (state: string) => request<{ state: string; status: "pending" | "success" | "error"; error?: string; accountId?: string }>(`/api/accounts/oauth/status?state=${encodeURIComponent(state)}`),
+  usage: (filters: UsageFilters = {}) => request<UsageReport>(`/api/usage?${usageQuery(filters)}`),
+  modelPrices: () => request<ModelPrice[]>("/api/usage/prices"),
+  modelPriceSync: () => request<ModelPriceSyncReport>("/api/usage/prices/sync"),
+  syncModelPrices: () => request<ModelPriceSyncReport>("/api/usage/prices/sync", { method: "POST" }),
+  saveModelPrice: (price: ModelPriceInput) => request<ModelPrice>("/api/usage/prices", { method: "POST", body: JSON.stringify(price) }),
+  deleteModelPrice: (id: string) => request<{ ok: true }>(`/api/usage/prices/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  priceUnpricedUsage: () => request<{ updated: number }>("/api/usage/price-unpriced", { method: "POST" }),
   authSession: () => request<AuthSession>("/api/auth/session"),
   login: (password: string) =>
     request<AuthSession>("/api/auth/login", {
@@ -242,3 +263,9 @@ export const api = {
       body: JSON.stringify(settings)
     })
 };
+
+function usageQuery(filters: UsageFilters) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) if (value !== undefined && value !== "") query.set(key, String(value));
+  return query.toString();
+}

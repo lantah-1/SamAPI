@@ -1,8 +1,9 @@
 import type { JsonStore } from "./store.js";
-import { extractUpstreamError, mapWithConcurrency } from "./util/text.js";
+import { extractUpstreamError, isRecord, mapWithConcurrency } from "./util/text.js";
+import { accountProviders } from "../shared/accounts.js";
+import { accountProvider, redactAccountError } from "./accounts.js";
 import { isNetworkError, upstreamNetworkErrorMessage } from "./proxy.js";
 import {
-  OPENAI_MODELS_URL,
   TEMPORARY_ACCOUNT_CHECK_CONCURRENCY,
   fetchTemporaryAccountCheckText
 } from "./providers/constants.js";
@@ -87,6 +88,7 @@ export function createAccountCheck(store: JsonStore) {
           idToken?: string;
           accountId?: string;
           email?: string;
+          tokenExpiresAt?: string;
         }
       | undefined;
     let activeAccount = account;
@@ -201,44 +203,55 @@ export function createAccountCheck(store: JsonStore) {
   }
 
   async function checkOpenAiApiKeyTemporaryAccount(account: TemporaryAccount, checkedAt: string, proxyConfig?: RouteProxyConfig) {
-    const { response, text } = await fetchTemporaryAccountCheckText(OPENAI_MODELS_URL, {
-      headers: {
-        Authorization: `Bearer ${account.secret}`,
-        Accept: "application/json"
+    const provider = accountProvider(account.providerType || "gpt");
+    const group = store.temporaryAccountCheckTarget(account.id)?.group;
+    const site = store.getDb().sites.find((item) => item.id === group?.siteId);
+    const address = site?.addresses.find((item) => item.enabled);
+    let base = (address?.baseUrl || accountProviders[provider].baseUrl).replace(/\/$/, "");
+    if (provider === "gemini") base = base.replace(/\/openai$/, "");
+    const headers: Record<string, string> = provider === "claude" ? { "x-api-key": account.secret, "anthropic-version": "2023-06-01" }
+      : provider === "gemini" ? { "x-goog-api-key": account.secret } : { Authorization: `Bearer ${account.secret}` };
+    headers.Accept = "application/json";
+    const models: string[] = [];
+    const pages = new Set<string>();
+    let cursor = "";
+    let statusCode = 200;
+    for (let page = 0; page < 100; page++) {
+      const url = new URL(`${base}/models`);
+      if (cursor) url.searchParams.set(provider === "gemini" ? "pageToken" : "after_id", cursor);
+      const { response, text } = await fetchTemporaryAccountCheckText(url, { headers }, proxyConfig);
+      statusCode = response.status;
+      if (!response.ok) {
+        const errorMessage = redactAccountError(extractUpstreamError(text) || `HTTP ${response.status}`, account)!;
+        const availability = response.status >= 500 ? "unknown" as const : "unavailable" as const;
+        return { patch: { availability, quotaStages: account.quotaStages, lastQuotaCheckedAt: checkedAt, lastCheckStatusCode: response.status, lastCheckError: errorMessage }, result: { availability, status: "failed" as const, statusCode: response.status, quotaStages: account.quotaStages, errorMessage, checkedAt } };
       }
-    }, proxyConfig);
-    if (!response.ok) {
-      const errorMessage = extractUpstreamError(text) || `HTTP ${response.status}`;
-      return {
-        patch: {
-          availability: "unavailable" as const,
-          quotaStages: account.quotaStages,
-          lastQuotaCheckedAt: checkedAt,
-          lastCheckStatusCode: response.status,
-          lastCheckError: errorMessage
-        },
-        result: {
-          availability: "unavailable" as const,
-          status: "failed" as const,
-          statusCode: response.status,
-          quotaStages: account.quotaStages,
-          errorMessage,
-          checkedAt
-        }
-      };
+      const body: unknown = JSON.parse(text);
+      if (!isRecord(body) || (!Array.isArray(body.data) && !Array.isArray(body.models))) throw new Error("模型列表返回格式无效");
+      for (const model of (Array.isArray(body.data) ? body.data : body.models) as unknown[]) {
+        if (!isRecord(model)) continue;
+        const id = typeof model.id === "string" ? model.id : typeof model.name === "string" ? model.name.replace(/^models\//, "") : "";
+        if (id) models.push(id);
+      }
+      const next = provider === "gemini" ? body.nextPageToken : body.has_more ? body.last_id : undefined;
+      if (body.has_more && !next) throw new Error("模型列表分页缺少游标");
+      if (!next) break;
+      if (typeof next !== "string" || pages.has(next) || page === 99) throw new Error("模型列表分页异常");
+      cursor = next; pages.add(next);
     }
     return {
       patch: {
         availability: "available" as const,
+        models: [...new Set(models)].sort(),
         quotaStages: account.quotaStages,
         lastQuotaCheckedAt: checkedAt,
-        lastCheckStatusCode: response.status,
+        lastCheckStatusCode: statusCode,
         lastCheckError: undefined
       },
       result: {
         availability: "available" as const,
         status: "success" as const,
-        statusCode: response.status,
+        statusCode,
         quotaStages: account.quotaStages,
         checkedAt
       }
@@ -323,17 +336,27 @@ export function createAccountCheck(store: JsonStore) {
   }
 
   async function checkTemporaryAccount(groupId: string, account: TemporaryAccount, proxyConfig?: RouteProxyConfig): Promise<TemporaryAccountCheckItemResult> {
+    // Editing or deleting an account during a check must not apply an old credential's result.
+    account = { ...account };
     const checkedAt = new Date().toISOString();
     const accountProxy = proxyConfig || siteProxyForTemporaryAccountGroup(groupId);
+    const changedWhileChecking = (): TemporaryAccountCheckItemResult | undefined => {
+      const current = store.temporaryAccountCheckTarget(account.id)?.account;
+      if (current && current.secret === account.secret && current.refreshToken === account.refreshToken && current.agentPrivateKey === account.agentPrivateKey) return undefined;
+      return { groupId, accountId: account.id, label: current?.label || account.label, availability: current?.availability || "unknown", status: "cancelled", quotaStages: current?.quotaStages || [], errorMessage: "账号在检查期间发生变更，已忽略旧检查结果", checkedAt: current?.lastQuotaCheckedAt || checkedAt };
+    };
     try {
-      const accountIsCodex = account.accountType === "codex" || Boolean(account.accountId);
       const providerType = account.providerType || "gpt";
+      const accountIsCodex = providerType === "gpt" && (account.accountType === "codex" || Boolean(account.accountId));
       const check = providerType === "grok"
         ? await checkGrokTemporaryAccount(account, checkedAt, accountProxy)
         : accountIsCodex
           ? await checkCodexTemporaryAccount(account, checkedAt, accountProxy)
           : await checkOpenAiApiKeyTemporaryAccount(account, checkedAt, accountProxy);
-      const updated = store.updateTemporaryAccountCheckResult(account.id, check.patch);
+      const changed = changedWhileChecking();
+      if (changed) return changed;
+      const safeError = redactAccountError(redactAccountError(check.result.errorMessage, account), { ...account, ...check.patch });
+      const updated = store.updateTemporaryAccountCheckResult(account.id, { ...check.patch, lastCheckError: safeError });
       return {
         groupId,
         accountId: account.id,
@@ -342,12 +365,14 @@ export function createAccountCheck(store: JsonStore) {
         status: check.result.status,
         statusCode: check.result.statusCode,
         quotaStages: updated?.quotaStages || check.result.quotaStages,
-        errorMessage: check.result.errorMessage,
+        errorMessage: safeError,
         checkedAt
       };
     } catch (error) {
+      const changed = changedWhileChecking();
+      if (changed) return changed;
       const rawMessage = error instanceof Error ? error.message : String(error);
-      const errorMessage = upstreamNetworkErrorMessage(error, "账号检查请求上游失败");
+      const errorMessage = redactAccountError(upstreamNetworkErrorMessage(error, "账号检查请求上游失败"), account)!;
       const authFailure = isTemporaryAccountAuthFailure(rawMessage);
       // Network/proxy blips stay "unknown" for every provider so a flaky local proxy
       // (especially under concurrent batch checks) doesn't permanently retire the account.

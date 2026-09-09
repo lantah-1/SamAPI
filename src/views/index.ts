@@ -6,3 +6,5 @@ export * from "./TemporaryAccountsView";
 export * from "./KeysView";
 export * from "./HeadersView";
 export * from "./SystemViews";
+export * from "./UsageView";
+export * from "./AccountsView";

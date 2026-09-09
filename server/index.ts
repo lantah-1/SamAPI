@@ -5,6 +5,7 @@ import { createAccountCheck } from "./account-check.js";
 import { createRouting } from "./routing.js";
 import { createModelDiscovery } from "./model-discovery.js";
 import { startProviderModelSyncScheduler } from "./model-sync-scheduler.js";
+import { createModelPriceSync } from "./model-price-sync.js";
 import { createApiHandler } from "./handlers/api.js";
 import { createProxyHandler } from "./handlers/proxy.js";
 import { ADMIN_PASSWORD_IS_DEFAULT, HOST, PORT, WEB_DIR } from "./config.js";
@@ -14,6 +15,7 @@ import { JsonStore } from "./store.js";
 import { createCodexOAuth } from "./codex-oauth.js";
 
 const store = new JsonStore();
+const modelPriceSync = createModelPriceSync(store);
 const {
   adminSessionCookie,
   clearAdminSessionCookie,
@@ -29,6 +31,7 @@ const { discoverProviderModels, syncAllProviderModels } = createModelDiscovery(s
 const { start: startCodexOAuth, status: codexOAuthStatus } = createCodexOAuth(store);
 const { handleApi } = createApiHandler({
   store,
+  modelPriceSync,
   hasAdminSession,
   renewAdminSession,
   verifyAdminPassword,
@@ -80,7 +83,9 @@ server.listen(PORT, HOST, () => {
   console.log(`Database: ${store.dbPath}`);
   console.log(`Web UI: ${WEB_DIR}`);
   console.log("Fetch proxy: per-supplier-address");
-  startProviderModelSyncScheduler({ syncAllProviderModels });
+  const modelSyncScheduler = startProviderModelSyncScheduler({ syncAllProviderModels });
+  modelPriceSync.start();
+  server.on("close", () => { modelSyncScheduler.stop(); modelPriceSync.stop(); });
   if (ADMIN_PASSWORD_IS_DEFAULT && !store.getAdminPasswordHash()) {
     console.warn("Admin password is using the local default: samapi-admin. Set SAMAPI_ADMIN_PASSWORD before exposing SamAPI publicly.");
   }

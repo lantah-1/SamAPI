@@ -1,5 +1,6 @@
 import {
   Activity,
+  ChartNoAxesCombined,
   Boxes,
   Braces,
   KeyRound,
@@ -8,7 +9,8 @@ import {
   Server,
   Settings,
   ShieldCheck,
-  Upload
+  Upload,
+  UsersRound
 } from "lucide-react";
 import type {
   AppThemeId,
@@ -77,6 +79,7 @@ export const temporaryAccountProviderLabels: Record<TemporaryAccountProviderType
   gpt: "GPT",
   grok: "Grok",
   claude: "Claude",
+  deepseek: "DeepSeek",
   gemini: "Gemini"
 };
 
@@ -119,19 +122,40 @@ export const themeOptions = [
   }
 ] satisfies Array<{ id: AppThemeId; name: string; description: string; swatches: string[] }>;
 
-export const navItems = [
-  { id: "routes", label: "路由管理", icon: Route },
-  { id: "sites", label: "站点管理", icon: Server },
-  { id: "providerKeys", label: "密钥管理", icon: KeyRound },
-  { id: "models", label: "模型管理", icon: Boxes },
-  { id: "temporaryAccounts", label: "临时账号", icon: Upload },
-  { id: "keys", label: "客户端密钥", icon: ShieldCheck },
-  { id: "headers", label: "请求头模板", icon: Braces },
-  { id: "logs", label: "请求日志", icon: Activity },
-  { id: "docs", label: "接入指南", icon: Map }
-] satisfies Array<{ id: Section; label: string; icon: typeof Route }>;
+type NavItem = { id: Section; label: string; icon: typeof Route };
 
-export const settingsNavItem = { id: "settings", label: "系统设置", icon: Settings } satisfies { id: Section; label: string; icon: typeof Route };
+export const navGroups = [
+  {
+    label: "编排",
+    items: [
+      { id: "routes", label: "路由管理", icon: Route },
+      { id: "sites", label: "站点管理", icon: Server }
+    ]
+  },
+  {
+    label: "资源",
+    items: [
+      { id: "providerKeys", label: "密钥管理", icon: KeyRound },
+      { id: "models", label: "模型管理", icon: Boxes },
+      { id: "accounts", label: "账号管理", icon: UsersRound },
+      { id: "temporaryAccounts", label: "临时账号", icon: Upload },
+      { id: "keys", label: "客户端密钥", icon: ShieldCheck },
+      { id: "headers", label: "请求头模板", icon: Braces }
+    ]
+  },
+  {
+    label: "观测与接入",
+    items: [
+      { id: "logs", label: "请求日志", icon: Activity },
+      { id: "usage", label: "消费统计", icon: ChartNoAxesCombined },
+      { id: "docs", label: "接入指南", icon: Map }
+    ]
+  }
+] satisfies Array<{ label: string; items: NavItem[] }>;
+
+export const navItems = navGroups.flatMap<NavItem>((group) => group.items);
+
+export const settingsNavItem = { id: "settings", label: "系统设置", icon: Settings } satisfies NavItem;
 export const allNavItems = [...navItems, settingsNavItem];
 
 export const sectionMeta: Record<Section, { category: string; description: string; addLabel?: string }> = {
@@ -139,13 +163,15 @@ export const sectionMeta: Record<Section, { category: string; description: strin
   sites: { category: "上游资源", description: "管理供应商地址、代理方式与可用状态。", addLabel: "添加站点" },
   providerKeys: { category: "上游资源", description: "集中维护供应商凭据与密钥分组。", addLabel: "添加密钥组" },
   models: { category: "上游资源", description: "同步并控制各供应商对外开放的模型。" },
-  temporaryAccounts: { category: "账号资源", description: "导入、检查和调度临时模型账号。", addLabel: "导入账号" },
+  accounts: { category: "账号资源", description: "管理 GPT、Claude、DeepSeek 等供应商的登录账号与 API Key。" },
+  temporaryAccounts: { category: "账号资源", description: "导入、检查和调度 Grok 临时账号。", addLabel: "导入账号" },
   keys: { category: "访问控制", description: "签发下游客户端使用的访问密钥。", addLabel: "创建密钥" },
   headers: { category: "访问控制", description: "复用转发请求所需的请求头配置。", addLabel: "新建模板" },
-  logs: { category: "运行状态", description: "查看请求链路、耗时与失败原因。" },
+  logs: { category: "运行状态", description: "按当次用户输入查看接口调用、上游结果与工具回传。" },
+  usage: { category: "运行状态", description: "按客户端 Key 查看 Token 用量、消费估算与模型定价。" },
   docs: { category: "开发接入", description: "复制代理地址、客户端配置与调用示例。" },
   settings: { category: "系统", description: "调整界面、日志保留与安全配置。" }
 };
 
-export const mobilePrimarySections: Section[] = ["routes", "sites", "temporaryAccounts", "logs"];
+export const mobilePrimarySections: Section[] = ["routes", "accounts", "usage", "logs"];
 export const LOGS_PAGE_SIZE = 3;

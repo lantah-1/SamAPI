@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createStreamLogCollector } from "../log-content.js";
 import { bodyRecord, extractUpstreamError, isRecord } from "../util/text.js";
 import { extractResponseText } from "./payload.js";
 import type { ProxyKind, RosettaConverter, RouteEndpointKind } from "../proxy-path.js";
@@ -180,7 +181,8 @@ export async function* sseJsonObjectsFromReadable(stream: ReadableStream<Uint8Ar
       const separator = buffer.slice(separatorIndex).match(/^\r?\n\r?\n/)?.[0] || "\n\n";
       buffer = buffer.slice(separatorIndex + separator.length);
       const parsed = parseSseFrame(frame);
-      if (parsed.data && parsed.data !== "[DONE]") {
+      if (parsed.data === "[DONE]") return;
+      if (parsed.data) {
         yield JSON.parse(parsed.data);
       }
       separatorIndex = buffer.search(/\r?\n\r?\n/);
@@ -301,14 +303,15 @@ export function serializeStreamEvent(proxyKind: ProxyKind, event: unknown) {
 export function streamEventErrorMessage(event: unknown) {
   if (!isRecord(event)) return "";
   const type = typeof event.type === "string" ? event.type.toLowerCase() : "";
-  const error = event.error;
+  const error = event.error || (isRecord(event.response) ? event.response.error : undefined);
   const errorRecord = isRecord(error) ? error : undefined;
   const message =
     (typeof errorRecord?.message === "string" && errorRecord.message) ||
     (typeof error === "string" && error) ||
     (typeof event.message === "string" && event.message) ||
     "";
-  if (type === "error" || type.includes(".error") || type.endsWith(".failed") || errorRecord) {
+  if (type === "error" || type.endsWith("_error") || type.includes(".error") || type.endsWith(".failed")
+    || (type === "response" && event.status === "failed") || error) {
     return message || JSON.stringify(event);
   }
   return "";
@@ -356,37 +359,41 @@ export async function streamConvertedResponse(input: {
   requestBody: unknown;
   converter: RosettaConverter;
 }) {
-  let preview = "";
+  const log = createStreamLogCollector();
+  async function* observedEvents() {
+    for await (const event of sseJsonObjectsFromReadable(input.upstreamBody)) {
+      log.event(event);
+      yield event;
+      // The converted protocol may not have a terminal event of its own (e.g. Responses → Chat).
+      // End the input at its terminal event instead of waiting for an idle upstream socket to close.
+      if (isTerminalStreamEvent(input.routeEndpoint === "chat/completions" ? "chat-completions" : input.routeEndpoint, event)) return;
+    }
+  }
   const upstreamStream =
     input.routeEndpoint === "chat/completions"
       ? normalizeOpenAiChatReasoningStream({
-          stream: sseJsonObjectsFromReadable(input.upstreamBody),
+          stream: observedEvents(),
           routeModel: input.routeModel,
           requestBody: input.requestBody
         })
-      : sseJsonObjectsFromReadable(input.upstreamBody);
-  let sawTerminal = false;
+      : observedEvents();
   for await (const event of input.converter.convertStream?.(upstreamStream) || []) {
     const chunk = serializeStreamEvent(input.proxyKind, event);
-    preview += chunk;
-    if (preview.length > 1200) preview = preview.slice(0, 1200);
     await writeResponseChunk(input.response, chunk);
     const errorMessage = streamEventErrorMessage(event);
     if (errorMessage) throw new Error(errorMessage);
     if (isTerminalStreamEvent(input.proxyKind, event)) {
       // Terminal event delivered — stop reading upstream instead of blocking on its EOF.
-      sawTerminal = true;
       break;
     }
   }
-  if (sawTerminal) input.upstreamBody.cancel().catch(() => {});
+  input.upstreamBody.cancel().catch(() => {});
   if (input.proxyKind === "chat-completions" || input.proxyKind === "generic") {
     const done = "data: [DONE]\n\n";
-    preview += done;
-    if (preview.length > 1200) preview = preview.slice(0, 1200);
     await writeResponseChunk(input.response, done);
   }
-  return preview;
+  if (log.error) throw new Error(log.error);
+  return log.finish();
 }
 
 export async function streamRawResponse(input: {
@@ -394,7 +401,7 @@ export async function streamRawResponse(input: {
   response: http.ServerResponse;
   proxyKind: ProxyKind;
 }) {
-  let preview = "";
+  const log = createStreamLogCollector();
   const marker = terminalSseMarker(input.proxyKind);
   // `preview` is truncated from the front for logging, so a separate rolling tail is needed to spot
   // the terminal marker even when it lands split across chunk boundaries.
@@ -405,8 +412,7 @@ export async function streamRawResponse(input: {
   let terminalFrame: string | null = null;
   let sawTerminal = false;
   for await (const chunk of textChunksFromReadable(input.upstreamBody)) {
-    preview += chunk;
-    if (preview.length > 1200) preview = preview.slice(0, 1200);
+    log.push(chunk);
     await writeResponseChunk(input.response, chunk);
     if (!marker) continue;
     if (terminalFrame === null) {
@@ -429,7 +435,8 @@ export async function streamRawResponse(input: {
     }
   }
   if (sawTerminal) input.upstreamBody.cancel().catch(() => {});
-  const errorMessage = streamPreviewErrorMessage(preview);
+  const result = log.finish();
+  const errorMessage = log.error;
   if (errorMessage) throw new Error(errorMessage);
-  return preview;
+  return result;
 }

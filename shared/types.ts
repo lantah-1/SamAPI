@@ -19,7 +19,7 @@ export type TemporaryAccountImportSource = "cpa" | "subapi";
 
 export type TemporaryAccountImportMode = "auto" | "subapi" | "sub2api-k12" | "cpa" | "auth-json" | "zip";
 
-export type TemporaryAccountProviderType = "gpt" | "grok" | "claude" | "gemini";
+export type TemporaryAccountProviderType = "gpt" | "grok" | "claude" | "gemini" | "deepseek";
 
 export type TemporaryAccountAvailability = "unknown" | "available" | "unavailable";
 
@@ -61,7 +61,7 @@ export interface ApiKeyCreated extends ApiKeyRecord {
   plainTextKey: string;
 }
 
-export type ProviderApiKeyKind = "api-key" | "chatgpt-official" | "grok-official";
+export type ProviderApiKeyKind = "api-key" | "chatgpt-official" | "grok-official" | "account-pool";
 
 export type ProviderModelManageMode = "auto" | "manual";
 
@@ -158,7 +158,7 @@ export interface TemporaryAccount {
   label: string;
   prefix: string;
   secret: string;
-  accountType?: "codex" | "openai-api-key";
+  accountType?: "codex" | "openai-api-key" | "api-key";
   providerType?: TemporaryAccountProviderType;
   accountId?: string;
   email?: string;
@@ -205,6 +205,7 @@ export interface TemporaryAccountGroup {
   providerType?: TemporaryAccountProviderType;
   siteId: string;
   strategy?: GroupRouteStrategy;
+  preferredAccountId?: string;
   enabled: boolean;
   accounts: TemporaryAccount[];
   createdAt: string;
@@ -354,9 +355,12 @@ export interface RequestLogUpstreamRequest {
   errorMessage?: string;
 }
 
-export interface RequestLog {
+/** Transient context accepted by the logger; only the compact RequestLog is persisted. */
+export interface RequestLogInput {
   id: string;
   createdAt: string;
+  /** A failed/retried upstream attempt belonging to this downstream request. */
+  parentRequestId?: string;
   routeName: string;
   routeId?: string;
   method: string;
@@ -378,6 +382,8 @@ export interface RequestLog {
   requestBody?: unknown;
   upstreamUrl?: string;
   upstreamContentType?: string;
+  /** First event that released the response prelude; helps explain failures after streaming began. */
+  streamStartedWith?: string;
   responsePreview?: string;
   errorMessage?: string;
   downstream?: RequestLogDownstream;
@@ -387,30 +393,78 @@ export interface RequestLog {
   summary?: string;
 }
 
+export interface RequestLogUpstream {
+  provider: string;
+  model: string;
+  url: string;
+}
+
+export interface RequestLogResult {
+  status: RequestLogStatus;
+  statusCode: number;
+  body: string;
+  streamStartedWith?: string;
+}
+
+export type RequestLogPhase = "running" | "waiting-tools" | "returned" | "failed" | "cancelled";
+
+export interface RequestLogAttempt {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  upstream?: RequestLogUpstream;
+  result: RequestLogResult;
+}
+
+export interface RequestLogCall {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  result: RequestLogResult;
+  attempts: RequestLogAttempt[];
+}
+
+export interface RequestLogTool {
+  id: string;
+  requestId: string;
+  resultRequestId?: string;
+  callId?: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  status: RequestLogStatus;
+  result: string;
+}
+
+export interface RequestLog {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  revision: number;
+  /** Masked headers from the first downstream request, stored once for the whole turn. */
+  requestHeaders: Record<string, string>;
+  /** Only this turn's user input, resolved from the shared message record. */
+  msg: string[];
+  upstream?: RequestLogUpstream;
+  result: RequestLogResult;
+  phase: RequestLogPhase;
+  calls: RequestLogCall[];
+  tools: RequestLogTool[];
+}
+
 export interface RequestLogSummary {
   id: string;
   createdAt: string;
-  status: RequestLogStatus;
-  statusCode: number;
-  durationMs: number;
-  downstream: RequestLogDownstream;
-  routeName: string;
-  routeId?: string;
-  routeTarget: RequestLogRouteTarget;
-  providerName: string;
-  providerId?: string;
-  model: string;
-  userAgent?: string;
-  clientIp?: string;
-  clientDevice?: string;
-  apiKeyId?: string;
-  apiKeyName?: string;
-  headerTemplateId?: string;
-  headerTemplateName?: string;
-  upstreamUrl?: string;
-  proxy?: RequestLogProxy;
-  errorMessage?: string;
-  summary?: string;
+  updatedAt: string;
+  revision: number;
+  msg: string;
+  messageCount: number;
+  upstream?: RequestLogUpstream;
+  result: RequestLogResult;
+  phase: RequestLogPhase;
+  requestCount: number;
+  attemptCount: number;
+  toolCount: number;
 }
 
 export interface RequestLogPage {
@@ -457,6 +511,7 @@ export interface AppBackupData extends Omit<AppDatabase, "adminPasswordHash"> {}
 export interface AppBackup {
   format: "samapi-backup";
   version: 1;
+  accountPolicyVersion?: 1;
   exportedAt: string;
   data: AppBackupData;
 }

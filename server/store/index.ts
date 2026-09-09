@@ -18,9 +18,7 @@ import type {
   ProviderApiKeyKind,
   ProviderModelManageMode,
   ProviderModelSyncStatus,
-  RequestLog,
-  RequestLogSummary,
-  RequestLogUpstreamRequest,
+  RequestLogInput,
   RouteDisplayGroup,
   RouteProxyConfig,
   RouteRecord,
@@ -64,22 +62,12 @@ import {
   smartModelMatches,
   temporaryAccountCanBeUsed
 } from "./helpers.js";
-import { clientDeviceFromUserAgent, resolveStoredClientIp } from "../util/text.js";
-
-function normalizeRequestLogShape(log: RequestLog): RequestLog {
-  const legacy = log as RequestLog & { upstreamAttempts?: RequestLogUpstreamRequest[] };
-  let normalized: RequestLog = log;
-  if (!log.upstreamRequest && Array.isArray(legacy.upstreamAttempts)) {
-    const upstreamRequest = legacy.upstreamAttempts.at(-1);
-    const { upstreamAttempts: _upstreamAttempts, ...rest } = legacy;
-    normalized = upstreamRequest ? { ...rest, upstreamRequest } : rest;
-  }
-  return {
-    ...normalized,
-    clientIp: resolveStoredClientIp(normalized),
-    clientDevice: normalized.clientDevice || clientDeviceFromUserAgent(normalized.userAgent)
-  };
-}
+import { RequestLogStore } from "./request-logs.js";
+import type { LogResponseTool } from "../log-context.js";
+import { UsageStore } from "./usage.js";
+import type { ModelPriceInput, ModelPriceSyncState, OfficialModelPrice, UsageFilters, UsageRecordInput } from "../../shared/usage.js";
+import { accountProviders, type AccountProvider, type ManagedAccountInput, type ManagedAccountPatch, type ManagedAccountsSnapshot } from "../../shared/accounts.js";
+import { accountProvider, managedAccountView } from "../accounts.js";
 
 function normalizedTemporaryAccountLabel(
   account: Pick<TemporaryAccount, "label" | "email" | "accountId" | "agentRuntimeId">,
@@ -104,8 +92,9 @@ export class JsonStore {
   readonly sqlitePath: string;
   private readonly sqlite: SqliteDatabase;
   private db: AppDatabase;
-  private requestLogs: RequestLog[] = [];
-  private temporaryAccountIndex = 0;
+  private readonly requestLogStore: RequestLogStore;
+  private readonly usageStore: UsageStore;
+  private readonly temporaryAccountIndexes = new Map<string, number>();
 
   constructor(dataDir = process.env.SAMAPI_DATA_DIR || path.resolve(process.cwd(), "data")) {
     this.dataDir = path.resolve(dataDir);
@@ -116,20 +105,176 @@ export class JsonStore {
     mkdirSync(this.dataDir, { recursive: true });
     this.sqlite = new DatabaseConstructor(this.sqlitePath);
     this.initializeSqlite();
+    this.usageStore = new UsageStore(this.sqlite);
+    this.requestLogStore = new RequestLogStore(this.sqlite, (log) => {
+      if (log.status !== "success" || !log.routeId || !log.providerId || !log.model) return;
+      this.sqlite.prepare(`INSERT INTO route_last_success (route_id, candidate_key, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(route_id) DO UPDATE SET candidate_key = excluded.candidate_key, updated_at = excluded.updated_at
+        WHERE excluded.updated_at >= route_last_success.updated_at`).run(log.routeId, `${log.providerId}::${log.model}`, log.createdAt);
+    });
     this.db = this.load();
+    this.requestLogStore.migrate(this.db.settings.maxRequestLogs);
     const migratedRouteProxies = this.migrateRouteProxiesToAddresses();
     this.ensureOfficialChatGptProviderKeyGroup();
     this.ensureOfficialGrokSite();
     this.ensureOfficialGrokProviderKeyGroup();
     const mergedTemporaryAccounts = this.mergeTemporaryAccountTypeGroups();
+    const migratedAccountPolicies = this.migrateManagedAccountPolicies();
     const migratedGrokModels = this.migrateOfficialGrokAddressModelsToProviderKey();
     const removedUnsupportedGrokAccounts = this.removeUnsupportedGrokAccounts();
     this.refreshGroupRouteMembers();
-    if (migratedRouteProxies || mergedTemporaryAccounts || migratedGrokModels || removedUnsupportedGrokAccounts) this.persist();
+    if (migratedRouteProxies || mergedTemporaryAccounts || migratedGrokModels || removedUnsupportedGrokAccounts || migratedAccountPolicies) this.persist();
+    let managedAccountsSynced = false;
+    for (const group of this.db.temporaryAccountGroups) {
+      if (group.providerType && group.providerType !== "gpt" && group.providerType !== "grok") { this.syncManagedAccountModels(accountProvider(group.providerType)); managedAccountsSynced = true; }
+    }
+    if (managedAccountsSynced) this.persist();
   }
 
   getDb() {
     return this.db;
+  }
+
+  close() {
+    if (this.sqlite.open) this.sqlite.close();
+  }
+
+  recordUsage(record: UsageRecordInput) { this.usageStore.record(record); }
+  usageReport(filters: UsageFilters = {}) { return this.usageStore.report(filters, this.db.apiKeys); }
+  listModelPrices() { return this.usageStore.listPrices(); }
+  saveModelPrice(price: ModelPriceInput) { return this.usageStore.savePrice(price); }
+  deleteModelPrice(id: string) { this.usageStore.deletePrice(id); }
+  priceUnpricedUsage() { return this.usageStore.priceUnpricedRecords(); }
+  modelPriceSyncStates() { return this.usageStore.priceSyncStates(); }
+  saveModelPriceSyncState(state: ModelPriceSyncState) { this.usageStore.savePriceSyncState(state); }
+  saveOfficialModelPrices(prices: OfficialModelPrice[], state: ModelPriceSyncState) { this.usageStore.saveOfficialPrices(prices, state); }
+
+  managedAccounts(): ManagedAccountsSnapshot {
+    return { providers: (Object.keys(accountProviders) as AccountProvider[]).map((provider) => {
+      const group = this.db.temporaryAccountGroups.find((item) => (item.providerType || "gpt") === provider);
+      const models = [...new Set(this.db.providerApiKeyGroups.filter((item) => item.siteId === group?.siteId).flatMap((item) => item.apiKeys.flatMap((key) => key.models)))].sort();
+      return { provider, siteId: group?.siteId, strategy: group?.strategy || this.db.settings.temporaryAccountStrategy, preferredAccountId: group?.preferredAccountId, models, accounts: group?.accounts.map((account) => managedAccountView(account, group)) || [] };
+    }) };
+  }
+
+  accountProviderForSite(siteId: string): AccountProvider | undefined {
+    const group = this.db.temporaryAccountGroups.find((item) => item.siteId === siteId && item.providerType !== "grok");
+    return group ? accountProvider(group.providerType || "gpt") : undefined;
+  }
+
+  private ensureAccountSite(provider: AccountProvider) {
+    if (provider === "gpt") return this.ensureOfficialOpenAiSite();
+    const group = this.db.temporaryAccountGroups.find((item) => item.providerType === provider);
+    const assigned = this.db.sites.find((item) => item.id === group?.siteId);
+    if (assigned && !this.isOfficialOpenAiSite(assigned.id)) return assigned;
+    const definition = accountProviders[provider];
+    const hostname = new URL(definition.baseUrl).hostname;
+    const existing = this.db.sites.find((site) => site.addresses.some((address) => { try { return new URL(address.baseUrl).hostname === hostname; } catch { return false; } }));
+    return existing || this.upsertSite({ name: definition.label, addresses: [{ id: `addr-${randomUUID()}`, label: "官方 API", baseUrl: definition.baseUrl, models: [], enabled: true, proxy: { mode: "direct" } }] });
+  }
+
+  private migrateManagedAccountPolicies() {
+    if (this.sqlite.prepare("SELECT 1 FROM meta WHERE key = 'managed_account_policy_format'").get()) return false;
+    // Older group.strategy values were unused; the global strategy controlled all pools.
+    // Preserve that behavior until the administrator explicitly selects a per-provider policy.
+    let changed = false;
+    for (const group of this.db.temporaryAccountGroups) {
+      if (group.providerType !== "grok" && !group.preferredAccountId && group.strategy !== undefined) { group.strategy = undefined; changed = true; }
+    }
+    this.sqlite.transaction(() => {
+      this.sqlite.prepare("UPDATE temporary_account_groups SET strategy = NULL WHERE COALESCE(provider_type, 'gpt') != 'grok' AND preferred_account_id IS NULL").run();
+      this.sqlite.prepare("INSERT INTO meta (key, value) VALUES ('managed_account_policy_format', '1')").run();
+    })();
+    return changed;
+  }
+
+  createManagedAccount(input: ManagedAccountInput) {
+    const provider = accountProvider(input.provider);
+    const label = typeof input.label === "string" ? input.label.trim() : "";
+    const secret = typeof input.secret === "string" ? input.secret.trim() : "";
+    if (!label || label.length > 200) throw new Error("账号名称不能为空且最多 200 字符");
+    if (!secret || secret.length > 4096 || /\s/.test(secret)) throw new Error("API Key 无效");
+    if (input.models !== undefined && (!Array.isArray(input.models) || input.models.some((model) => typeof model !== "string"))) throw new Error("模型列表无效");
+    if (this.db.temporaryAccountGroups.some((group) => (group.providerType || "gpt") === provider && group.accounts.some((account) => account.secret === secret))) throw new Error("该供应商已存在使用相同凭据的账号");
+    const site = this.ensureAccountSite(provider);
+    const group = this.ensureTemporaryAccountTypeGroup(provider, site.id, "subapi");
+    const account: TemporaryAccount = { id: `account-${randomUUID()}`, label, prefix: secret.slice(0, 12), secret, providerType: provider, accountType: "api-key", enabled: true, models: normalizeModelList(input.models), availability: "unknown", quotaStages: [], importedAt: now() };
+    group.accounts.push(account); group.enabled = true; group.updatedAt = now();
+    if (!group.preferredAccountId && group.accounts.length === 1) { group.preferredAccountId = account.id; group.strategy = "priority"; }
+    this.syncManagedAccountModels(provider);
+    this.persist();
+    return managedAccountView(account, group);
+  }
+
+  updateManagedAccount(id: string, input: ManagedAccountPatch) {
+    const target = this.temporaryAccountCheckTarget(id);
+    if (!target || target.group.providerType === "grok") throw new Error("账号不存在");
+    const { account, group } = target;
+    if (input.label !== undefined && (typeof input.label !== "string" || !input.label.trim() || input.label.length > 200)) throw new Error("账号名称无效");
+    if (input.models !== undefined && (!Array.isArray(input.models) || input.models.some((model) => typeof model !== "string"))) throw new Error("模型列表无效");
+    if (input.secret !== undefined && typeof input.secret !== "string") throw new Error("API Key 无效");
+    const secret = input.secret?.trim();
+    if (secret) {
+      if (managedAccountView(account, group).kind !== "api-key") throw new Error("登录账号请重新授权，不能替换为 API Key");
+      if (secret.length > 4096 || /\s/.test(secret)) throw new Error("API Key 无效");
+      if (group.accounts.some((item) => item.id !== id && item.secret === secret)) throw new Error("此凭据已被其他账号使用");
+    }
+    if (input.label !== undefined) account.label = input.label.trim();
+    if (input.models !== undefined) account.models = normalizeModelList(input.models);
+    if (typeof input.enabled === "boolean") account.enabled = input.enabled;
+    if (secret) { account.secret = secret; account.prefix = secret.slice(0, 12); account.availability = "unknown"; account.lastCheckError = undefined; account.quotaStages = []; }
+    group.updatedAt = now();
+    this.syncManagedAccountModels(accountProvider(group.providerType || "gpt"));
+    this.persist();
+    return managedAccountView(account, group);
+  }
+
+  setManagedAccountPolicy(providerInput: unknown, input: { strategy?: string; preferredAccountId?: string }) {
+    const provider = accountProvider(providerInput);
+    const group = this.db.temporaryAccountGroups.find((item) => (item.providerType || "gpt") === provider);
+    if (!group) throw new Error("请先添加该供应商的账号");
+    if (input.strategy && !["priority", "stable-first", "sequential", "random"].includes(input.strategy)) throw new Error("账号调度策略无效");
+    if (input.preferredAccountId) {
+      const account = group.accounts.find((item) => item.id === input.preferredAccountId);
+      if (!account || !account.enabled || account.availability === "unavailable") throw new Error("默认账号必须已启用且未失效");
+      group.preferredAccountId = account.id; group.strategy = "priority";
+    } else if (input.strategy) {
+      group.strategy = input.strategy as TemporaryAccountGroup["strategy"];
+      if (input.strategy === "sequential" || input.strategy === "random") group.preferredAccountId = undefined;
+    }
+    group.updatedAt = now(); this.persist();
+    return this.managedAccounts();
+  }
+
+  createManagedAccountRoute(providerInput: unknown, input: { name?: string; model?: string }) {
+    const provider = accountProvider(providerInput);
+    const group = this.db.temporaryAccountGroups.find((item) => (item.providerType || "gpt") === provider);
+    if (!group || !group.accounts.some((account) => account.enabled)) throw new Error("请先添加并启用账号");
+    if (!input.model || !this.resolveTemporaryProviderAccounts(provider, input.model).length) throw new Error("没有支持该模型的可用账号");
+    return this.upsertRoute({ type: "switch", name: input.name?.trim() || `${provider}-${input.model}`, siteId: group.siteId, model: input.model, endpoint: accountProviders[provider].endpoint, enabled: true });
+  }
+
+  private syncManagedAccountModels(provider: AccountProvider) {
+    const accountGroup = this.db.temporaryAccountGroups.find((group) => (group.providerType || "gpt") === provider);
+    if (!accountGroup) return;
+    const assignedSite = this.db.sites.find((site) => site.id === accountGroup.siteId);
+    const site = provider === "gpt" ? this.ensureOfficialOpenAiSite() : assignedSite && !this.isOfficialOpenAiSite(assignedSite.id) ? assignedSite : this.ensureAccountSite(provider);
+    accountGroup.siteId = site.id;
+    let group = this.db.providerApiKeyGroups.find((item) => item.siteId === site.id && item.apiKeys.some((key) => key.kind === (provider === "gpt" ? "chatgpt-official" : "account-pool")));
+    if (!group) {
+      if (provider === "gpt") { this.ensureOfficialChatGptProviderKeyGroup(); group = this.db.providerApiKeyGroups.find((item) => item.siteId === site.id && item.apiKeys.some((key) => key.kind === "chatgpt-official")); }
+      else {
+        const timestamp = now();
+        group = { id: `provider-key-group-accounts-${provider}`, siteId: site.id, groupName: `${accountProviders[provider].label} 账号`, modelManageMode: "manual", apiKeys: [{ id: `provider-key-accounts-${provider}`, label: `${accountProviders[provider].label} 账号池`, prefix: "account-pool", secret: "", kind: "account-pool", enabled: true, models: [] }], createdAt: timestamp, updatedAt: timestamp };
+        this.db.providerApiKeyGroups.push(group);
+      }
+    }
+    const key = group?.apiKeys.find((item) => item.kind === (provider === "gpt" ? "chatgpt-official" : "account-pool"));
+    if (key) {
+      const models = accountGroup.accounts.filter((account) => account.enabled).flatMap((account) => account.models);
+      key.models = [...new Set([...(provider === "gpt" ? key.models : []), ...models])].sort();
+      this.syncSiteModelsFromProviderKeys(site.id); this.refreshGroupRouteMembers();
+    }
   }
 
   exportBackup(): AppBackup {
@@ -137,6 +282,7 @@ export class JsonStore {
     return {
       format: "samapi-backup",
       version: 1,
+      accountPolicyVersion: 1,
       exportedAt: now(),
       data: structuredClone(data)
     };
@@ -193,7 +339,8 @@ export class JsonStore {
     for (const group of next.temporaryAccountGroups) {
       if (!group?.id || !group.siteId || !Array.isArray(group.accounts)) throw new Error("备份文件包含无效的临时账号分组");
       group.providerType = normalizeTemporaryAccountProviderType(group.providerType || group.name);
-      group.strategy = normalizeGroupStrategy(group.strategy);
+      group.strategy = group.strategy === undefined ? undefined : normalizeGroupStrategy(group.strategy);
+      if (backup.accountPolicyVersion !== 1 && group.providerType !== "grok" && !group.preferredAccountId) group.strategy = undefined;
       group.enabled = group.enabled !== false;
       for (const account of group.accounts) {
         if (!account?.id || typeof account.secret !== "string") throw new Error("备份文件包含无效的临时账号");
@@ -213,10 +360,11 @@ export class JsonStore {
       if (!group?.id || !group.name || !Array.isArray(group.routeIds)) throw new Error("备份文件包含无效的路由展示分组");
     }
 
-    const retainedLogs = this.requestLogs.slice(0, next.settings.maxRequestLogs);
-    this.replaceSqliteDatabase(next, retainedLogs);
+    this.sqlite.transaction(() => {
+      this.replaceSqliteDatabase(next);
+      this.requestLogStore.trim(next.settings.maxRequestLogs);
+    })();
     this.db = next;
-    this.requestLogs = retainedLogs;
 
     return {
       ok: true,
@@ -306,101 +454,51 @@ export class JsonStore {
     return changed;
   }
 
-  private requestLogSummary(log: RequestLog): RequestLogSummary {
-    const route = this.db.routes.find((item) => item.id === log.routeId || item.name === log.routeName);
-    const headerTemplateId = route && (route.type === "switch" || route.type === "group") ? route.headerTemplateId : undefined;
-    const headerTemplate = headerTemplateId ? this.db.headerTemplates.find((item) => item.id === headerTemplateId) : undefined;
-    return {
-      id: log.id,
-      createdAt: log.createdAt,
-      status: log.status,
-      statusCode: log.statusCode,
-      durationMs: log.durationMs,
-      downstream: log.downstream || {
-        model: log.routeName,
-        endpoint: log.path,
-        userAgent: log.userAgent,
-        path: log.path,
-        method: log.method
-      },
-      routeName: log.routeName,
-      routeId: log.routeId,
-      routeTarget: log.routeTarget || {
-        routeName: log.routeName,
-        model: log.model,
-        endpoint: log.endpoint,
-        providerName: log.providerName
-      },
-      providerName: log.providerName,
-      providerId: log.providerId,
-      model: log.model,
-      userAgent: log.userAgent,
-      clientIp: resolveStoredClientIp(log),
-      clientDevice: log.clientDevice || clientDeviceFromUserAgent(log.userAgent),
-      apiKeyId: log.apiKeyId,
-      apiKeyName: log.apiKeyName,
-      headerTemplateId,
-      headerTemplateName: headerTemplate?.name,
-      upstreamUrl: log.upstreamUrl,
-      errorMessage: log.errorMessage,
-      proxy: log.proxy,
-      summary: log.summary
-    };
-  }
-
   listRequestLogs(limit = this.db.settings.maxRequestLogs, offset = 0) {
-    return this.requestLogs.slice(offset, offset + limit).map((log) => this.requestLogSummary(log));
+    return this.requestLogStore.list(limit, offset);
   }
 
   listNewRequestLogs(since: string, limit = this.db.settings.maxRequestLogs) {
-    return this.requestLogs.filter((log) => log.createdAt > since).slice(0, limit).map((log) => this.requestLogSummary(log));
+    return this.requestLogStore.list(limit, 0, since);
   }
 
   getRequestLog(id: string) {
-    const log = this.requestLogs.find((item) => item.id === id);
-    if (!log) return undefined;
-    return {
-      ...log,
-      clientIp: resolveStoredClientIp(log),
-      clientDevice: log.clientDevice || clientDeviceFromUserAgent(log.userAgent)
-    };
+    return this.requestLogStore.get(id);
   }
 
-  updateRequestLog(id: string, patch: Partial<Omit<RequestLog, "id" | "createdAt">>) {
-    const index = this.requestLogs.findIndex((log) => log.id === id);
-    if (index < 0) return undefined;
-    const updated = {
-      ...this.requestLogs[index],
-      ...patch
-    };
-    this.requestLogs[index] = updated;
-    this.insertRequestLogRow(updated);
-    return updated;
+  updateRequestLog(id: string, patch: Partial<Omit<RequestLogInput, "id" | "createdAt">>) {
+    return this.requestLogStore.update(id, patch);
   }
 
   requestLogCount() {
-    return this.requestLogs.length;
+    return this.requestLogStore.count();
   }
 
-  recordRequestLog(input: Omit<RequestLog, "id" | "createdAt">) {
-    const created: RequestLog = {
-      id: `log-${randomUUID()}`,
-      createdAt: now(),
-      ...input
-    };
-    this.requestLogs.unshift(created);
-    this.insertRequestLogRow(created);
-    if (this.requestLogs.length > this.db.settings.maxRequestLogs) {
-      this.requestLogs = this.requestLogs.slice(0, this.db.settings.maxRequestLogs);
-      this.rewriteRequestLogFile();
-    }
-    return created;
+  recordRequestLog(input: Omit<RequestLogInput, "id" | "createdAt">) {
+    return this.requestLogStore.record(input, this.db.settings.maxRequestLogs);
+  }
+
+  associateRequestLog(id: string, headers: Record<string, string>, body: unknown, clientScope: string) {
+    return this.requestLogStore.associate(id, headers, body, clientScope);
+  }
+
+  observeRequestLog(id: string, observationId: string, responseIds: string[], tools: LogResponseTool[]) {
+    this.requestLogStore.observe(id, observationId, responseIds, tools);
+  }
+
+  getRouteLastSuccess(routeId: string) {
+    const row = this.sqlite.prepare("SELECT candidate_key FROM route_last_success WHERE route_id = ?").get(routeId) as { candidate_key: string } | undefined;
+    return row?.candidate_key;
+  }
+
+  setRouteLastSuccess(routeId: string, candidateKey: string) {
+    this.sqlite.prepare(`INSERT INTO route_last_success (route_id, candidate_key, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(route_id) DO UPDATE SET candidate_key = excluded.candidate_key, updated_at = excluded.updated_at`).run(routeId, candidateKey, now());
   }
 
   updateSettings(input: Partial<AppSettings>) {
     this.db.settings = normalizeSettings({ ...this.db.settings, ...input });
-    this.requestLogs = this.requestLogs.slice(0, this.db.settings.maxRequestLogs);
-    this.rewriteRequestLogFile();
+    this.requestLogStore.trim(this.db.settings.maxRequestLogs);
     this.persist();
     return this.db.settings;
   }
@@ -646,7 +744,7 @@ export class JsonStore {
     const timestamp = now();
     const source = input.mode === "cpa" || input.source === "cpa" ? "cpa" : "subapi";
     const providerType = normalizeTemporaryAccountProviderType(input.providerType);
-    const site = providerType === "grok" ? this.ensureOfficialGrokSite() : this.ensureOfficialOpenAiSite();
+    const site = providerType === "grok" ? this.ensureOfficialGrokSite() : this.ensureAccountSite(accountProvider(providerType));
     const models = normalizeModelList(input.models);
     const importItems = [
       ...(typeof input.content === "string" && input.content.trim() ? [{ name: "粘贴内容", content: input.content }] : []),
@@ -674,8 +772,8 @@ export class JsonStore {
         : `没有解析到可用账号密钥${names}`);
     }
     const seen = new Set<string>(
-      this.db.temporaryAccountGroups.flatMap((group) =>
-        group.accounts.map((account) => hashSecret(account.secret.trim() || account.refreshToken?.trim() || account.accountId?.trim() && account.chatgptUserId?.trim() ? `${account.accountId}:${account.chatgptUserId}` : account.accountId?.trim() || account.agentRuntimeId?.trim() || account.id))
+      this.db.temporaryAccountGroups.filter((group) => (group.providerType || "gpt") === providerType).flatMap((group) =>
+        group.accounts.map((account) => hashSecret(account.secret.trim() || account.refreshToken?.trim() || (account.accountId?.trim() && account.chatgptUserId?.trim() ? `${account.accountId}:${account.chatgptUserId}` : account.accountId?.trim()) || account.agentRuntimeId?.trim() || account.id))
       )
     );
     const group = this.ensureTemporaryAccountTypeGroup(providerType, site.id, source, timestamp);
@@ -697,7 +795,7 @@ export class JsonStore {
         label: normalizedTemporaryAccountLabel(account, group.accounts.length + accounts.length),
         prefix: secret ? secret.slice(0, 12) : account.agentRuntimeId ? "agent-identity" : "oauth-refresh",
         secret,
-        accountType: providerType === "gpt" ? account.accountType : undefined,
+        accountType: providerType === "gpt" ? account.accountType : providerType === "grok" ? undefined : "api-key",
         providerType,
         accountId: account.accountId,
         email: account.email,
@@ -728,6 +826,7 @@ export class JsonStore {
     group.enabled = true;
     group.providerType = providerType;
     group.updatedAt = timestamp;
+    if (providerType !== "grok") this.syncManagedAccountModels(accountProvider(providerType));
     this.persist();
     return { site, group, imported: accounts.length, skipped, unrecognizedFiles, accountIds: accounts.map((account) => account.id) };
   }
@@ -765,9 +864,8 @@ export class JsonStore {
     this.persist();
   }
 
-  private orderedTemporaryAccountPool(pool: TemporaryAccount[]) {
+  private orderedTemporaryAccountPool(pool: TemporaryAccount[], strategy: TemporaryAccountGroup["strategy"], poolKey: string) {
     if (pool.length === 0) return pool;
-    const strategy = this.db.settings.temporaryAccountStrategy;
     if (strategy === "random") {
       const shuffled = [...pool];
       for (let index = shuffled.length - 1; index > 0; index -= 1) {
@@ -777,24 +875,27 @@ export class JsonStore {
       return shuffled;
     }
     if (strategy === "sequential") {
-      const start = this.temporaryAccountIndex % pool.length;
-      this.temporaryAccountIndex = (this.temporaryAccountIndex + 1) % pool.length;
+      const start = (this.temporaryAccountIndexes.get(poolKey) || 0) % pool.length;
+      this.temporaryAccountIndexes.set(poolKey, (start + 1) % pool.length);
       return [...pool.slice(start), ...pool.slice(0, start)];
     }
     return pool;
   }
 
   resolveTemporaryProviderAccounts(providerType: TemporaryAccountProviderType, model: string) {
-    const allEnabledAccounts = this.db.temporaryAccountGroups
-      .filter((group) => group.enabled !== false && normalizeTemporaryAccountProviderType(group.providerType) === providerType)
+    const groups = this.db.temporaryAccountGroups.filter((group) => group.enabled !== false && normalizeTemporaryAccountProviderType(group.providerType) === providerType);
+    const allEnabledAccounts = groups
       .flatMap((group) => group.accounts.filter((account) => account.enabled !== false));
     const candidates = allEnabledAccounts.filter((account) => account.models.length === 0 || account.models.includes(model));
-    const pool = candidates.length > 0 ? candidates : allEnabledAccounts;
+    const pool = providerType === "grok" && candidates.length === 0 ? allEnabledAccounts : candidates;
     const usable = pool.filter(temporaryAccountCanBeUsed);
     if (usable.length === 0) return [];
     const available = usable.filter((account) => account.availability === "available");
     const unchecked = usable.filter((account) => account.availability !== "available");
-    return [...this.orderedTemporaryAccountPool(available), ...this.orderedTemporaryAccountPool(unchecked)];
+    const strategy = providerType === "grok" ? this.db.settings.temporaryAccountStrategy : groups[0]?.strategy || this.db.settings.temporaryAccountStrategy;
+    const ordered = [...this.orderedTemporaryAccountPool(available, strategy, `${providerType}:available`), ...this.orderedTemporaryAccountPool(unchecked, strategy, `${providerType}:unknown`)];
+    const preferred = (strategy === "priority" || strategy === "stable-first") ? ordered.find((account) => groups.some((group) => group.preferredAccountId === account.id)) : undefined;
+    return preferred ? [preferred, ...ordered.filter((account) => account.id !== preferred.id)] : ordered;
   }
 
   resolveTemporaryOpenAiAccounts(model: string) {
@@ -838,8 +939,9 @@ export class JsonStore {
       const nextAccounts = group.accounts.filter((account) => account.id !== id);
       if (nextAccounts.length === group.accounts.length) continue;
       group.accounts = nextAccounts;
+      if (group.preferredAccountId === id) group.preferredAccountId = undefined;
       group.updatedAt = now();
-      this.db.temporaryAccountGroups = this.db.temporaryAccountGroups.filter((item) => item.accounts.length > 0);
+      if (group.providerType !== "grok") this.syncManagedAccountModels(accountProvider(group.providerType || "gpt"));
       this.persist();
       return;
     }
@@ -853,11 +955,12 @@ export class JsonStore {
       const nextAccounts = group.accounts.filter((account) => !idSet.has(account.id));
       if (nextAccounts.length === group.accounts.length) continue;
       group.accounts = nextAccounts;
+      if (group.preferredAccountId && idSet.has(group.preferredAccountId)) group.preferredAccountId = undefined;
       group.updatedAt = now();
       changed = true;
     }
     if (!changed) return;
-    this.db.temporaryAccountGroups = this.db.temporaryAccountGroups.filter((item) => item.accounts.length > 0);
+    for (const group of this.db.temporaryAccountGroups) if (group.providerType !== "grok") this.syncManagedAccountModels(accountProvider(group.providerType || "gpt"));
     this.persist();
   }
 
@@ -876,12 +979,14 @@ export class JsonStore {
       email?: string;
       tokenExpiresAt?: string;
       agentTaskId?: string;
+      models?: string[];
     }
   ) {
     for (const group of this.db.temporaryAccountGroups) {
       const account = group.accounts.find((item) => item.id === accountId);
       if (!account) continue;
       if (input.availability) account.availability = input.availability;
+      if (input.models) account.models = normalizeModelList(input.models);
       if (input.quotaStages) account.quotaStages = input.quotaStages;
       if (input.lastQuotaCheckedAt) account.lastQuotaCheckedAt = input.lastQuotaCheckedAt;
       if (typeof input.lastCheckStatusCode === "number") account.lastCheckStatusCode = input.lastCheckStatusCode;
@@ -894,23 +999,22 @@ export class JsonStore {
       if (typeof input.idToken === "string" && input.idToken.trim()) account.idToken = input.idToken.trim();
       if (typeof input.accountId === "string" && input.accountId.trim()) account.accountId = input.accountId.trim();
       if (typeof input.email === "string" && input.email.trim()) account.email = input.email.trim();
-      if (typeof input.tokenExpiresAt === "string" && input.tokenExpiresAt.trim()) account.tokenExpiresAt = input.tokenExpiresAt.trim();
+      if ("tokenExpiresAt" in input) account.tokenExpiresAt = input.tokenExpiresAt?.trim() || undefined;
       if (typeof input.agentTaskId === "string" && input.agentTaskId.trim()) account.agentTaskId = input.agentTaskId.trim();
       group.updatedAt = now();
-      this.persistTemporaryAccountCheckResult(group.id, account);
+      if (input.models && group.providerType !== "grok") { this.syncManagedAccountModels(accountProvider(group.providerType || "gpt")); this.persist(); }
+      else this.persistTemporaryAccountCheckResult(group.id, account);
       return account;
     }
     return undefined;
   }
 
   deleteRequestLog(id: string) {
-    this.requestLogs = this.requestLogs.filter((log) => log.id !== id);
-    this.rewriteRequestLogFile();
+    this.requestLogStore.delete(id);
   }
 
   clearRequestLogs() {
-    this.requestLogs = [];
-    this.rewriteRequestLogFile();
+    this.requestLogStore.clear();
   }
 
   upsertSite(input: Partial<Site>) {
@@ -1517,8 +1621,10 @@ export class JsonStore {
       CREATE TABLE IF NOT EXISTS route_display_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, route_ids_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS request_logs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, data_json TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at);
+      CREATE TABLE IF NOT EXISTS route_last_success (route_id TEXT PRIMARY KEY, candidate_key TEXT NOT NULL, updated_at TEXT NOT NULL);
     `);
     this.ensureSqliteColumn("temporary_account_groups", "provider_type", "TEXT");
+    this.ensureSqliteColumn("temporary_account_groups", "preferred_account_id", "TEXT");
     this.ensureSqliteColumn("temporary_accounts", "provider_type", "TEXT");
     this.ensureSqliteColumn("temporary_accounts", "agent_runtime_id", "TEXT");
     this.ensureSqliteColumn("temporary_accounts", "agent_private_key", "TEXT");
@@ -1549,24 +1655,22 @@ export class JsonStore {
     const initialized = this.sqlite.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string } | undefined;
     if (!initialized) {
       const legacy = this.loadLegacyDatabase();
-      this.replaceSqliteDatabase(legacy, this.requestLogs);
+      this.replaceSqliteDatabase(legacy);
       return legacy;
     }
-    const db = this.loadDatabaseFromSqlite();
-    this.requestLogs = this.loadRequestLogsFromSqlite(db.settings.maxRequestLogs);
-    return db;
+    return this.loadDatabaseFromSqlite();
   }
 
   private loadLegacyDatabase(): AppDatabase {
     if (!existsSync(this.dbPath)) {
       const empty = createEmptyDatabase();
-      this.requestLogs = this.loadRequestLogs(empty.settings.maxRequestLogs);
+      this.requestLogStore.importLegacy(this.loadRequestLogs(empty.settings.maxRequestLogs), empty.settings.maxRequestLogs);
       return empty;
     }
     const parsed = JSON.parse(readFileSync(this.dbPath, "utf8")) as Partial<AppDatabase>;
     const settings = normalizeSettings(parsed.settings);
-    const legacyRequestLogs = (parsed as Partial<AppDatabase> & { requestLogs?: RequestLog[] }).requestLogs || [];
-    this.requestLogs = this.loadRequestLogs(settings.maxRequestLogs, legacyRequestLogs);
+    const legacyRequestLogs = (parsed as Partial<AppDatabase> & { requestLogs?: RequestLogInput[] }).requestLogs || [];
+    this.requestLogStore.importLegacy(this.loadRequestLogs(settings.maxRequestLogs, legacyRequestLogs), settings.maxRequestLogs);
     const legacyTemporaryAccountGroups = parsed.temporaryAccountGroups || [];
     return {
       sites: (parsed.sites || []).map((site) => ({ ...site, enabled: site.enabled ?? true, siteType: normalizeSiteType(site.siteType) })),
@@ -1609,7 +1713,7 @@ export class JsonStore {
     const providerApiKeyGroups = (this.sqlite.prepare("SELECT * FROM provider_api_key_groups ORDER BY created_at DESC").all() as Array<Record<string, unknown>>).map((row) => {
       const apiKeys = (this.sqlite.prepare("SELECT * FROM provider_api_keys WHERE group_id = ? ORDER BY rowid").all(row.id) as Array<Record<string, unknown>>).map((apiKey) => {
         const kind: ProviderApiKeyKind =
-          apiKey.kind === "chatgpt-official" || apiKey.kind === "grok-official" ? apiKey.kind : "api-key";
+          apiKey.kind === "chatgpt-official" || apiKey.kind === "grok-official" || apiKey.kind === "account-pool" ? apiKey.kind : "api-key";
         return {
           id: String(apiKey.id),
           label: String(apiKey.label),
@@ -1640,7 +1744,7 @@ export class JsonStore {
         label: String(account.label),
         prefix: String(account.prefix),
         secret: String(account.secret),
-        accountType: account.account_type == null ? undefined : account.account_type === "openai-api-key" ? "openai-api-key" as const : "codex" as const,
+        accountType: account.account_type == null ? undefined : account.account_type === "api-key" ? "api-key" as const : account.account_type === "openai-api-key" ? "openai-api-key" as const : "codex" as const,
         providerType: normalizeTemporaryAccountProviderType(account.provider_type),
         accountId: account.account_id == null ? undefined : String(account.account_id),
         email: account.email == null ? undefined : String(account.email),
@@ -1674,7 +1778,8 @@ export class JsonStore {
         source: row.source === "cpa" ? "cpa" as const : "subapi" as const,
         providerType,
         siteId: String(row.site_id),
-        strategy: normalizeGroupStrategy(row.strategy),
+        strategy: row.strategy == null ? undefined : normalizeGroupStrategy(row.strategy),
+        preferredAccountId: typeof row.preferred_account_id === "string" ? row.preferred_account_id : undefined,
         enabled: row.enabled == null ? true : Boolean(row.enabled),
         accounts: accounts.map((account) => ({ ...account, providerType })),
         createdAt: String(row.created_at),
@@ -1718,14 +1823,14 @@ export class JsonStore {
     }));
   }
 
-  private loadRequestLogs(limit: number, fallback: RequestLog[] = []) {
+  private loadRequestLogs(limit: number, fallback: RequestLogInput[] = []) {
     if (!existsSync(this.logsPath)) return fallback.slice(0, limit);
     const lines = readFileSync(this.logsPath, "utf8").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    const logs: RequestLog[] = [];
+    const logs: RequestLogInput[] = [];
     for (const line of lines) {
       try {
-        const parsed = JSON.parse(line) as RequestLog;
-        if (parsed.id && parsed.createdAt) logs.push(normalizeRequestLogShape(parsed));
+        const parsed = JSON.parse(line) as RequestLogInput;
+        if (parsed.id && parsed.createdAt) logs.push(parsed);
       } catch {
         // Ignore malformed log lines so one bad append does not break startup.
       }
@@ -1733,21 +1838,12 @@ export class JsonStore {
     return logs.reverse().slice(0, limit);
   }
 
-  private loadRequestLogsFromSqlite(limit: number) {
-    return (this.sqlite.prepare("SELECT data_json FROM request_logs ORDER BY created_at DESC LIMIT ?").all(limit) as Array<{ data_json: string }>).map((row) => normalizeRequestLogShape(JSON.parse(row.data_json) as RequestLog));
-  }
-
-  private rewriteRequestLogFile() {
-    this.replaceRequestLogs(this.requestLogs);
-  }
-
   private persist() {
-    this.replaceSqliteDatabase(this.db, this.requestLogs);
+    this.replaceSqliteDatabase(this.db);
   }
 
-  private replaceSqliteDatabase(db: AppDatabase, requestLogs = this.requestLogs) {
+  private replaceSqliteDatabase(db: AppDatabase) {
     const replace = this.sqlite.transaction(() => {
-      this.sqlite.prepare("DELETE FROM request_logs").run();
       this.sqlite.prepare("DELETE FROM route_display_groups").run();
       this.sqlite.prepare("DELETE FROM routes").run();
       this.sqlite.prepare("DELETE FROM header_templates").run();
@@ -1759,14 +1855,14 @@ export class JsonStore {
       this.sqlite.prepare("DELETE FROM sites").run();
       this.sqlite.prepare("DELETE FROM auth").run();
       this.sqlite.prepare("DELETE FROM settings").run();
-      this.writeDatabaseRows(db, requestLogs);
+      this.writeDatabaseRows(db);
       this.sqlite.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '1')").run();
       this.sqlite.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('migrated_from_json_at', ?)").run(now());
     });
     replace();
   }
 
-  private writeDatabaseRows(db: AppDatabase, requestLogs: RequestLog[]) {
+  private writeDatabaseRows(db: AppDatabase) {
     const insertSetting = this.sqlite.prepare("INSERT INTO settings (key, value) VALUES (?, ?)");
     for (const [key, value] of Object.entries(db.settings)) insertSetting.run(key, JSON.stringify(value));
     this.sqlite.prepare("INSERT INTO auth (id, admin_password_hash) VALUES (1, ?)").run(db.adminPasswordHash || null);
@@ -1792,11 +1888,11 @@ export class JsonStore {
       );
       for (const apiKey of group.apiKeys) insertProviderKey.run(apiKey.id, group.id, apiKey.label, apiKey.prefix, apiKey.secret, apiKey.kind || "api-key", apiKey.enabled ? 1 : 0, JSON.stringify(apiKey.models), apiKey.lastCheckedAt || null);
     }
-    const insertTemporaryGroup = this.sqlite.prepare("INSERT INTO temporary_account_groups (id, name, source, provider_type, site_id, strategy, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    const insertTemporaryGroup = this.sqlite.prepare("INSERT INTO temporary_account_groups (id, name, source, provider_type, site_id, strategy, preferred_account_id, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     const insertTemporaryAccount = this.sqlite.prepare("INSERT INTO temporary_accounts (id, group_id, label, prefix, secret, account_type, provider_type, account_id, email, refresh_token, id_token, session_token, agent_runtime_id, agent_private_key, agent_task_id, chatgpt_user_id, chatgpt_account_is_fedramp, grok_oauth_format, oauth_client_id, oauth_token_endpoint, upstream_base_url, token_expires_at, grok_using_api, enabled, models_json, availability, quota_stages_json, imported_at, last_quota_checked_at, last_check_status_code, last_check_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     for (const group of db.temporaryAccountGroups) {
       const providerType = normalizeTemporaryAccountProviderType(group.providerType || group.name.toLowerCase());
-      insertTemporaryGroup.run(group.id, TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType], group.source, providerType, group.siteId, group.strategy || null, group.enabled === false ? 0 : 1, group.createdAt, group.updatedAt);
+      insertTemporaryGroup.run(group.id, TEMPORARY_ACCOUNT_PROVIDER_LABELS[providerType], group.source, providerType, group.siteId, group.strategy || null, group.preferredAccountId || null, group.enabled === false ? 0 : 1, group.createdAt, group.updatedAt);
       for (const account of group.accounts) insertTemporaryAccount.run(account.id, group.id, account.label, account.prefix, account.secret, account.accountType || null, account.providerType || providerType, account.accountId || null, account.email || null, account.refreshToken || null, account.idToken || null, account.sessionToken || null, account.agentRuntimeId || null, account.agentPrivateKey || null, account.agentTaskId || null, account.chatgptUserId || null, account.chatgptAccountIsFedramp == null ? null : account.chatgptAccountIsFedramp ? 1 : 0, account.grokOAuthFormat || null, account.oauthClientId || null, account.oauthTokenEndpoint || null, account.upstreamBaseUrl || null, account.tokenExpiresAt || null, account.grokUsingApi == null ? null : account.grokUsingApi ? 1 : 0, account.enabled === false ? 0 : 1, JSON.stringify(account.models), account.availability || "unknown", JSON.stringify(account.quotaStages || []), account.importedAt, account.lastQuotaCheckedAt || null, account.lastCheckStatusCode ?? null, account.lastCheckError || null);
     }
     const insertHeader = this.sqlite.prepare("INSERT INTO header_templates (id, name, headers_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
@@ -1805,21 +1901,6 @@ export class JsonStore {
     for (const route of db.routes) insertRoute.run(route.id, route.type, JSON.stringify(route), route.createdAt, route.updatedAt);
     const insertRouteDisplayGroup = this.sqlite.prepare("INSERT INTO route_display_groups (id, name, route_ids_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
     for (const group of db.routeDisplayGroups) insertRouteDisplayGroup.run(group.id, group.name, JSON.stringify(group.routeIds || []), group.createdAt, group.updatedAt);
-    const insertLog = this.sqlite.prepare("INSERT INTO request_logs (id, created_at, data_json) VALUES (?, ?, ?)");
-    for (const log of requestLogs.slice().reverse()) insertLog.run(log.id, log.createdAt, JSON.stringify(log));
-  }
-
-  private insertRequestLogRow(log: RequestLog) {
-    this.sqlite.prepare("INSERT OR REPLACE INTO request_logs (id, created_at, data_json) VALUES (?, ?, ?)").run(log.id, log.createdAt, JSON.stringify(log));
-  }
-
-  private replaceRequestLogs(logs: RequestLog[]) {
-    const replace = this.sqlite.transaction(() => {
-      this.sqlite.prepare("DELETE FROM request_logs").run();
-      const insertLog = this.sqlite.prepare("INSERT INTO request_logs (id, created_at, data_json) VALUES (?, ?, ?)");
-      for (const log of logs.slice().reverse()) insertLog.run(log.id, log.createdAt, JSON.stringify(log));
-    });
-    replace();
   }
 
   private persistTemporaryAccountCheckResult(groupId: string, account: TemporaryAccount) {
@@ -1842,8 +1923,8 @@ export class JsonStore {
 
   private normalizeProviderApiKeyEntry(input: Partial<ProviderApiKeyEntry>, index: number, existingKeys: ProviderApiKeyEntry[] = []): ProviderApiKeyEntry {
     const existing = input.id ? existingKeys.find((key) => key.id === input.id) : undefined;
-    const kind = input.kind === "chatgpt-official" || input.kind === "grok-official" ? input.kind : existing?.kind || "api-key";
-    const isOfficialKey = kind === "chatgpt-official" || kind === "grok-official";
+    const kind = input.kind === "api-key" || input.kind === "chatgpt-official" || input.kind === "grok-official" || input.kind === "account-pool" ? input.kind : existing?.kind || "api-key";
+    const isOfficialKey = kind === "chatgpt-official" || kind === "grok-official" || kind === "account-pool";
     const resolvedSecret = isOfficialKey ? "" : input.secret?.trim() || existing?.secret;
     if (!isOfficialKey && !resolvedSecret) throw new Error(`第 ${index + 1} 个 API Key 不能为空`);
     const secret = resolvedSecret || "";
@@ -1853,7 +1934,7 @@ export class JsonStore {
     return {
       id: input.id || (kind === "chatgpt-official" ? CHATGPT_OFFICIAL_PROVIDER_KEY_ID : kind === "grok-official" ? GROK_OFFICIAL_PROVIDER_KEY_ID : `provider-key-${randomUUID()}`),
       label: input.label?.trim() || (kind === "chatgpt-official" ? CHATGPT_OFFICIAL_PROVIDER_KEY_LABEL : kind === "grok-official" ? GROK_OFFICIAL_PROVIDER_KEY_LABEL : `Key ${index + 1}`),
-      prefix: kind === "chatgpt-official" ? "chatgpt" : kind === "grok-official" ? "grok" : secret.slice(0, 10),
+      prefix: kind === "chatgpt-official" ? "chatgpt" : kind === "grok-official" ? "grok" : kind === "account-pool" ? "account-pool" : secret.slice(0, 10),
       secret,
       kind,
       enabled: input.enabled ?? true,
