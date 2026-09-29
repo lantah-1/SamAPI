@@ -3,7 +3,7 @@ import type { ModelPriceRates, ModelPriceRule, OfficialModelPrice, OfficialPrice
 
 export type FetchPriceText = (url: string) => Promise<string>;
 type HtmlNode = ReturnType<CheerioAPI>[number];
-export interface PriceSource extends OfficialPriceSource { read: (fetchText: FetchPriceText) => Promise<OfficialModelPrice[]> }
+export interface PriceSource extends OfficialPriceSource { parserVersion?: number; read: (fetchText: FetchPriceText) => Promise<OfficialModelPrice[]> }
 const clean = (text: string) => text.replace(/\s+/g, " ").trim();
 const rounded = (value: number) => Math.round(value * 1e6) / 1e6;
 const dollars = (text: string) => {
@@ -68,43 +68,63 @@ function decodeAstro(value: unknown): unknown {
   throw new Error("OpenAI 官方价格数据类型变化");
 }
 
-function openAiRows(html: string) {
+function openAiTables(html: string) {
   const $ = load(html);
+  const tables: Array<{ element: HtmlNode; tier: string; rows: unknown[][] }> = [];
   for (const element of $("astro-island[props]")) {
     const raw = $(element).attr("props")!;
-    if (!raw.includes("standard") || !raw.includes("rows")) continue;
+    if (!raw.includes("tier") || !raw.includes("rows")) continue;
     const props = Object.fromEntries(Object.entries(JSON.parse(raw)).map(([key, value]) => [key, decodeAstro(value)]));
-    if (props.tier === "standard" && Array.isArray(props.rows)) return { $, element, rows: props.rows as unknown[][] };
+    if (typeof props.tier === "string" && Array.isArray(props.rows)) tables.push({ element, tier: props.tier, rows: props.rows as unknown[][] });
   }
-  throw new Error("未找到 OpenAI 官方标准价格表");
+  if (!tables.some((table) => table.tier === "standard")) throw new Error("未找到 OpenAI 官方标准价格表");
+  return { $, tables };
 }
 
 export function parseOpenAiPrices(html: string, modelDocs: Record<string, string>, source: OfficialPriceSource): OfficialModelPrice[] {
-  const { $, element, rows } = openAiRows(html);
-  const longRates = new Map<string, ModelPriceRates>();
-  const table = $(element).find("table").first();
-  if (table.length) for (const row of pricingTableRows($, table[0])) {
-    if (row.length === 9 && dollars(row[5]) !== undefined && dollars(row[8]) !== undefined) longRates.set(clean(row[0]), rates(dollars(row[5]), dollars(row[8]), dollars(row[6]), dollars(row[7])));
-  }
-  const result: OfficialModelPrice[] = [];
-  for (const row of rows) {
-    if (typeof row[0] !== "string" || !/^[\w.-]+(?: \(|$)/.test(row[0])) continue;
-    const model = row[0].replace(/ \(.+$/, "");
-    const base = rates(numeric(row[1]), numeric(row[row.length - 1]), numeric(row[2]), row.length === 5 ? numeric(row[3]) : undefined);
-    const extra: Partial<OfficialModelPrice> = { cacheReadUnavailable: numeric(row[2]) === undefined };
-    const context = row[0].match(/<([\d,]+)([KM]?)\s*context/i);
-    if (context || longRates.has(model)) {
-      const description = pageText(modelDocs[model] || "");
-      const threshold = description.match(/(?:prompts? with(?: more than)?|input(?:s| tokens)? (?:over|above)|greater than)\s*>?\s*([\d,]+)\s*([km]?)/i);
-      const aboveInputTokens = threshold ? tokenCount(threshold[1], threshold[2]) : context ? tokenCount(context[1], context[2]) : undefined;
-      if (!aboveInputTokens) throw new Error(`未确认 ${model} 的长上下文计费阈值`);
-      let longer = longRates.get(model);
-      const multiplier = description.match(/(?:priced|billed) at\s*([\d.]+)x input and\s*([\d.]+)x output/i);
-      if (!longer && multiplier) longer = rates(base.inputUsdPerMillion * Number(multiplier[1]), base.outputUsdPerMillion * Number(multiplier[2]), base.cachedInputUsdPerMillion * Number(multiplier[1]), base.cacheWriteUsdPerMillion === undefined ? undefined : base.cacheWriteUsdPerMillion * Number(multiplier[1]));
-      if (longer) extra.rules = [{ aboveInputTokens, ...longer }];
-      else extra.maxInputTokens = aboveInputTokens;
+  const { $, tables } = openAiTables(html);
+  const readTier = ({ element, rows }: typeof tables[number]) => {
+    const longRates = new Map<string, ModelPriceRates>();
+    const table = $(element).find("table").first();
+    if (table.length) for (const row of pricingTableRows($, table[0])) {
+      if (row.length === 9 && dollars(row[5]) !== undefined && dollars(row[8]) !== undefined) longRates.set(clean(row[0]), rates(dollars(row[5]), dollars(row[8]), dollars(row[6]), dollars(row[7])));
     }
-    result.push(price(source, model, base, extra));
+    const result: OfficialModelPrice[] = [];
+    for (const row of rows) {
+      if (typeof row[0] !== "string" || !/^[\w.-]+(?: \(|$)/.test(row[0])) continue;
+      const model = row[0].replace(/ \(.+$/, "");
+      const base = rates(numeric(row[1]), numeric(row[row.length - 1]), numeric(row[2]), row.length === 5 ? numeric(row[3]) : undefined);
+      const extra: Partial<OfficialModelPrice> = { cacheReadUnavailable: numeric(row[2]) === undefined };
+      const context = row[0].match(/<([\d,]+)([KM]?)\s*context/i);
+      if (context || longRates.has(model)) {
+        const description = pageText(modelDocs[model] || "");
+        const threshold = description.match(/(?:prompts? with(?: more than)?|input(?:s| tokens)? (?:over|above)|greater than)\s*>?\s*([\d,]+)\s*([km]?)/i);
+        const aboveInputTokens = threshold ? tokenCount(threshold[1], threshold[2]) : context ? tokenCount(context[1], context[2]) : undefined;
+        if (!aboveInputTokens) throw new Error(`未确认 ${model} 的长上下文计费阈值`);
+        let longer = longRates.get(model);
+        const multiplier = description.match(/(?:priced|billed) at\s*([\d.]+)x input and\s*([\d.]+)x output/i);
+        if (!longer && multiplier) longer = rates(base.inputUsdPerMillion * Number(multiplier[1]), base.outputUsdPerMillion * Number(multiplier[2]), base.cachedInputUsdPerMillion * Number(multiplier[1]), base.cacheWriteUsdPerMillion === undefined ? undefined : base.cacheWriteUsdPerMillion * Number(multiplier[1]));
+        if (longer) extra.rules = [{ aboveInputTokens, ...longer }];
+        else extra.maxInputTokens = aboveInputTokens;
+      }
+      result.push(price(source, model, base, extra));
+    }
+    return result;
+  };
+  const result = readTier(tables.find((table) => table.tier === "standard")!);
+  for (const table of tables.filter((table) => ["flex", "fast", "priority", "ultrafast"].includes(table.tier))) {
+    for (const item of readTier(table)) {
+      const base = result.find((entry) => entry.model === item.model);
+      if (!base) continue;
+      const { providerId: _provider, model: _model, source: _source, ...tier } = item;
+      base.serviceTiers ||= {};
+      base.serviceTiers[table.tier] = tier;
+      // OpenAI Fast mode accepts both spellings and can report either one.
+      if (table.tier === "fast" || table.tier === "priority") {
+        base.serviceTiers.fast = tier;
+        base.serviceTiers.priority = tier;
+      }
+    }
   }
   // The specialized text-model table is separate from the flagship table.
   for (const table of $("table")) {
@@ -222,17 +242,27 @@ export function parseZaiPrices(markdown: string, source: OfficialPriceSource): O
 }
 
 export function parseMinimaxPrices(markdown: string, source: OfficialPriceSource): OfficialModelPrice[] {
-  const standard = markdown.replace(/<Tab title="Priority[^"]*">[\s\S]*?<\/Tab>/g, "");
-  const result = new Map<string, OfficialModelPrice>();
-  for (const rows of markdownTables(standard).filter((rows) => rows[0].includes("Prompt caching Read"))) for (const row of rows.slice(1)) {
-    const model = row[0].match(/MiniMax-[\w.-]+/)?.[0].toLowerCase();
-    if (!model) throw new Error("MiniMax 模型名称格式变化");
-    const base = rates(dollars(row[1]), dollars(row[2]), dollars(row[3]), row[4] ? dollars(row[4]) : undefined);
-    const threshold = row[0].replace(/<[^>]+>/g, " ").match(/>\s*([\d,]+)\s*k/i);
-    if (threshold) {
-      const existing = result.get(model); if (!existing) throw new Error("MiniMax 缺少标准上下文价格");
-      existing.rules = [...(existing.rules || []), { aboveInputTokens: tokenCount(threshold[1], "k"), ...base }];
-    } else result.set(model, price(source, model, base));
+  const priorityTabs = [...markdown.matchAll(/<Tab title="Priority[^"]*">([\s\S]*?)<\/Tab>/g)];
+  const readTier = (text: string) => {
+    const result = new Map<string, OfficialModelPrice>();
+    for (const rows of markdownTables(text).filter((rows) => rows[0].includes("Prompt caching Read"))) for (const row of rows.slice(1)) {
+      const model = row[0].match(/MiniMax-[\w.-]+/)?.[0].toLowerCase();
+      if (!model) throw new Error("MiniMax 模型名称格式变化");
+      const base = rates(dollars(row[1]), dollars(row[2]), dollars(row[3]), row[4] ? dollars(row[4]) : undefined);
+      const threshold = row[0].replace(/<[^>]+>/g, " ").match(/>\s*([\d,]+)\s*k/i);
+      if (threshold) {
+        const existing = result.get(model); if (!existing) throw new Error("MiniMax 缺少标准上下文价格");
+        existing.rules = [...(existing.rules || []), { aboveInputTokens: tokenCount(threshold[1], "k"), ...base }];
+      } else result.set(model, price(source, model, base));
+    }
+    return result;
+  };
+  const result = readTier(markdown.replace(/<Tab title="Priority[^"]*">[\s\S]*?<\/Tab>/g, ""));
+  for (const tab of priorityTabs) for (const item of readTier(tab[1]).values()) {
+    const base = result.get(item.model);
+    if (!base) continue;
+    const { providerId: _provider, model: _model, source: _source, ...tier } = item;
+    base.serviceTiers = { priority: tier };
   }
   return [...result.values()];
 }
@@ -325,16 +355,18 @@ export function parseStepfunPrices(markdown: string, source: OfficialPriceSource
   }));
 }
 
-function documentSource(id: string, name: string, url: string, parse: (text: string, source: OfficialPriceSource) => OfficialModelPrice[]): PriceSource {
+function documentSource(id: string, name: string, url: string, parse: (text: string, source: OfficialPriceSource) => OfficialModelPrice[], parserVersion?: number): PriceSource {
   const source = { id, name, url };
-  return { ...source, read: async (fetchText) => parse(await fetchText(url), source) };
+  return { ...source, parserVersion, read: async (fetchText) => parse(await fetchText(url), source) };
 }
 
 export const officialPriceSources: PriceSource[] = [
-  { id: "openai", name: "OpenAI", url: "https://developers.openai.com/api/docs/pricing", async read(fetchText) {
-    const html = await fetchText(this.url), { $, element, rows } = openAiRows(html);
-    const latest = new Set($(element).find("table").first().find("tbody tr").map((_, row) => $(row).children("td").length === 9 ? $(row).children("td").first().text() : "").get().filter(Boolean));
-    const names = rows.filter((row) => typeof row[0] === "string" && (row[0].includes("context") || latest.has(row[0]))).map((row) => String(row[0]).replace(/ \(.+$/, ""));
+  { id: "openai", name: "OpenAI", url: "https://developers.openai.com/api/docs/pricing", parserVersion: 1, async read(fetchText) {
+    const html = await fetchText(this.url), { $, tables } = openAiTables(html);
+    const names = [...new Set(tables.filter((table) => table.tier !== "batch").flatMap(({ element, rows }) => {
+      const latest = new Set($(element).find("table").first().find("tbody tr").map((_, row) => $(row).children("td").length === 9 ? $(row).children("td").first().text() : "").get().filter(Boolean));
+      return rows.filter((row) => typeof row[0] === "string" && (row[0].includes("context") || latest.has(row[0]))).map((row) => String(row[0]).replace(/ \(.+$/, ""));
+    }))];
     const docs: Record<string, string> = {};
     for (let i = 0; i < names.length; i += 3) await Promise.all(names.slice(i, i + 3).map(async (name) => { docs[name] = await fetchText(`https://developers.openai.com/api/docs/models/${encodeURIComponent(name)}`); }));
     return parseOpenAiPrices(html, docs, this);
@@ -344,7 +376,7 @@ export const officialPriceSources: PriceSource[] = [
   documentSource("deepseek", "DeepSeek", "https://api-docs.deepseek.com/quick_start/pricing/", parseDeepSeekPrices),
   documentSource("xai", "Grok", "https://docs.x.ai/developers/models", parseXaiPrices),
   documentSource("zai", "GLM", "https://docs.z.ai/guides/overview/pricing.md", parseZaiPrices),
-  documentSource("minimax", "MiniMax", "https://platform.minimax.io/docs/guides/pricing-paygo.md", parseMinimaxPrices),
+  documentSource("minimax", "MiniMax", "https://platform.minimax.io/docs/guides/pricing-paygo.md", parseMinimaxPrices, 1),
   { id: "qwen", name: "Qwen（国际站）", url: "https://www.alibabacloud.com/help/en/model-studio/model-pricing", async read(fetchText) {
     const [html, cache] = await Promise.all([fetchText(this.url), fetchText("https://www.alibabacloud.com/help/en/model-studio/context-cache")]);
     return parseQwenPrices(html, this, cache);

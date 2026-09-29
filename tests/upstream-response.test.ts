@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { setImmediate as nextTick } from "node:timers/promises";
 import test from "node:test";
 import { prepareUpstreamResponse } from "../server/upstream-response.js";
 
@@ -7,6 +8,72 @@ const sseHeaders = { "content-type": "text/event-stream" };
 const frame = (value: unknown) => `data: ${JSON.stringify(value)}\r\n\r\n`;
 const codexMetadata = frame({ type: "codex.rate_limits", rate_limits: { primary: { used_percent: 25 } } })
   + frame({ type: "codex.response.metadata", headers: { "x-request-id": "fixture-request" } });
+
+async function readUntil(reader: ReadableStreamDefaultReader<Uint8Array>, expected: string) {
+  let text = "";
+  while (text.length < expected.length) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    text += new TextDecoder().decode(chunk.value);
+  }
+  return text;
+}
+
+test("retryable streams forward useful frames immediately, suppress the failed event and append the retry", async () => {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const firstText = frame({ type: "response.output_text.delta", delta: "partial answer" });
+  const retryPrelude = frame({ type: "response.created", response: { output: [] } });
+  const recovered = frame({ type: "response.output_text.delta", delta: "recovered answer" });
+  const terminal = frame({ type: "response.completed", response: { status: "completed" } });
+  let retries = 0;
+  const startedWith: string[] = [];
+  const prepared = await prepareUpstreamResponse(new Response(new ReadableStream<Uint8Array>({
+    start(stream) { controller = stream; stream.enqueue(encoder.encode(firstText)); }
+  }), { headers: sseHeaders }), true, undefined, (type) => { startedWith.push(type); }, {
+    retryStreamFailure: async () => {
+      retries++;
+      return prepareUpstreamResponse(new Response(retryPrelude + recovered + terminal, { headers: sseHeaders }), true, undefined, undefined, { streamContinuation: true });
+    }
+  });
+  const reader = prepared.body!.getReader();
+  const first = new TextDecoder().decode((await reader.read()).value);
+  assert.equal(first, firstText, "the first data frame must not wait for stream completion");
+  controller.enqueue(encoder.encode('event: error\ndata: {"error":{"message":"late overload"}}\n\n'));
+  const chunks = [first];
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    chunks.push(new TextDecoder().decode(chunk.value));
+  }
+  const text = chunks.join("");
+  assert.equal(retries, 1);
+  assert.deepEqual(startedWith, ["response.output_text.delta", "response.output_text.delta"]);
+  assert.match(text, /partial answer/);
+  assert.match(text, /recovered answer/);
+  assert.doesNotMatch(text, /late overload|response.created/);
+});
+
+test("retryable streams continue after transport termination and missing terminal events", async (t) => {
+  for (const failure of ["transport", "EOF"] as const) await t.test(failure, async () => {
+    const partial = frame({ choices: [{ delta: { content: "partial" } }] });
+    const recovered = frame({ choices: [{ delta: { content: "recovered" } }] }) + "data: [DONE]\n\n";
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(encoder.encode(partial)); if (failure === "EOF") controller.close(); },
+      pull(controller) { if (failure === "transport") controller.error(new TypeError("terminated after output")); }
+    }, { highWaterMark: 0 }), { headers: sseHeaders });
+    const prepared = await prepareUpstreamResponse(response, true, undefined, undefined, {
+      retryStreamFailure: async () => prepareUpstreamResponse(new Response(recovered, { headers: sseHeaders }), true, undefined, undefined, { streamContinuation: true })
+    });
+    assert.equal(await prepared.text(), partial + recovered);
+  });
+});
+
+test("retryable streams reject malformed events when no retry remains", async () => {
+  const prepared = await prepareUpstreamResponse(new Response(frame({ type: "response.output_text.delta", delta: "partial" }) + 'data: {bad json}\n\n', { headers: sseHeaders }), true, undefined, undefined, {
+    retryStreamFailure: async () => undefined
+  });
+  await assert.rejects(prepared.text(), /无效 JSON/);
+});
 
 test("stream preparation preserves prelude frames and UTF-8 bytes across arbitrary chunk boundaries", async () => {
   const text = ': keepalive\r\n\r\n' + codexMetadata + frame({ type: "response.created", response: { output: [] } })
@@ -99,7 +166,7 @@ test("buffered heartbeats are replayed unchanged on real output, and heartbeat-o
   const prepared = await prepareUpstreamResponse(response, true, undefined, (event) => { startedWith.push(event); });
   assert.deepEqual(startedWith, ["response.output_text.delta"]);
   const reader = prepared.body!.getReader();
-  assert.equal(new TextDecoder().decode((await reader.read()).value), text);
+  assert.equal(await readUntil(reader, text), text);
   await reader.cancel();
   assert.equal(cancelled, true);
   await assert.rejects(prepareUpstreamResponse(new Response('event: keepalive\ndata: {"error":{"message":"busy"}}\n\n'), true), /busy/);
@@ -184,7 +251,7 @@ test("nonempty output items and content events still stream immediately and pres
     const prepared = await prepareUpstreamResponse(response, true, undefined, (type) => { startedWith.push(type); });
     assert.deepEqual(startedWith, [event.type]);
     const reader = prepared.body!.getReader();
-    assert.equal(new TextDecoder().decode((await reader.read()).value), text);
+    assert.equal(await readUntil(reader, text), text);
     await reader.cancel();
     assert.equal(cancelled, true);
   });
@@ -225,10 +292,10 @@ test("a prelude-only EOF is a failure, while a terminal empty response is valid"
   assert.equal(await prepared.text(), "data: [DONE]\n\n");
 });
 
-test("errors after real output in the same chunk remain on the original stream", async () => {
+test("errors after real output in the same chunk are suppressed", async () => {
   const text = frame({ choices: [{ delta: { content: "partial" } }] }) + frame({ error: { message: "failed later" } });
   const prepared = await prepareUpstreamResponse(new Response(text, { headers: sseHeaders }), true);
-  assert.equal(await prepared.text(), text);
+  assert.equal(await prepared.text(), frame({ choices: [{ delta: { content: "partial" } }] }));
 });
 
 test("large prelude frames never open the retry boundary before output", async () => {
@@ -306,7 +373,7 @@ test("headerless SSE starts forwarding useful output without waiting for the ups
   }));
   const prepared = await prepareUpstreamResponse(response, true);
   const reader = prepared.body!.getReader();
-  assert.equal(new TextDecoder().decode((await reader.read()).value), text);
+  assert.equal(await readUntil(reader, text), text);
   await reader.cancel();
   assert.equal(cancelled, true);
 });

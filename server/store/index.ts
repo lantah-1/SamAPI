@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import DatabaseConstructor, { type Database as SqliteDatabase } from "better-sqlite3";
+import { validateModelRuleTargets } from "../../shared/model-rules.js";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type {
@@ -114,6 +115,7 @@ export class JsonStore {
     });
     this.db = this.load();
     this.requestLogStore.migrate(this.db.settings.maxRequestLogs);
+    this.usageStore.recoverInterruptedRecords();
     const migratedRouteProxies = this.migrateRouteProxiesToAddresses();
     this.ensureOfficialChatGptProviderKeyGroup();
     this.ensureOfficialGrokSite();
@@ -141,6 +143,7 @@ export class JsonStore {
 
   recordUsage(record: UsageRecordInput) { this.usageStore.record(record); }
   usageReport(filters: UsageFilters = {}) { return this.usageStore.report(filters, this.db.apiKeys); }
+  estimateMissingUsage(filters: UsageFilters = {}) { return this.usageStore.estimateMissingRecords(filters); }
   listModelPrices() { return this.usageStore.listPrices(); }
   saveModelPrice(price: ModelPriceInput) { return this.usageStore.savePrice(price); }
   deleteModelPrice(id: string) { this.usageStore.deletePrice(id); }
@@ -174,22 +177,25 @@ export class JsonStore {
   }
 
   private migrateManagedAccountPolicies() {
-    if (this.sqlite.prepare("SELECT 1 FROM meta WHERE key = 'managed_account_policy_format'").get()) return false;
+    const previous = this.sqlite.prepare("SELECT value FROM meta WHERE key = 'managed_account_policy_format'").get() as { value: string } | undefined;
+    if (previous?.value === "2") return false;
     // Older group.strategy values were unused; the global strategy controlled all pools.
     // Preserve that behavior until the administrator explicitly selects a per-provider policy.
     let changed = false;
     for (const group of this.db.temporaryAccountGroups) {
-      if (group.providerType !== "grok" && !group.preferredAccountId && group.strategy !== undefined) { group.strategy = undefined; changed = true; }
+      if ((group.providerType === "grok" || !previous && !group.preferredAccountId) && group.strategy !== undefined) { group.strategy = undefined; changed = true; }
     }
     this.sqlite.transaction(() => {
-      this.sqlite.prepare("UPDATE temporary_account_groups SET strategy = NULL WHERE COALESCE(provider_type, 'gpt') != 'grok' AND preferred_account_id IS NULL").run();
-      this.sqlite.prepare("INSERT INTO meta (key, value) VALUES ('managed_account_policy_format', '1')").run();
+      if (!previous) this.sqlite.prepare("UPDATE temporary_account_groups SET strategy = NULL WHERE preferred_account_id IS NULL").run();
+      this.sqlite.prepare("UPDATE temporary_account_groups SET strategy = NULL WHERE provider_type = 'grok'").run();
+      this.sqlite.prepare("INSERT INTO meta (key, value) VALUES ('managed_account_policy_format', '2') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
     })();
     return changed;
   }
 
   createManagedAccount(input: ManagedAccountInput) {
     const provider = accountProvider(input.provider);
+    if (provider === "grok") throw new Error("Grok 账号请通过 OAuth JSON 导入");
     const label = typeof input.label === "string" ? input.label.trim() : "";
     const secret = typeof input.secret === "string" ? input.secret.trim() : "";
     if (!label || label.length > 200) throw new Error("账号名称不能为空且最多 200 字符");
@@ -208,7 +214,7 @@ export class JsonStore {
 
   updateManagedAccount(id: string, input: ManagedAccountPatch) {
     const target = this.temporaryAccountCheckTarget(id);
-    if (!target || target.group.providerType === "grok") throw new Error("账号不存在");
+    if (!target) throw new Error("账号不存在");
     const { account, group } = target;
     if (input.label !== undefined && (typeof input.label !== "string" || !input.label.trim() || input.label.length > 200)) throw new Error("账号名称无效");
     if (input.models !== undefined && (!Array.isArray(input.models) || input.models.some((model) => typeof model !== "string"))) throw new Error("模型列表无效");
@@ -255,6 +261,8 @@ export class JsonStore {
   }
 
   private syncManagedAccountModels(provider: AccountProvider) {
+    // Grok keeps its existing official account pool and model-management source.
+    if (provider === "grok") return;
     const accountGroup = this.db.temporaryAccountGroups.find((group) => (group.providerType || "gpt") === provider);
     if (!accountGroup) return;
     const assignedSite = this.db.sites.find((site) => site.id === accountGroup.siteId);
@@ -282,7 +290,7 @@ export class JsonStore {
     return {
       format: "samapi-backup",
       version: 1,
-      accountPolicyVersion: 1,
+      accountPolicyVersion: 2,
       exportedAt: now(),
       data: structuredClone(data)
     };
@@ -340,7 +348,7 @@ export class JsonStore {
       if (!group?.id || !group.siteId || !Array.isArray(group.accounts)) throw new Error("备份文件包含无效的临时账号分组");
       group.providerType = normalizeTemporaryAccountProviderType(group.providerType || group.name);
       group.strategy = group.strategy === undefined ? undefined : normalizeGroupStrategy(group.strategy);
-      if (backup.accountPolicyVersion !== 1 && group.providerType !== "grok" && !group.preferredAccountId) group.strategy = undefined;
+      if (group.providerType === "grok" ? backup.accountPolicyVersion !== 2 : !backup.accountPolicyVersion && !group.preferredAccountId) group.strategy = undefined;
       group.enabled = group.enabled !== false;
       for (const account of group.accounts) {
         if (!account?.id || typeof account.secret !== "string") throw new Error("备份文件包含无效的临时账号");
@@ -356,6 +364,7 @@ export class JsonStore {
     for (const route of next.routes) {
       if (!route?.id || !route.name || (route.type !== "switch" && route.type !== "group")) throw new Error("备份文件包含无效的路由");
     }
+    validateModelRuleTargets(next.settings.downstreamModelRules, next);
     for (const group of next.routeDisplayGroups) {
       if (!group?.id || !group.name || !Array.isArray(group.routeIds)) throw new Error("备份文件包含无效的路由展示分组");
     }
@@ -497,7 +506,9 @@ export class JsonStore {
   }
 
   updateSettings(input: Partial<AppSettings>) {
-    this.db.settings = normalizeSettings({ ...this.db.settings, ...input });
+    const settings = normalizeSettings({ ...this.db.settings, ...input });
+    if (input.downstreamModelRules !== undefined) validateModelRuleTargets(settings.downstreamModelRules, this.db);
+    this.db.settings = settings;
     this.requestLogStore.trim(this.db.settings.maxRequestLogs);
     this.persist();
     return this.db.settings;
@@ -892,7 +903,7 @@ export class JsonStore {
     if (usable.length === 0) return [];
     const available = usable.filter((account) => account.availability === "available");
     const unchecked = usable.filter((account) => account.availability !== "available");
-    const strategy = providerType === "grok" ? this.db.settings.temporaryAccountStrategy : groups[0]?.strategy || this.db.settings.temporaryAccountStrategy;
+    const strategy = groups[0]?.strategy || this.db.settings.temporaryAccountStrategy;
     const ordered = [...this.orderedTemporaryAccountPool(available, strategy, `${providerType}:available`), ...this.orderedTemporaryAccountPool(unchecked, strategy, `${providerType}:unknown`)];
     const preferred = (strategy === "priority" || strategy === "stable-first") ? ordered.find((account) => groups.some((group) => group.preferredAccountId === account.id)) : undefined;
     return preferred ? [preferred, ...ordered.filter((account) => account.id !== preferred.id)] : ordered;
@@ -1268,6 +1279,9 @@ export class JsonStore {
       }
       return route;
     });
+    this.db.settings.downstreamModelRules = this.db.settings.downstreamModelRules.map((rule) =>
+      rule.headerTemplateId === id ? { ...rule, headerTemplateId: undefined } : rule
+    );
     this.persist();
   }
 
@@ -1296,6 +1310,7 @@ export class JsonStore {
       model: input.model.trim(),
       endpoint: input.endpoint || "messages",
       headerTemplateId: input.headerTemplateId || undefined,
+      temporaryAccountId: input.temporaryAccountId || undefined,
       enabled: input.enabled ?? true,
       updatedAt: timestamp
     };

@@ -12,7 +12,7 @@ import type {
   TemporaryAccountProviderType
 } from "../../shared/types";
 
-export type Section = "routes" | "sites" | "providerKeys" | "models" | "accounts" | "temporaryAccounts" | "keys" | "headers" | "logs" | "usage" | "settings" | "docs";
+export type Section = "routes" | "sites" | "providerKeys" | "models" | "accounts" | "keys" | "headers" | "logs" | "usage" | "settings" | "docs";
 export type AuthStatus = "checking" | "signed-out" | "signed-in";
 
 export interface RouteDraft {
@@ -81,5 +81,5 @@ export interface ProviderModelOption {
   enabled: boolean;
 }
 
-export type SnapshotLoader = (options?: { includeRequestLogs?: boolean; includeTemporaryAccounts?: boolean }) => Promise<void>;
+export type SnapshotLoader = (options?: { includeRequestLogs?: boolean }) => Promise<void>;
 export type SnapshotState = AppSnapshot | null;

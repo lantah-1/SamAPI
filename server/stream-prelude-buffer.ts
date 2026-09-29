@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 const MEMORY_BYTES = 256 * 1024;
 const REPLAY_BYTES = 64 * 1024;
-const MAX_PRELUDE_BYTES = 256 * 1024 * 1024;
+const MAX_BUFFER_BYTES = 256 * 1024 * 1024;
 
 /** Preserve wire bytes without letting buffer size commit a response to the client. */
 export class StreamPreludeBuffer {
@@ -28,7 +28,7 @@ export class StreamPreludeBuffer {
   append(chunk: Uint8Array): Promise<void> {
     if (this.disposal) return Promise.reject(new Error("上游前置缓冲已关闭"));
     return this.run(async () => {
-      if (this.size + chunk.byteLength > MAX_PRELUDE_BYTES) throw new Error("上游在返回内容前发送了过多前置数据");
+      if (this.size + chunk.byteLength > MAX_BUFFER_BYTES) throw new Error("上游响应缓冲超出大小限制");
       if (!this.file && this.size + chunk.byteLength <= MEMORY_BYTES) {
         this.chunks.push(chunk);
       } else {

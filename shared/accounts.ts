@@ -1,9 +1,10 @@
-import type { EndpointKind, GroupRouteStrategy, TemporaryAccountAvailability, TemporaryAccountQuotaStage } from "./types.js";
+import type { EndpointKind, GrokOAuthFormat, GroupRouteStrategy, TemporaryAccountAvailability, TemporaryAccountQuotaStage } from "./types.js";
 
-export type AccountProvider = "gpt" | "claude" | "deepseek" | "gemini";
+export type AccountProvider = "gpt" | "grok" | "claude" | "deepseek" | "gemini";
 
 export const accountProviders: Record<AccountProvider, { label: string; baseUrl: string; endpoint: EndpointKind; credentialHint: string }> = {
   gpt: { label: "GPT", baseUrl: "https://api.openai.com/v1", endpoint: "chat/completions", credentialHint: "登录 ChatGPT，或使用 OpenAI API Key" },
+  grok: { label: "Grok", baseUrl: "https://api.x.ai/v1", endpoint: "chat/completions", credentialHint: "导入 CPA 或 grok2api 的 Grok OAuth 账号" },
   claude: { label: "Claude", baseUrl: "https://api.anthropic.com/v1", endpoint: "messages", credentialHint: "使用 Anthropic Console 的 API Key" },
   deepseek: { label: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", endpoint: "chat/completions", credentialHint: "使用 DeepSeek 开放平台的 API Key" },
   gemini: { label: "Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", endpoint: "chat/completions", credentialHint: "使用 Google AI Studio 的 API Key" }
@@ -16,6 +17,7 @@ export interface ManagedAccount {
   email?: string;
   accountId?: string;
   kind: "oauth" | "api-key" | "agent-identity";
+  grokOAuthFormat?: GrokOAuthFormat;
   credentialPreview: string;
   enabled: boolean;
   availability: TemporaryAccountAvailability;

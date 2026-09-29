@@ -47,6 +47,7 @@ export function createModelPriceSync(store: Pick<JsonStore, "modelPriceSyncState
   let current: Promise<ModelPriceSyncReport> | undefined;
   let timer: NodeJS.Timeout | undefined;
   let stopped = true;
+  const needsParserRefresh = (source: PriceSource, state: ModelPriceSyncState) => (source.parserVersion || 0) > (state.parserVersion || 0);
 
   const status = (): ModelPriceSyncReport => {
     const saved = new Map(store.modelPriceSyncStates().map((state) => [state.id, state]));
@@ -56,7 +57,7 @@ export function createModelPriceSync(store: Pick<JsonStore, "modelPriceSyncState
   const schedule = () => {
     if (stopped) return;
     if (timer) clearTimeout(timer);
-    const times = status().sources.map((source) => Number.isFinite(Date.parse(source.nextSyncAt || "")) ? Date.parse(source.nextSyncAt!) : now().getTime());
+    const times = status().sources.map((state, index) => !needsParserRefresh(sources[index], state) && Number.isFinite(Date.parse(state.nextSyncAt || "")) ? Date.parse(state.nextSyncAt!) : now().getTime());
     const due = Math.min(...times);
     timer = setTimeout(() => { void sync(false).catch((error) => console.error("[model-prices] sync failed:", error instanceof Error ? error.message : "unknown error")); }, Math.max(1000, Math.min(86400000, due - now().getTime())));
     timer.unref();
@@ -68,7 +69,7 @@ export function createModelPriceSync(store: Pick<JsonStore, "modelPriceSyncState
       const states = new Map(status().sources.map((state) => [state.id, state]));
       const due = sources.filter((source) => {
         const next = Date.parse(states.get(source.id)?.nextSyncAt || "");
-        return force || !Number.isFinite(next) || next <= now().getTime();
+        return force || needsParserRefresh(source, states.get(source.id)!) || !Number.isFinite(next) || next <= now().getTime();
       });
       let cursor = 0;
       await Promise.all(Array.from({ length: Math.min(3, due.length) }, async () => {
@@ -81,11 +82,11 @@ export function createModelPriceSync(store: Pick<JsonStore, "modelPriceSyncState
             if (!prices.length || prices.length > 10000) throw new Error("未解析到有效官方价格，已保留上次价格");
             const unique = new Map(prices.map((price) => [price.model, price]));
             const finished = now();
-            const state: ModelPriceSyncState = { id: source.id, name: source.name, url: source.url, status: "success", modelCount: unique.size,
+            const state: ModelPriceSyncState = { id: source.id, name: source.name, url: source.url, status: "success", modelCount: unique.size, parserVersion: source.parserVersion,
               lastAttemptAt: attemptedAt, lastSuccessAt: finished.toISOString(), nextSyncAt: nextModelPriceSyncAt(finished).toISOString() };
             store.saveOfficialModelPrices([...unique.values()], state);
           } catch (error) {
-            store.saveModelPriceSyncState({ ...previous, status: "failed", lastAttemptAt: attemptedAt,
+            store.saveModelPriceSyncState({ ...previous, status: "failed", lastAttemptAt: attemptedAt, parserVersion: source.parserVersion,
               nextSyncAt: new Date(now().getTime() + RETRY_MS).toISOString(), error: error instanceof Error ? error.message.slice(0, 240) : "官方价格同步失败" });
           }
         }

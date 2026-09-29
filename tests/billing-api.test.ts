@@ -33,6 +33,7 @@ test("usage API authenticates price updates, validates inputs and removes organi
     return { status, body: JSON.parse(text) };
   };
   assert.equal((await request("/api/usage", "GET", undefined, false)).status, 401);
+  assert.equal((await request("/api/usage/estimate-missing", "POST", undefined, false)).status, 401);
   assert.equal((await request("/api/usage/prices/sync", "GET", undefined, false)).status, 401);
   assert.equal((await request("/api/usage/prices/sync", "POST", undefined, false)).status, 401);
   assert.equal(syncCalls, 0);
@@ -68,4 +69,31 @@ test("usage API authenticates price updates, validates inputs and removes organi
   assert.equal((await request("/api/accounts", "POST", { provider: "other", label: "bad", secret: "fixture" })).status, 400);
   await request(`/api/accounts/${account.body.id}`, "DELETE");
   assert.equal((await request("/api/accounts")).body.providers.find((item: { provider: string }) => item.provider === "deepseek").accounts.length, 0);
+  const grokIds: string[] = [];
+  for (const fields of [{ type: "xai" }, { provider: "grok_build" }]) {
+    const imported = await request("/api/accounts/import", "POST", { providerType: "grok", content: JSON.stringify({ ...fields, name: `Grok ${grokIds.length}`, access_token: `fixture-grok-access-${grokIds.length}`, refresh_token: `fixture-grok-refresh-${grokIds.length}` }) });
+    assert.equal(imported.status, 201); assert.equal(imported.body.group.providerType, "grok");
+    grokIds.push(imported.body.accountIds[0]);
+    assert.equal(JSON.stringify(imported.body).includes("fixture-grok-access"), false);
+    assert.equal(JSON.stringify(imported.body).includes("fixture-grok-refresh"), false);
+  }
+  const grokAccounts = (await request("/api/accounts")).body.providers.find((item: { provider: string }) => item.provider === "grok").accounts;
+  assert.equal(grokAccounts.length, 2);
+  assert.ok(grokAccounts.every((item: { kind: string }) => item.kind === "oauth"));
+  const editedGrok = await request(`/api/accounts/${grokIds[0]}`, "PATCH", { label: "managed Grok", enabled: false });
+  assert.equal(editedGrok.status, 200); assert.equal(editedGrok.body.label, "managed Grok"); assert.equal(editedGrok.body.enabled, false);
+  const policy = await request("/api/accounts/providers/grok", "PATCH", { strategy: "sequential" });
+  assert.equal(policy.status, 200); assert.equal(policy.body.providers.find((item: { provider: string }) => item.provider === "grok").strategy, "sequential");
+  assert.equal((await request("/api/accounts/import", "POST", { providerType: "unsupported", content: "{}" })).status, 400);
+  assert.equal((await request(`/api/accounts/${grokIds[0]}`, "DELETE")).status, 200);
+  assert.equal((await request("/api/accounts/batch", "DELETE", { ids: [grokIds[1]] })).status, 200);
+  assert.equal((await request("/api/accounts")).body.providers.find((item: { provider: string }) => item.provider === "grok").accounts.length, 0);
+  const usage = { requestId: "history", apiKeyId: "client", apiKeyName: "Client", providerId: "p", providerName: "P", model: "fixture-model", createdAt: "2026-09-09T00:00:00Z", statusCode: 200 };
+  store.recordUsage({ ...usage, id: "known", usage: { inputTokens: 100, outputTokens: 10, cachedInputTokens: 0, cacheWriteInputTokens: 0, totalTokens: 110 } });
+  store.recordUsage({ ...usage, id: "unknown" });
+  assert.equal((await request("/api/usage/estimate-missing?from=bad", "POST")).status, 400);
+  assert.deepEqual((await request("/api/usage/estimate-missing?apiKeyId=other", "POST")).body, { updated: 0, remaining: 0 });
+  assert.deepEqual((await request("/api/usage/estimate-missing?apiKeyId=client", "POST")).body, { updated: 1, remaining: 0 });
+  const report = (await request("/api/usage?apiKeyId=client")).body;
+  assert.equal(report.totals.reportedRequests, 1); assert.equal(report.totals.estimatedRequests, 1); assert.equal(report.totals.missingUsageRequests, 0);
 });

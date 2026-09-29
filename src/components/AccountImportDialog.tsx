@@ -97,8 +97,8 @@ export function AccountImportDialog(props: {
           <form onSubmit={props.onSubmit} className="modal-panel temp-account-modal" role="dialog" aria-modal="true" aria-label="账号导入">
             <div className="form-head">
               <div>
-                <h2>{props.draft.providerType === "gpt" ? "导入 GPT 账号" : "导入 Grok 临时账号"}</h2>
-                <div className="mt-1 text-xs font-bold text-ink/55">选择账号平台，文件格式可自动识别</div>
+                <h2>{props.draft.providerType === "gpt" ? "导入 GPT 账号" : "导入 Grok 账号"}</h2>
+                <div className="mt-1 text-xs font-bold text-ink/55">导入当前平台的账号，文件格式可自动识别</div>
               </div>
               <ActionButton type="button" tone="ghost" onClick={props.onClose} title="关闭">
                 <X className="h-4 w-4" />

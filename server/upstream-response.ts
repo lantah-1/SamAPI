@@ -3,6 +3,15 @@ import { StreamPreludeBuffer } from "./stream-prelude-buffer.js";
 import { isRecord, looksLikeHtml } from "./util/text.js";
 
 const streamHeartbeats = new Set(["ping", "keepalive", "keep-alive", "keep_alive", "heartbeat"]);
+const streamTerminalEvents = new Set(["response.completed", "response.incomplete", "message_stop"]);
+const encoder = new TextEncoder();
+
+export interface UpstreamResponseOptions {
+  /** Retry a stream that fails after useful output has already been released downstream. */
+  retryStreamFailure?: (error: Error) => Promise<Response | undefined>;
+  /** A previous attempt has already emitted useful output on this downstream response. */
+  streamContinuation?: boolean;
+}
 
 function hasStreamContent(value: unknown): boolean {
   if (value == null || value === "") return false;
@@ -12,7 +21,6 @@ function hasStreamContent(value: unknown): boolean {
     if (value.type === "refusal") return hasStreamContent(value.refusal);
     if (value.type === "thinking") return hasStreamContent(value.thinking);
   }
-  // Preserve unfamiliar content (e.g. image output) rather than treating it as empty.
   return true;
 }
 
@@ -20,21 +28,14 @@ function isOutputItemPrelude(item: unknown) {
   if (item == null) return true;
   if (!isRecord(item)) return false;
   if (item.type === "message") return !hasStreamContent(item.content);
-  if (item.type === "reasoning") {
-    // Responses Lite omits empty fields or sends null. IDs, status and encrypted
-    // reasoning state do not establish that any reply content has been produced.
-    return !hasStreamContent(item.summary) && !hasStreamContent(item.content);
-  }
+  if (item.type === "reasoning") return !hasStreamContent(item.summary) && !hasStreamContent(item.content);
   return false;
 }
 
 function isStreamPrelude(value: unknown, eventName: string) {
   const type = isRecord(value) && typeof value.type === "string" ? value.type : eventName;
-  // Codex keepalives can be data-bearing SSE events, not just comments. They must
-  // not commit the downstream response and take a later overload out of the retry loop.
   if (streamHeartbeats.has(type)) return true;
   if (!isRecord(value)) return false;
-  // Codex relays send quota/header metadata before generation; it must not commit the downstream stream.
   if (["codex.rate_limits", "codex.response.metadata"].includes(type)) return true;
   if (["response.created", "response.queued", "response.in_progress"].includes(type)) {
     return !(isRecord(value.response) && Array.isArray(value.response.output) && value.response.output.some((item) => !isOutputItemPrelude(item)));
@@ -58,7 +59,6 @@ function isStreamPrelude(value: unknown, eventName: string) {
       && isRecord(choice.delta) && Object.entries(choice.delta).every(([key, item]) => key === "role"
         || (["content", "reasoning", "reasoning_content"].includes(key) && (item == null || item === ""))));
   }
-  // Unknown events may contain output or tool actions. Start forwarding them immediately.
   return false;
 }
 
@@ -67,7 +67,6 @@ function streamFormat(prefix: string): "sse" | "body" | undefined {
   if (!text) return undefined;
   const fields = ["event:", "data:", "id:", "retry:", ":"];
   if (fields.some((field) => text.startsWith(field))) return "sse";
-  // A transport chunk may stop halfway through the first SSE field name.
   if (fields.some((field) => field.startsWith(text))) return undefined;
   return "body";
 }
@@ -79,130 +78,227 @@ function checkStreamBodyError(text: string) {
   if (error) throw new Error(error);
 }
 
-function readyStreamFrame(frame: string) {
-  const parsed = parseSseFrame(frame);
-  if (!parsed.data && !frame.trimStart().startsWith("{")) return undefined;
-  if (parsed.data === "[DONE]") return "[DONE]";
+function inspectStreamFrame(frame: string, strict = false): { ready?: string; terminal?: boolean } {
+  const parsed = parseSseFrame(frame.replace(/^\uFEFF/, ""));
+  if (!parsed.data && !frame.trimStart().startsWith("{")) return {};
+  if (parsed.data === "[DONE]") return { ready: "[DONE]", terminal: true };
   const text = parsed.data || frame;
   let value: unknown;
+  let malformed = false;
   try { value = JSON.parse(text); } catch {
-    // Named heartbeat/error events may carry plain text instead of JSON.
     value = { type: parsed.event, message: text };
+    malformed = true;
   }
   const error = streamEventErrorMessage(value)
     || streamEventErrorMessage({ ...(isRecord(value) ? value : { message: text }), type: parsed.event });
   if (error) throw new Error(error);
-  if (isStreamPrelude(value, parsed.event)) return undefined;
-  // Keep a bounded event label for failure diagnosis; never retain the event payload here.
+  if (strict && malformed && !streamHeartbeats.has(parsed.event)) throw new Error("上游流包含无效 JSON 事件");
+  if (isStreamPrelude(value, parsed.event)) return {};
   const type = isRecord(value) && typeof value.type === "string" ? value.type : parsed.event;
-  return /^[\w.-]{1,100}$/.test(type) ? type : "data";
+  return { ready: /^[\w.-]{1,100}$/.test(type) ? type : "data", terminal: streamTerminalEvents.has(type) };
+}
+
+function isUpstreamErrorFrame(frame: string) {
+  const parsed = parseSseFrame(frame.replace(/^\uFEFF/, ""));
+  if (parsed.event === "error") return true;
+  const text = parsed.data || frame;
+  try {
+    const value: unknown = JSON.parse(text);
+    return Boolean(streamEventErrorMessage(value)
+      || streamEventErrorMessage({ ...(isRecord(value) ? value : { message: text }), type: parsed.event }));
+  } catch {
+    return false;
+  }
 }
 
 function checkBufferedResponse(text: string, contentType: string) {
   if (!text.trim()) throw new Error("上游返回空响应");
   if (looksLikeHtml(contentType, text)) throw new Error("上游返回了 HTML 页面，请检查 API 地址或代理状态");
   if (streamFormat(text) === "sse") {
-    // Non-streaming callers have not received any output yet, even if the buffered SSE has deltas.
-    for (const frame of text.split(/\r?\n\r?\n/)) readyStreamFrame(frame);
+    for (const frame of text.split(/\r?\n\r?\n/)) inspectStreamFrame(frame);
   } else checkStreamBodyError(text);
 }
 
-/** Identify the wire format from bytes: Codex Responses Lite can omit Content-Type entirely. */
-async function prepareStreamingResponse(response: Response, signal?: AbortSignal, onStreamReady?: (eventType: string) => void) {
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder();
-  const buffered = new StreamPreludeBuffer();
-  let pending = "";
-  let format: ReturnType<typeof streamFormat>;
-  let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
-  let released: Promise<void> | undefined;
-  let cancelled: Promise<void> | undefined;
-  const release = () => released ??= (async () => {
-    signal?.removeEventListener("abort", abort);
-    try { await buffered.dispose(); } finally { reader.releaseLock(); }
-  })();
-  const cancel = (reason: unknown) => cancelled ??= reader.cancel(reason).catch(() => {}).then(release);
-  const abort = () => {
-    bodyController?.error(signal?.reason);
-    // Preparation owns cleanup while it is still parsing. After handoff, abort must also
-    // release the spool even when the downstream never pulls another chunk.
-    void (bodyController ? cancel(signal?.reason) : reader.cancel(signal?.reason)).catch(() => {});
-  };
-  signal?.addEventListener("abort", abort, { once: true });
+async function* replay(buffer: StreamPreludeBuffer) {
   try {
-    let ready: string | undefined;
-    while (!ready) {
-      signal?.throwIfAborted();
-      const chunk = await reader.read();
-      signal?.throwIfAborted();
-      if (chunk.done) {
-        pending += decoder.decode();
-        if (format === "sse" || (!pending.trim() && /text\/event-stream/i.test(response.headers.get("content-type") || ""))) {
-          ready = pending.trim() ? readyStreamFrame(pending) : undefined;
-          if (ready) break;
-          throw new Error("上游流在返回内容前结束");
-        }
-        checkBufferedResponse(pending, response.headers.get("content-type") || "");
-        break;
-      }
-      await buffered.append(chunk.value);
-      signal?.throwIfAborted();
-      pending += decoder.decode(chunk.value, { stream: true });
-      format ??= streamFormat(pending);
-      if (format === "sse") {
-        let separator: RegExpExecArray | null;
-        while ((separator = /\r?\n\r?\n/.exec(pending))) {
-          const frame = pending.slice(0, separator.index);
-          pending = pending.slice(separator.index + separator[0].length);
-          ready = readyStreamFrame(frame);
-          if (ready) break;
-        }
-      }
-      // A size limit is a failure, never evidence of output. Codex can echo large instructions
-      // in response.created/in_progress before an overload error arrives.
-      if (!ready && pending.length > 64 * 1024 * 1024) throw new Error("上游前置响应帧超出大小限制");
-    }
-    pending = "";
-    signal?.throwIfAborted();
-    onStreamReady?.(ready || "body");
-    const body = new ReadableStream<Uint8Array>({
-      start(controller) { bodyController = controller; },
-      async pull(controller) {
-        try {
-          signal?.throwIfAborted();
-          const prefetched = await buffered.read();
-          signal?.throwIfAborted();
-          if (prefetched) { controller.enqueue(prefetched); return; }
-          await buffered.dispose();
-          const chunk = await reader.read();
-          signal?.throwIfAborted();
-          if (chunk.done) { await release(); controller.close(); }
-          else controller.enqueue(chunk.value);
-        } catch (error) {
-          try { await cancel(error); } finally { controller.error(error); }
-        }
-      },
-      async cancel(reason) {
-        await cancel(reason);
-      }
-    }, { highWaterMark: 0 });
-    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
-  } catch (error) {
-    await cancel(error);
-    throw error;
+    let chunk: Uint8Array | undefined;
+    while ((chunk = await buffer.read())) yield chunk;
+  } finally {
+    await buffer.dispose();
   }
 }
 
-/** Keep body-read failures inside the retry boundary; successful streaming output stays streaming. */
-export async function prepareUpstreamResponse(response: Response, downstreamStream: boolean, signal?: AbortSignal, onStreamReady?: (eventType: string) => void) {
+type AttemptOutcome = { kind: "complete" } | { kind: "failure"; error: Error; rawFrame?: Uint8Array };
+
+async function* readStreamingAttempt(input: {
+  response: Response;
+  signal?: AbortSignal;
+  strict: boolean;
+  suppressPrelude: boolean;
+  state: { started: boolean };
+  onStreamReady?: (eventType: string) => void;
+}): AsyncGenerator<Uint8Array, AttemptOutcome> {
+  const reader = input.response.body!.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: input.strict, ignoreBOM: true });
+  const prelude = new StreamPreludeBuffer();
+  let pending = "";
+  let format: ReturnType<typeof streamFormat>;
+  let attemptReady = false;
+  let terminal = false;
+  let readerFinished = false;
+  const abort = () => { void reader.cancel(input.signal?.reason).catch(() => {}); };
+  input.signal?.addEventListener("abort", abort, { once: true });
+
+  const processFrame = async function* (frame: string, separator: string): AsyncGenerator<Uint8Array, AttemptOutcome | undefined> {
+    const rawFrame = encoder.encode(frame + separator);
+    let inspected: ReturnType<typeof inspectStreamFrame>;
+    try { inspected = inspectStreamFrame(frame, input.strict); }
+    catch (error) {
+      return { kind: "failure", error: error instanceof Error ? error : new Error(String(error)), ...(isUpstreamErrorFrame(frame) ? { rawFrame } : {}) };
+    }
+    if (!attemptReady && !inspected.ready) {
+      await prelude.append(rawFrame);
+      return undefined;
+    }
+    if (!attemptReady) {
+      attemptReady = true;
+      input.state.started = true;
+      input.onStreamReady?.(inspected.ready || "data");
+      if (input.suppressPrelude) await prelude.dispose();
+      else yield* replay(prelude);
+    }
+    yield rawFrame;
+    if (inspected.terminal) {
+      terminal = true;
+      await reader.cancel().catch(() => {});
+      readerFinished = true;
+      return { kind: "complete" };
+    }
+    return undefined;
+  };
+
+  try {
+    while (true) {
+      input.signal?.throwIfAborted();
+      let chunk: Awaited<ReturnType<typeof reader.read>>;
+      try { chunk = await reader.read(); }
+      catch (error) { return { kind: "failure", error: error instanceof Error ? error : new Error(String(error)) }; }
+      input.signal?.throwIfAborted();
+      if (chunk.done) {
+        readerFinished = true;
+        pending += decoder.decode();
+        if (format === "sse" || (!pending.trim() && /text\/event-stream/i.test(input.response.headers.get("content-type") || ""))) {
+          if (pending.trim()) {
+            const iterator = processFrame(pending, "");
+            let item = await iterator.next();
+            while (!item.done) { yield item.value; item = await iterator.next(); }
+            if (item.value) return item.value;
+          }
+          if (terminal) return { kind: "complete" };
+          if (input.state.started && !input.strict) return { kind: "complete" };
+          const message = input.state.started ? "上游流在完整结束前中断（缺少结束事件）" : "上游流在返回内容前结束";
+          return { kind: "failure", error: new Error(message) };
+        }
+        try { checkBufferedResponse(pending, input.response.headers.get("content-type") || ""); }
+        catch (error) { return { kind: "failure", error: error instanceof Error ? error : new Error(String(error)) }; }
+        input.state.started = true;
+        input.onStreamReady?.("body");
+        if (pending) yield encoder.encode(pending);
+        return { kind: "complete" };
+      }
+
+      pending += decoder.decode(chunk.value, { stream: true });
+      format ??= streamFormat(pending);
+      if (format === "body") {
+        if (pending.length > 64 * 1024 * 1024) return { kind: "failure", error: new Error("上游响应帧超出大小限制") };
+        continue;
+      }
+      if (format !== "sse") continue;
+      let separator: RegExpExecArray | null;
+      while ((separator = /\r?\n\r?\n/.exec(pending))) {
+        const frame = pending.slice(0, separator.index);
+        pending = pending.slice(separator.index + separator[0].length);
+        const iterator = processFrame(frame, separator[0]);
+        let item = await iterator.next();
+        while (!item.done) { yield item.value; item = await iterator.next(); }
+        if (item.value) return item.value;
+      }
+      if (!attemptReady && pending.length > 64 * 1024 * 1024) return { kind: "failure", error: new Error("上游响应帧超出大小限制") };
+    }
+  } finally {
+    input.signal?.removeEventListener("abort", abort);
+    await prelude.dispose();
+    if (!readerFinished) await reader.cancel().catch(() => {});
+    try { reader.releaseLock(); } catch { /* Already released by the runtime. */ }
+  }
+}
+
+async function* retryingStreamingBody(response: Response, signal: AbortSignal | undefined, onStreamReady: ((eventType: string) => void) | undefined, options: UpstreamResponseOptions) {
+  const state = { started: options.streamContinuation === true };
+  let current = response;
+  let suppressPrelude = state.started;
+  while (true) {
+    const iterator = readStreamingAttempt({ response: current, signal, strict: Boolean(options.retryStreamFailure), suppressPrelude, state, onStreamReady });
+    let item: Awaited<ReturnType<typeof iterator.next>>;
+    try {
+      item = await iterator.next();
+      while (!item.done) { yield item.value; item = await iterator.next(); }
+    } finally {
+      await iterator.return({ kind: "complete" });
+    }
+    if (item.value.kind === "complete") return;
+
+    // Before the first useful frame, keep the failure in the ordinary fetch retry/failover path so
+    // a successful replacement can still provide its own response metadata and opening events.
+    if (!state.started) throw item.value.error;
+
+    const next = await options.retryStreamFailure?.(item.value.error);
+    if (next?.ok && next.body) {
+      current = next;
+      suppressPrelude = true;
+      continue;
+    }
+    if (state.started && item.value.rawFrame) return;
+    throw item.value.error;
+  }
+}
+
+async function prepareStreamingResponse(response: Response, signal?: AbortSignal, onStreamReady?: (eventType: string) => void, options: UpstreamResponseOptions = {}) {
+  const iterator = retryingStreamingBody(response, signal, onStreamReady, options);
+  const first = await iterator.next();
+  if (first.done) throw new Error("上游返回空响应");
+  let firstChunk: Uint8Array | undefined = first.value;
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        signal?.throwIfAborted();
+        if (firstChunk) {
+          const chunk = firstChunk;
+          firstChunk = undefined;
+          controller.enqueue(chunk);
+          return;
+        }
+        const next = await iterator.next();
+        signal?.throwIfAborted();
+        if (next.done) controller.close();
+        else controller.enqueue(next.value);
+      } catch (error) {
+        try { await iterator.return(undefined); } finally { controller.error(error); }
+      }
+    },
+    async cancel() { await iterator.return(undefined); }
+  }, { highWaterMark: 0 });
+  return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+}
+
+/** Validate the prelude, then forward complete safe frames immediately. Retryable error frames are withheld while a retry is available. */
+export async function prepareUpstreamResponse(response: Response, downstreamStream: boolean, signal?: AbortSignal, onStreamReady?: (eventType: string) => void, options: UpstreamResponseOptions = {}) {
   signal?.throwIfAborted();
   if (!response.body) {
     if (response.ok) throw new Error("上游返回空响应");
     return response;
   }
-  if (response.ok && downstreamStream) {
-    return prepareStreamingResponse(response, signal, onStreamReady);
-  }
+  if (response.ok && downstreamStream) return prepareStreamingResponse(response, signal, onStreamReady, options);
   const body = await response.arrayBuffer();
   signal?.throwIfAborted();
   if (response.ok) checkBufferedResponse(new TextDecoder().decode(body), response.headers.get("content-type") || "");

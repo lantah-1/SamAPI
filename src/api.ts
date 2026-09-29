@@ -1,4 +1,4 @@
-import type { ModelPrice, ModelPriceInput, ModelPriceSyncReport, UsageFilters, UsageReport } from "../shared/usage";
+import type { ModelPrice, ModelPriceInput, ModelPriceSyncReport, UsageEstimationResult, UsageFilters, UsageReport } from "../shared/usage";
 import type { AccountProvider, ManagedAccount, ManagedAccountInput, ManagedAccountPatch, ManagedAccountsSnapshot } from "../shared/accounts";
 import type {
   ApiKeyCreated,
@@ -20,9 +20,8 @@ import type {
   RouteDisplayGroup,
   RouteRecord,
   Site,
-  TemporaryAccountGroup,
-  TemporaryAccountCheckOptions,
   TemporaryAccountCheckResult,
+  TemporaryAccountGroup,
   TemporaryAccountImportInput,
   TemporaryAccountImportResult,
 } from "../shared/types";
@@ -104,14 +103,15 @@ export const api = {
   updateManagedAccount: (id: string, body: ManagedAccountPatch) => request<ManagedAccount>(`/api/accounts/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteManagedAccount: (id: string) => request<{ ok: true }>(`/api/accounts/${encodeURIComponent(id)}`, { method: "DELETE" }),
   deleteManagedAccounts: (ids: string[]) => request<{ ok: true }>("/api/accounts/batch", { method: "DELETE", body: JSON.stringify({ ids }) }),
-  preferManagedAccount: (id: string) => request<ManagedAccountsSnapshot>(`/api/accounts/${encodeURIComponent(id)}/prefer`, { method: "POST" }),
   managedAccountPolicy: (provider: AccountProvider, strategy: string) => request<ManagedAccountsSnapshot>(`/api/accounts/providers/${provider}`, { method: "PATCH", body: JSON.stringify({ strategy }) }),
   checkManagedAccount: (id: string) => request<TemporaryAccountCheckResult>(`/api/accounts/${encodeURIComponent(id)}/check`, { method: "POST" }),
   resetManagedAccount: (id: string) => request<TemporaryAccountCheckResult>(`/api/accounts/${encodeURIComponent(id)}/reset`, { method: "POST" }),
   importManagedAccounts: (body: TemporaryAccountImportInput) => request<TemporaryAccountImportResult>("/api/accounts/import", { method: "POST", body: JSON.stringify(body) }),
+  temporaryAccountGroups: () => request<TemporaryAccountGroup[]>("/api/temporary-accounts"),
   startAccountOAuth: () => request<{ state: string; authorizationUrl: string; redirectUri: string }>("/api/accounts/oauth/start", { method: "POST" }),
   accountOAuthStatus: (state: string) => request<{ state: string; status: "pending" | "success" | "error"; error?: string; accountId?: string }>(`/api/accounts/oauth/status?state=${encodeURIComponent(state)}`),
   usage: (filters: UsageFilters = {}) => request<UsageReport>(`/api/usage?${usageQuery(filters)}`),
+  estimateMissingUsage: (filters: UsageFilters = {}) => request<UsageEstimationResult>(`/api/usage/estimate-missing?${usageQuery(filters)}`, { method: "POST" }),
   modelPrices: () => request<ModelPrice[]>("/api/usage/prices"),
   modelPriceSync: () => request<ModelPriceSyncReport>("/api/usage/prices/sync"),
   syncModelPrices: () => request<ModelPriceSyncReport>("/api/usage/prices/sync", { method: "POST" }),
@@ -182,53 +182,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify(options)
     }),
-  listTemporaryAccountGroups: () => request<TemporaryAccountGroup[]>("/api/temporary-accounts"),
-  startTemporaryAccountOAuth: () =>
-    request<{ state: string; authorizationUrl: string; redirectUri: string }>("/api/temporary-accounts/oauth/start", {
-      method: "POST",
-      body: JSON.stringify({ providerType: "gpt" })
-    }),
-  temporaryAccountOAuthStatus: (state: string) =>
-    request<{ state: string; status: "pending" | "success" | "error"; error?: string; accountId?: string }>(
-      `/api/temporary-accounts/oauth/status?state=${encodeURIComponent(state)}`
-    ),
-  importTemporaryAccounts: (input: TemporaryAccountImportInput) =>
-    request<TemporaryAccountImportResult>("/api/temporary-accounts/import", {
-      method: "POST",
-      body: JSON.stringify(input)
-    }),
-  checkTemporaryAccounts: (options?: TemporaryAccountCheckOptions) =>
-    request<TemporaryAccountCheckResult>("/api/temporary-accounts/check", {
-      method: "POST",
-      body: JSON.stringify(options || {})
-    }),
-  checkTemporaryAccount: (id: string, options?: TemporaryAccountCheckOptions) =>
-    request<TemporaryAccountCheckResult>(`/api/temporary-accounts/accounts/${id}/check`, {
-      method: "POST",
-      body: JSON.stringify(options || {})
-    }),
-  resetTemporaryAccount: (id: string, options?: TemporaryAccountCheckOptions) =>
-    request<TemporaryAccountCheckResult>(`/api/temporary-accounts/accounts/${id}/reset`, {
-      method: "POST",
-      body: JSON.stringify(options || {})
-    }),
-  updateTemporaryAccount: (id: string, body: Partial<TemporaryAccountGroup["accounts"][number]>) =>
-    request<TemporaryAccountGroup["accounts"][number]>(`/api/temporary-accounts/accounts/${id}`, {
-      method: "PATCH",
-      body: JSON.stringify(body)
-    }),
-  deleteTemporaryAccount: (id: string) => request<{ ok: true }>(`/api/temporary-accounts/accounts/${id}`, { method: "DELETE" }),
-  deleteTemporaryAccounts: (ids: string[]) =>
-    request<{ ok: true }>("/api/temporary-accounts/batch", {
-      method: "DELETE",
-      body: JSON.stringify({ ids })
-    }),
-  updateTemporaryAccountGroup: (id: string, input: Partial<TemporaryAccountGroup>) =>
-    request<TemporaryAccountGroup>(`/api/temporary-accounts/${id}`, {
-      method: "PATCH",
-      body: JSON.stringify(input)
-    }),
-  deleteTemporaryAccountGroup: (id: string) => request<{ ok: true }>(`/api/temporary-accounts/${id}`, { method: "DELETE" }),
   listHeaders: () => request<HeaderTemplate[]>("/api/headers"),
   saveHeader: (template: Partial<HeaderTemplate>) =>
     request<HeaderTemplate>(template.id ? `/api/headers/${template.id}` : "/api/headers", {

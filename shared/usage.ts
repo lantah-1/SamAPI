@@ -26,21 +26,31 @@ export interface ModelPriceRule extends ModelPriceRates {
   effectiveUntil?: string;
 }
 
+export interface ModelPriceTier extends ModelPriceRates {
+  rules?: ModelPriceRule[];
+  maxInputTokens?: number;
+}
+
 export interface OfficialPriceSource {
   id: string;
   name: string;
   url: string;
 }
 
-export interface ModelPrice extends ModelPriceRates {
+export interface ModelPrice extends ModelPriceTier {
   id: string;
   providerId: string;
   model: string;
   updatedAt: string;
   source?: OfficialPriceSource;
-  rules?: ModelPriceRule[];
-  maxInputTokens?: number;
+  serviceTiers?: Record<string, ModelPriceTier>;
   cacheReadRequiresMode?: boolean;
+}
+
+export function normalizeServiceTier(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const tier = value.trim().toLowerCase();
+  return /^[a-z][a-z0-9_-]{0,63}$/.test(tier) ? tier === "standard" ? "default" : tier : undefined;
 }
 
 export type ModelPriceInput = Pick<ModelPrice, "providerId" | "model" | "inputUsdPerMillion" | "cachedInputUsdPerMillion" | "cacheWriteUsdPerMillion" | "cacheWriteLongUsdPerMillion" | "outputUsdPerMillion">;
@@ -53,6 +63,7 @@ export interface ModelPriceSyncState extends OfficialPriceSource {
   nextSyncAt?: string;
   modelCount: number;
   error?: string;
+  parserVersion?: number;
 }
 
 export interface ModelPriceSyncReport {
@@ -71,7 +82,19 @@ export interface UsageRecordInput {
   createdAt: string;
   statusCode: number;
   cacheMode?: "implicit" | "explicit";
+  serviceTier?: string;
   usage?: TokenUsage;
+  finalized?: boolean;
+  estimation?: {
+    method: "content" | "same-request" | "historical" | "rejected";
+    sampleCount?: number;
+    inputEstimated?: boolean;
+    outputEstimated?: boolean;
+    tokenizer?: "o200k_base" | "cl100k_base";
+    cacheUsageMissing?: boolean;
+    cacheEstimated?: boolean;
+    cacheSampleCount?: number;
+  };
 }
 
 export interface UsageTotals extends TokenUsage {
@@ -79,9 +102,22 @@ export interface UsageTotals extends TokenUsage {
   downstreamRequests: number;
   failedRequests: number;
   reportedRequests: number;
+  estimatedRequests: number;
+  historicalEstimatedRequests: number;
+  estimatedInputTokens: number;
+  estimatedOutputTokens: number;
+  estimatedCachedInputTokens: number;
+  estimatedTotalTokens: number;
+  estimatedUsageCostUsd: number;
+  pendingRequests: number;
   missingUsageRequests: number;
   unpricedRequests: number;
   estimatedCostUsd: number;
+}
+
+export interface UsageEstimationResult {
+  updated: number;
+  remaining: number;
 }
 
 export interface UsageFilters {

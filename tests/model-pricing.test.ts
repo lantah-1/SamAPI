@@ -64,6 +64,46 @@ test("Claude parses five-minute and one-hour cache writes and normalizes mixed c
   assert.equal(priceOf(prices, "claude-3-5-haiku").inputUsdPerMillion, 0.8);
 });
 
+test("OpenAI cache writes remain part of input and use their published rate in both response formats", () => {
+  const astra = priceOf(parseOpenAiPrices(fixture("openai.html"), JSON.parse(fixture("openai-models.json")), source("openai")), "gpt-6-astra");
+  for (const value of [
+    { input_tokens: 100000, output_tokens: 1000, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 100000 } },
+    { prompt_tokens: 100000, completion_tokens: 1000, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 100000 } }
+  ]) {
+    const capture = createUsageCapture();
+    const wire = JSON.stringify({ usage: value });
+    for (const char of wire) capture.push(char);
+    assert.equal(capture.result()?.cacheWriteInputTokens, 100000);
+    assert.equal(capture.result()?.totalTokens, 101000);
+    assert.equal(usageCostNano(capture.result()!, astra), 1300000000n, "100k cache-write input plus 1k output costs $1.30, not $1.05");
+  }
+});
+
+test("service tiers select independent base, cache-write and long-context prices", () => {
+  const prices = parseOpenAiPrices(fixture("openai.html") + fixture("openai-tiers.html"), JSON.parse(fixture("openai-models.json")), source("openai"));
+  const sol = priceOf(prices, "gpt-5.6-sol");
+  for (const [tier, cost] of [["default", 600000000n], ["standard", 600000000n], ["fast", 1200000000n], ["priority", 1200000000n], ["flex", 300000000n]] as const) {
+    assert.equal(usageCostNano(usage(100000, 10000), sol, undefined, undefined, tier), cost, tier);
+  }
+  assert.equal(usageCostNano(usage(300000, 1000), sol, undefined, undefined, "priority"), 4860000000n);
+  assert.equal(usageCostNano(usage(300000, 1000), sol, undefined, undefined, "flex"), 1215000000n);
+  for (const tier of ["auto", "ultrafast", "scale", "batch", "unknown", "constructor"]) assert.equal(usageCostNano(usage(100000), sol, undefined, undefined, tier), null, tier);
+  const astra = priceOf(prices, "gpt-6-astra");
+  assert.equal(usageCostNano({ ...usage(100000, 1000), cacheWriteInputTokens: 100000 }, astra, undefined, undefined, "fast"), 2600000000n);
+  const minimax = priceOf(parseMinimaxPrices(fixture("minimax.md"), source("minimax")), "minimax-m3");
+  assert.equal(usageCostNano(usage(100000, 10000), minimax), 42000000n);
+  assert.equal(usageCostNano(usage(100000, 10000), minimax, undefined, undefined, "priority"), 63000000n);
+  assert.equal(usageCostNano(usage(600000, 1000), minimax, undefined, undefined, "priority"), 543600000n);
+});
+
+test("tier price validation happens before saving any part of a price update", (t) => {
+  const store = ledger(t);
+  store.saveOfficialModelPrices([official()], syncedState());
+  const previous = store.listModelPrices();
+  assert.throws(() => store.saveOfficialModelPrices([{ ...official(), serviceTiers: { priority: { inputUsdPerMillion: 4, cachedInputUsdPerMillion: 0.4, outputUsdPerMillion: -1 } } }], syncedState()));
+  assert.deepEqual(store.listModelPrices(), previous);
+});
+
 test("DeepSeek prices follow UTC weekday windows at each boundary", () => {
   const flash = priceOf(parseDeepSeekPrices(fixture("deepseek.html"), source("deepseek")), "deepseek-v4-flash");
   assert.equal(flash.cachedInputUsdPerMillion, 0.007);
@@ -214,6 +254,29 @@ test("failed or invalid sources retain prices, retry hourly and preserve due tim
     assert.equal(sync.status().sources[0].status, "failed");
     assert.deepEqual(store.listModelPrices(), before, "a partially invalid catalog is rejected atomically");
   }
+});
+
+test("upgrading a pricing parser refreshes existing same-day prices and still backs off after failure", async (t) => {
+  const store = ledger(t);
+  store.saveOfficialModelPrices([official()], syncedState());
+  let at = new Date("2026-09-08T12:00:00Z");
+  let calls = 0;
+  const sync = createModelPriceSync(store, { now: () => at, sources: [{ ...testSource, parserVersion: 1, read: async () => {
+    calls++;
+    if (calls === 1) throw new Error("temporary failure");
+    return [{ ...official(), serviceTiers: { priority: { inputUsdPerMillion: 4, cachedInputUsdPerMillion: 0.4, outputUsdPerMillion: 16 } } }];
+  } }] });
+  await sync.sync(false);
+  assert.equal(calls, 1, "a parser upgrade must not wait for tomorrow's scheduled update");
+  assert.equal(sync.status().sources[0].parserVersion, 1);
+  await sync.sync(false);
+  assert.equal(calls, 1, "failed upgrades use the normal retry delay");
+  at = new Date("2026-09-08T13:00:00Z");
+  await sync.sync(false);
+  assert.equal(calls, 2);
+  assert.equal(store.listModelPrices()[0].serviceTiers?.priority.inputUsdPerMillion, 4);
+  await sync.sync(false);
+  assert.equal(calls, 2);
 });
 
 test("concurrent scheduled and manual refreshes share one run with at most three sources in flight", async (t) => {

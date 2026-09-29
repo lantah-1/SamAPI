@@ -5,8 +5,8 @@ import type { ModelPrice, ModelPriceInput, ModelPriceRule, ModelPriceSyncReport,
 import { api } from "../api";
 import { ActionButton, SelectInput, TextInput } from "../components/ui";
 
-const integer = (value: number) => value.toLocaleString("zh-CN");
-const dollars = (value: number) => `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 6 })}`;
+const integer = (value: number) => (value ?? 0).toLocaleString("zh-CN");
+const dollars = (value: number) => `$${(value ?? 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 6 })}`;
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : "加载失败";
 
 export function usageDateFilters(apiKeyId: string, from: string, to: string): UsageFilters {
@@ -19,12 +19,13 @@ export function usageDateFilters(apiKeyId: string, from: string, to: string): Us
 export function UsageSummary({ totals }: { totals: UsageTotals }) {
   return <>
     <div className="consumption-metrics">
-      <div className="metric">总 Token<span>{integer(totals.totalTokens)}</span><small>输入 {integer(totals.inputTokens)} · 输出 {integer(totals.outputTokens)}</small></div>
-      <div className="metric">缓存命中<span>{integer(totals.cachedInputTokens)}</span><small>缓存写入 {integer(totals.cacheWriteInputTokens)} · 已包含在输入中</small></div>
-      <div className="metric">估算消费 · USD<span>{dollars(totals.estimatedCostUsd)}</span><small>按调用时的模型定价计算</small></div>
+      <div className="metric">总 Token{totals.estimatedRequests > 0 && "（含估算）"}<span>{integer(totals.totalTokens)}</span><small>输入 {integer(totals.inputTokens)} · 输出 {integer(totals.outputTokens)}</small>{totals.estimatedRequests > 0 && <small>其中估算 {integer(totals.estimatedTotalTokens)} Token</small>}</div>
+      <div className="metric">缓存命中<span>{integer(totals.cachedInputTokens)}</span><small>缓存写入 {integer(totals.cacheWriteInputTokens)} · 已包含在输入中</small>{totals.estimatedCachedInputTokens > 0 && <small>其中估算 {integer(totals.estimatedCachedInputTokens)} Token</small>}</div>
+      <div className="metric">估算消费 · USD<span>{dollars(totals.estimatedCostUsd)}</span><small>按调用时的模型定价计算</small>{totals.estimatedRequests > 0 && <small>含估算用量费用 {dollars(totals.estimatedUsageCostUsd)}</small>}</div>
       <div className="metric">客户端请求<span>{integer(totals.downstreamRequests)}</span><small>上游调用 {integer(totals.requests)} · 失败 {integer(totals.failedRequests)}</small></div>
     </div>
-    <p className="field-hint" role="status">已采集 {integer(totals.reportedRequests)} 次用量；{integer(totals.missingUsageRequests)} 次未返回完整用量或尚未结束；{integer(totals.unpricedRequests)} 次用量未定价。未计费部分不包含在估算消费中。</p>
+    <p className="field-hint" role="status">上游实报 {integer(totals.reportedRequests)} 次；估算 {integer(totals.estimatedRequests)} 次{totals.historicalEstimatedRequests > 0 && `（含历史补算 ${integer(totals.historicalEstimatedRequests)} 次）`}；处理中 {integer(totals.pendingRequests)} 次；{integer(totals.missingUsageRequests)} 次未返回完整用量且缺少估算依据；{integer(totals.unpricedRequests)} 次用量未定价。未定价部分不包含在估算消费中。</p>
+    {totals.estimatedRequests > 0 && <details className="field-hint mt-2"><summary>估算方式与范围</summary><p>有实际用量时优先使用。缺失的文本用量使用本地分词器估算，消息结构及其他供应商的分词仍有偏差。缓存缺失时参考同客户端、同供应商、同模型的实报比例，并标记为估算；没有足够样本的金额保留为未定价。历史补算参考附近实报，未观察到生成内容的失败请求按 0 估算。图片、音频及不可见推理无法完整计入，金额仅供参考。</p></details>}
   </>;
 }
 
@@ -33,7 +34,7 @@ function UsageTable({ rows, title }: { title: string; rows: Array<UsageTotals & 
     <div className="form-head"><h2>{title}</h2></div>
     {rows.length === 0 ? <div className="center-empty">该范围内暂无用量</div> : <div className="consumption-table-scroll"><table className="consumption-table">
       <thead><tr><th>名称</th><th>调用</th><th>输入 Token</th><th>缓存命中</th><th>输出 Token</th><th>总 Token</th><th>估算 USD</th></tr></thead>
-      <tbody>{rows.map((row) => <tr key={row.id}><th scope="row">{row.label}{row.detail && <small>{row.detail}</small>}</th><td>{integer(row.requests)}</td><td>{integer(row.inputTokens)}</td><td>{integer(row.cachedInputTokens)}</td><td>{integer(row.outputTokens)}</td><td>{integer(row.totalTokens)}</td><td>{dollars(row.estimatedCostUsd)}{row.unpricedRequests > 0 && <small>{row.unpricedRequests} 次待定价</small>}{row.missingUsageRequests > 0 && <small>{row.missingUsageRequests} 次用量未知</small>}</td></tr>)}</tbody>
+      <tbody>{rows.map((row) => <tr key={row.id}><th scope="row">{row.label}{row.detail && <small>{row.detail}</small>}</th><td>{integer(row.requests)}{row.pendingRequests > 0 && <small>{row.pendingRequests} 次处理中</small>}</td><td>{integer(row.inputTokens)}</td><td>{integer(row.cachedInputTokens)}</td><td>{integer(row.outputTokens)}</td><td>{integer(row.totalTokens)}{row.estimatedRequests > 0 && <small>含估算 {integer(row.estimatedTotalTokens)}</small>}</td><td>{dollars(row.estimatedCostUsd)}{row.estimatedRequests > 0 && <small>{row.estimatedRequests} 次用量估算</small>}{row.unpricedRequests > 0 && <small>{row.unpricedRequests} 次待定价</small>}{row.missingUsageRequests > 0 && <small>{row.missingUsageRequests} 次缺少估算依据</small>}</td></tr>)}</tbody>
     </table></div>}
   </section>;
 }
@@ -47,6 +48,17 @@ export function UsageView({ sites, onUnauthorized }: { sites: Site[]; onUnauthor
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [revision, setRevision] = useState(0);
+  const [estimating, setEstimating] = useState(false);
+  const [notice, setNotice] = useState("");
+  const estimateMissing = async () => {
+    setEstimating(true); setError(""); setNotice("");
+    try {
+      const result = await api.estimateMissingUsage(usageDateFilters(keyId, from, to));
+      setNotice(`已补算 ${integer(result.updated)} 次历史用量${result.remaining ? `，${integer(result.remaining)} 次缺少估算依据` : ""}`);
+      setRevision((value) => value + 1);
+    } catch (cause) { if (!onUnauthorized(cause)) setError(errorMessage(cause)); }
+    finally { setEstimating(false); }
+  };
   useEffect(() => {
     let active = true;
     setLoading(true);
@@ -69,9 +81,11 @@ export function UsageView({ sites, onUnauthorized }: { sites: Site[]; onUnauthor
         <label>结束日期（含当天）<TextInput type="date" value={to} min={from || undefined} onChange={(event) => setTo(event.target.value)} /></label>
         <ActionButton tone="ghost" onClick={() => { setFrom(""); setTo(""); }}>全部时间</ActionButton>
       </div>
-      <p className="field-hint my-3">从功能启用后的请求开始累计，每次重试单独归集上游实际用量。账目独立保存，清理请求日志不会影响消费统计。</p>
+      <p className="field-hint my-3">每次上游尝试单独统计，优先使用实际用量，缺失时自动估算。账目独立保存，清理请求日志不会影响消费统计。</p>
       {error && <p className="error-banner" role="alert">{error}</p>}
+      {notice && <p className="field-hint mb-3" role="status">{notice}</p>}
       {loading ? <div className="center-empty">正在读取用量…</div> : report && <UsageSummary totals={report.totals} />}
+      {Boolean(report?.totals.missingUsageRequests) && <ActionButton className="mt-3" tone="ghost" disabled={estimating || loading} onClick={() => void estimateMissing()}>{estimating ? "正在补算…" : "补算当前范围的历史未知用量"}</ActionButton>}
     </section>
     {report && <>
       <UsageTable title="客户端用量" rows={report.clients.map((row) => ({ ...row, id: row.apiKeyId, label: row.apiKeyName }))} />
@@ -141,7 +155,7 @@ function ModelPrices({ sites, models, onChanged, onUnauthorized }: { sites: Site
     cacheWriteLongUsdPerMillion: price.cacheWriteLongUsdPerMillion === undefined ? "" : String(price.cacheWriteLongUsdPerMillion)
   });
   return <details className="panel p-4 consumption-details"><summary>模型定价 <small>USD / 百万 Token · {prices.length} 项 · 每日自动更新</small></summary>
-    <div className="form-head consumption-price-head my-3"><p className="field-hint">每天北京时间 08:00 查询官方标准 Token 价格，失败后每小时重试。手动单价优先，已计费记录保留调用时的价格。工具调用、缓存存储和图像等额外费用不计入 Token 估算。</p><ActionButton tone="ghost" disabled={busy || sync?.running} onClick={() => void run(async () => { const result = await api.syncModelPrices(); setSync(result); const failed = result.sources.filter((source) => source.status === "failed"); return failed.length ? `价格更新完成，${failed.length} 个来源暂未更新，保留上次价格` : "官方模型价格已更新，对新调用生效"; })}><RefreshCw className={`h-4 w-4 ${busy || sync?.running ? "animate-spin" : ""}`} />{sync?.running ? "正在更新价格" : "立即更新价格"}</ActionButton></div>
+    <div className="form-head consumption-price-head my-3"><p className="field-hint">每天北京时间 08:00 查询官方 Token 价格，失败后每小时重试。自动价格按响应的实际服务档位计算，未知档位保留为未定价；手动统一单价优先，已计费记录保留调用时的价格。工具调用、缓存存储和图像等额外费用不计入 Token 估算。</p><ActionButton tone="ghost" disabled={busy || sync?.running} onClick={() => void run(async () => { const result = await api.syncModelPrices(); setSync(result); const failed = result.sources.filter((source) => source.status === "failed"); return failed.length ? `价格更新完成，${failed.length} 个来源暂未更新，保留上次价格` : "官方模型价格已更新，对新调用生效"; })}><RefreshCw className={`h-4 w-4 ${busy || sync?.running ? "animate-spin" : ""}`} />{sync?.running ? "正在更新价格" : "立即更新价格"}</ActionButton></div>
     {failedSources.length > 0 && <p className="field-hint my-2" role="status">暂未更新：{failedSources.map((source) => source.name).join("、")}。可展开更新状态查看原因。</p>}
     {sync && <details className="consumption-details mb-3"><summary>更新状态 <small>{sync.sources.filter((source) => source.status === "success").length}/{sync.sources.length} 个来源已更新</small></summary><div className="consumption-table-scroll"><table className="consumption-table"><thead><tr><th>官方来源</th><th>上次成功</th><th>下次查询</th><th>状态</th></tr></thead><tbody>{sync.sources.map((source) => <tr key={source.id}><th scope="row"><a href={source.url} target="_blank" rel="noreferrer">{source.name}</a></th><td>{priceTime(source.lastSuccessAt)}</td><td>{source.nextSyncAt ? priceTime(source.nextSyncAt) : "即将更新"}</td><td>{source.status === "success" ? `${source.modelCount} 个模型` : source.status === "failed" ? source.error || "等待重试" : "等待首次更新"}</td></tr>)}</tbody></table></div></details>}
     {error && <p className="error-banner" role="alert">{error}</p>}{notice && <p className="field-hint" role="status">{notice}</p>}
@@ -159,7 +173,7 @@ function ModelPrices({ sites, models, onChanged, onUnauthorized }: { sites: Site
           <th scope="row">{price.model}
             <small>{sites.find((site) => site.id === price.providerId)?.name || (price.providerId ? "历史供应商" : "通用价格")}{price.source ? <> · <a href={price.source.url} target="_blank" rel="noreferrer">{price.source.name} 官方</a></> : " · 手动配置"}</small>
             <small>更新于 {priceTime(price.updatedAt)}</small>
-            {Boolean(price.rules?.length || price.cacheWriteLongUsdPerMillion !== undefined || price.maxInputTokens || price.cacheReadRequiresMode) && <details className="mt-1">
+            {Boolean(price.rules?.length || price.serviceTiers || price.cacheWriteLongUsdPerMillion !== undefined || price.maxInputTokens || price.cacheReadRequiresMode) && <details className="mt-1">
               <summary>计费规则</summary>
               {price.cacheReadRequiresMode && <small>基础缓存价为隐式缓存；显式缓存命中：{price.explicitCachedInputUsdPerMillion ?? "未提供"}</small>}
               {price.rules?.map((rule, index) => <small key={index}>
@@ -169,6 +183,11 @@ function ModelPrices({ sites, models, onChanged, onUnauthorized }: { sites: Site
               </small>)}
               {price.cacheWriteLongUsdPerMillion !== undefined && <small>1 小时缓存写入：{price.cacheWriteLongUsdPerMillion}</small>}
               {price.maxInputTokens !== undefined && <small>超过 {integer(price.maxInputTokens)} 输入 Token 的价格待确认</small>}
+              {Object.entries(price.serviceTiers || {}).filter(([tier]) => tier !== "fast" || !price.serviceTiers?.priority).map(([tier, rates]) => <div key={tier}>
+                <small>{tier === "priority" && price.serviceTiers?.fast ? "Fast / Priority" : tier}：输入 {rates.inputUsdPerMillion} / 缓存命中 {rates.cacheReadUnavailable ? "未提供" : rates.cachedInputUsdPerMillion} / 输出 {rates.outputUsdPerMillion}{rates.cacheWriteUsdPerMillion !== undefined ? ` / 缓存写入 ${rates.cacheWriteUsdPerMillion}` : ""}</small>
+                {rates.rules?.map((rule, index) => <small key={index}>{ruleDescription(rule)}：输入 {rule.inputUsdPerMillion} / 缓存命中 {rule.cacheReadUnavailable ? "未提供" : rule.cachedInputUsdPerMillion} / 输出 {rule.outputUsdPerMillion}{rule.cacheWriteUsdPerMillion !== undefined ? ` / 缓存写入 ${rule.cacheWriteUsdPerMillion}` : ""}</small>)}
+                {rates.maxInputTokens !== undefined && <small>超过 {integer(rates.maxInputTokens)} 输入 Token 的档位价格待确认</small>}
+              </div>)}
             </details>}
           </th>
           <td>{price.inputUsdPerMillion}</td><td>{price.cacheReadUnavailable ? "未提供" : price.cachedInputUsdPerMillion}</td><td>{price.cacheWriteUsdPerMillion ?? "未提供"}</td><td>{price.outputUsdPerMillion}</td>

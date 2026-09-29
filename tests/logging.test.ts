@@ -65,6 +65,37 @@ test("only the current user input is retained in full and shared across repeated
   assert.deepEqual(store.getRequestLog(sameTurn.id)?.msg, ["repeat"]);
 });
 
+test("upstream account snapshots survive progress and restart, exclude credentials and can be cleared", (t) => {
+  const { store, sql, dir } = fixture(t);
+  const account = { id: "account-original", label: "original label", secret: "account-secret", refreshToken: "account-refresh-secret" };
+  const expected = { id: account.id, label: account.label };
+  const template = { id: "template-original", name: "Original template", headersText: "Authorization: fixture-template-secret" };
+  const userAgent = { value: "fixture-agent/1.0", source: "template" as const, template };
+  const expectedUserAgent = { ...userAgent, template: { id: template.id, name: template.name } };
+  const log = store.recordRequestLog(logInput({ status: "pending", statusCode: 0, upstreamAccount: account, upstreamUserAgent: userAgent }));
+  account.label = "renamed after request";
+  template.name = "renamed after request";
+  store.updateRequestLog(log.id, { stage: "receiving-upstream", responsePreview: "partial reply" });
+  assert.deepEqual(store.getRequestLog(log.id)?.upstream?.account, expected);
+  assert.deepEqual(store.listRequestLogs()[0].upstream?.account, expected);
+  store.updateRequestLog(log.id, { status: "success", statusCode: 200, responsePreview: "finished" });
+  const stored = (sql.prepare("SELECT data_json FROM request_logs WHERE id = ?").get(log.id) as { data_json: string }).data_json;
+  assert.deepEqual(JSON.parse(stored).upstream.account, expected);
+  assert.deepEqual(JSON.parse(stored).upstream.userAgent, expectedUserAgent);
+  assert.equal(stored.includes("fixture-template-secret"), false);
+  for (const secret of [account.secret, account.refreshToken]) assert.equal(stored.includes(secret), false);
+  store.close();
+  const reopened = new JsonStore(dir);
+  try {
+    assert.deepEqual(reopened.getRequestLog(log.id)?.upstream?.account, expected);
+    assert.deepEqual(reopened.getRequestLog(log.id)?.upstream?.userAgent, expectedUserAgent);
+    assert.deepEqual(reopened.getRequestLog(log.id)?.calls[0].attempts[0].upstream?.account, expected);
+    reopened.updateRequestLog(log.id, { upstreamAccount: null, upstreamUrl: "https://template.invalid/v1" });
+    assert.equal(reopened.getRequestLog(log.id)?.upstream?.account, undefined);
+    assert.equal(reopened.listRequestLogs()[0].upstream?.account, undefined);
+  } finally { reopened.close(); }
+});
+
 test("pending updates, deletion, retention and configuration saves preserve shared references", (t) => {
   const { store, sql } = fixture(t);
   store.updateSettings({ maxRequestLogs: 2 });

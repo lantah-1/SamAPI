@@ -16,7 +16,7 @@ function navigationButtons(section: "accounts" | "usage") {
 test("main navigation renders account management and consumption alongside every existing page", () => {
   const buttons = navigationButtons("accounts");
   assert.deepEqual(buttons.map((button) => button.label), [
-    "路由管理", "站点管理", "密钥管理", "模型管理", "账号管理", "临时账号",
+    "路由管理", "站点管理", "密钥管理", "模型管理", "账号管理",
     "客户端密钥", "请求头模板", "请求日志", "消费统计", "接入指南"
   ]);
   assert.deepEqual(buttons.filter((button) => button.current).map((button) => button.label), ["账号管理"]);

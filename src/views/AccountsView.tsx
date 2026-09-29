@@ -12,30 +12,34 @@ const availabilityLabels = { available: "可用", unavailable: "不可用", unkn
 const kindLabels = { oauth: "ChatGPT 登录", "api-key": "API Key", "agent-identity": "Agent Identity" };
 const message = (error: unknown) => error instanceof Error ? error.message : "操作失败";
 
-export function ManagedAccountRow({ account, selected, busy, checking, onSelect, onEdit, onPrefer, onCheck, onReset, onToggle, onDelete }: {
+export function ManagedAccountRow({ account, selected, busy, checking, onSelect, onEdit, onCheck, onReset, onToggle, onDelete }: {
   account: ManagedAccount; selected: boolean; busy: boolean; checking: boolean;
-  onSelect: () => void; onEdit: () => void; onPrefer: () => void; onCheck: () => void; onReset: () => void; onToggle: () => void; onDelete: () => void;
+  onSelect: () => void; onEdit: () => void; onCheck: () => void; onReset: () => void; onToggle: () => void; onDelete: () => void;
 }) {
   const StatusIcon = checking ? RefreshCw : account.availability === "available" ? CircleCheck : account.availability === "unavailable" ? CircleX : CircleHelp;
+  const kindLabel = account.provider === "grok" && account.kind === "oauth"
+    ? account.grokOAuthFormat === "grok2api-oauth" ? "grok2api OAuth" : "CPA OAuth"
+    : kindLabels[account.kind];
   return <article className={`managed-account-row ${!account.enabled ? "managed-account-disabled" : ""}`}>
     <label className="managed-account-row-select"><input type="checkbox" checked={selected} disabled={busy} onChange={onSelect} aria-label={`选择 ${account.label}`} /></label>
     <div className="managed-account-content min-w-0">
-      <div className="managed-account-title"><strong>{account.label}</strong>{account.preferred && <span className="managed-account-preferred"><Star className="h-3 w-3" />默认</span>}<span>{kindLabels[account.kind]}</span></div>
+      <div className="managed-account-title"><strong>{account.label}</strong>{account.preferred && <span className="managed-account-preferred"><Star className="h-3 w-3" />默认</span>}<span>{kindLabel}</span></div>
       <p className="managed-account-meta">{account.email && account.email !== account.label ? `${account.email} · ` : ""}{account.credentialPreview} · {account.models.length ? `${account.models.length} 个模型` : "默认模型范围"}</p>
       <div className="managed-account-health"><span className={`account-status account-status-${checking ? "checking" : account.availability}`}><StatusIcon className={`h-3.5 w-3.5 ${checking ? "animate-spin" : ""}`} />{checking ? "检查中" : !account.enabled ? "已停用" : availabilityLabels[account.availability]}</span><small>{account.lastCheckedAt ? `检查于 ${formatTime(account.lastCheckedAt)}` : "尚未检查"}{account.expiresAt ? ` · 授权到期 ${formatTime(account.expiresAt)}` : ""}</small></div>
       {account.lastCheckError && <p className="temp-account-error">{account.lastCheckError}</p>}
       {account.quotaStages.length > 0 && <div className="temp-account-quota-list">
         {account.quotaStages.map((stage, index) => {
           const percent = temporaryAccountQuotaPercent(stage);
-          const quotaText = temporaryAccountQuotaText(stage);
+          const isCreditsStage = stage.label === "Credits 余额";
+          const quotaText = isCreditsStage ? `${stage.label}：${stage.remaining ?? "未知"}` : temporaryAccountQuotaText(stage);
           const isResetCreditStage = stage.label === "主动重置次数";
           const resetCount = numericQuotaValue(stage.remaining);
           return <div key={`${stage.label}-${index}`} className={`temp-account-quota temp-account-quota-${account.availability}`} title={quotaText}>
             <div className="temp-account-quota-head">
               <span>{stage.label}</span>
-              <strong>{isResetCreditStage ? resetCount == null ? "未知" : `${resetCount} 次` : formatQuotaPercent(percent)}</strong>
+              <strong>{isCreditsStage ? stage.remaining ?? "未知" : isResetCreditStage ? resetCount == null ? "未知" : `${resetCount} 次` : formatQuotaPercent(percent)}</strong>
             </div>
-            {!isResetCreditStage && <div
+            {!isResetCreditStage && !isCreditsStage && <div
               className="temp-account-quota-track"
               role="progressbar"
               aria-label={`${account.label} · ${stage.label}剩余额度`}
@@ -53,7 +57,6 @@ export function ManagedAccountRow({ account, selected, busy, checking, onSelect,
       {account.models.length > 0 && <details className="managed-account-details"><summary>模型</summary><div className="managed-account-models">{account.models.map((model) => <code key={model}>{model}</code>)}</div></details>}
     </div>
     <div className="managed-account-actions">
-      <ActionButton tone="ghost" disabled={busy || !account.enabled || account.availability === "unavailable" || account.preferred} onClick={onPrefer}><Star className="h-3.5 w-3.5" />设为默认</ActionButton>
       <ActionButton tone="ghost" disabled={busy || checking} aria-busy={checking} onClick={onCheck}><RefreshCw className={`h-3.5 w-3.5 ${checking ? "animate-spin" : ""}`} />检查</ActionButton>
       <ActionButton tone="ghost" disabled={busy} onClick={onEdit} aria-label={`编辑 ${account.label}`}><Pencil className="h-3.5 w-3.5" /></ActionButton>
       <label className="toggle-row"><input type="checkbox" checked={account.enabled} disabled={busy} onChange={onToggle} aria-label={`${account.enabled ? "停用" : "启用"} ${account.label}`} />启用</label>
@@ -141,11 +144,12 @@ export function AccountsView({ onChanged, onUnauthorized, onNotify }: { onChange
   };
   const importAccounts = (event: FormEvent) => {
     event.preventDefault();
+    const value = importDraft;
     void run(async () => {
-      const result = await api.importManagedAccounts({ ...importDraft, providerType: "gpt" });
+      const result = await api.importManagedAccounts({ ...value, models: parseModelText(value.modelsText) });
       setImportOpen(false); setImportDraft(emptyTemporaryAccountImport()); await refresh();
-      const checked = result.accountIds?.length ? await checkAccounts(result.accountIds) : "";
-      return `已导入 ${result.imported} 个 GPT 账号，跳过 ${result.skipped} 个重复项${result.unrecognizedFiles?.length ? `，${result.unrecognizedFiles.length} 个文件未识别` : ""}。${checked}`;
+      const checked = result.accountIds?.length ? await checkAccounts(result.accountIds, true) : "";
+      return `已导入 ${result.imported} 个 ${accountProviders[value.providerType].label} 账号，跳过 ${result.skipped} 个重复项${result.unrecognizedFiles?.length ? `，${result.unrecognizedFiles.length} 个文件未识别` : ""}。${checked}`;
     });
   };
   const login = async () => {
@@ -176,15 +180,20 @@ export function AccountsView({ onChanged, onUnauthorized, onNotify }: { onChange
     finally { if (generation === loginGeneration.current) { loginPopup.current?.close(); setOauthBusy(false); } }
   };
   const newAccount = () => setDraft({ provider, label: "", secret: "", modelsText: "", kind: "api-key" });
+  const openImport = () => {
+    setImportDraft({ ...emptyTemporaryAccountImport(), providerType: provider, name: `${accountProviders[provider].label} 账号` });
+    setImportOpen(true);
+  };
 
   return <div className="grid min-w-0 grid-cols-1 gap-4">
     <section className="panel p-4">
       <div className="managed-provider-tabs" role="group" aria-label="账号供应商">{(Object.keys(accountProviders) as AccountProvider[]).map((id) => <button type="button" key={id} className={provider === id ? "managed-provider-active" : ""} aria-pressed={provider === id} onClick={() => { setProvider(id); setSelected([]); setQuery(""); setFilter("all"); setLimit(50); }}><strong>{accountProviders[id].label}</strong><small>{data?.providers.find((item) => item.provider === id)?.accounts.length || 0} 个账号</small></button>)}</div>
       <div className="form-head managed-account-header mt-4">
-        <div className="managed-account-heading"><h2>{accountProviders[provider].label} 账号</h2><p className="field-hint mt-1">{accountProviders[provider].credentialHint}。默认账号不可用时自动尝试同供应商的其他可用账号。</p></div>
+        <div className="managed-account-heading"><h2>{accountProviders[provider].label} 账号</h2><p className="field-hint mt-1">{accountProviders[provider].credentialHint}。账号不可用时自动尝试同供应商的其他可用账号。</p></div>
         <div className="managed-account-header-actions">
-          {provider === "gpt" && <><ActionButton disabled={busy || oauthBusy} onClick={() => void login()}><LogIn className="h-4 w-4" />{oauthBusy ? "等待登录" : "登录 ChatGPT"}</ActionButton><ActionButton tone="ghost" disabled={busy} onClick={() => { setImportDraft(emptyTemporaryAccountImport()); setImportOpen(true); }}><Upload className="h-4 w-4" />导入账号</ActionButton></>}
-          <ActionButton tone={provider === "gpt" ? "ghost" : "primary"} disabled={busy} onClick={newAccount}><Plus className="h-4 w-4" />添加 API Key</ActionButton>
+          {provider === "gpt" && <ActionButton disabled={busy || oauthBusy} onClick={() => void login()}><LogIn className="h-4 w-4" />{oauthBusy ? "等待登录" : "登录 ChatGPT"}</ActionButton>}
+          {(provider === "gpt" || provider === "grok") && <ActionButton tone={provider === "grok" ? "primary" : "ghost"} disabled={busy} onClick={openImport}><Upload className="h-4 w-4" />导入账号</ActionButton>}
+          {provider !== "grok" && <ActionButton tone={provider === "gpt" ? "ghost" : "primary"} disabled={busy} onClick={newAccount}><Plus className="h-4 w-4" />添加 API Key</ActionButton>}
         </div>
         <ActionButton className="managed-account-refresh" tone="ghost" disabled={busy || loading} aria-label="刷新账号列表" onClick={() => void run(async () => "账号列表已刷新")}><RefreshCw className="h-4 w-4" /></ActionButton>
       </div>
@@ -197,7 +206,7 @@ export function AccountsView({ onChanged, onUnauthorized, onNotify }: { onChange
         <ActionButton tone="ghost" disabled={busy || !accounts.length} aria-busy={Boolean(batchProgress)} onClick={() => void run(() => checkAccounts(selectedIds.length ? selectedIds : accounts.map((account) => account.id), true))}><RefreshCw className={`h-4 w-4 ${batchProgress ? "animate-spin" : ""}`} />{batchProgress ? `${batchProgress.done}/${batchProgress.total}` : selectedIds.length ? `检查所选 ${selectedIds.length}` : "检查全部"}</ActionButton>
       </div>
       <div className="managed-account-selection"><label className="toggle-row"><input type="checkbox" checked={visible.length > 0 && visible.every((account) => selected.includes(account.id))} disabled={busy || !visible.length} onChange={(event) => setSelected(event.target.checked ? visible.map((account) => account.id) : [])} />选择筛选结果 · {visible.length} 个</label><span>{accounts.filter((account) => account.enabled && account.availability === "available").length} 个可用 / 共 {accounts.length} 个</span>{selectedIds.length > 0 && <ActionButton tone="danger" disabled={busy} onClick={() => void run(async () => { await api.deleteManagedAccounts(selectedIds); setSelected([]); return "所选账号已删除"; })}>删除所选 {selectedIds.length}</ActionButton>}</div>
-      {loading ? <div className="center-empty">正在加载账号…</div> : !visible.length ? <div className="center-empty center-empty-stack"><KeyRound className="h-6 w-6" /><strong>{accounts.length ? "没有匹配的账号" : `尚未添加 ${accountProviders[provider].label} 账号`}</strong><span className="field-hint">{accounts.length ? "调整名称或状态筛选" : accountProviders[provider].credentialHint}</span></div> : <div>{visible.slice(0, limit).map((account) => <ManagedAccountRow key={account.id} account={account} selected={selected.includes(account.id)} busy={busy} checking={checking.includes(account.id)} onSelect={() => setSelected((current) => current.includes(account.id) ? current.filter((id) => id !== account.id) : [...current, account.id])} onEdit={() => setDraft({ id: account.id, provider: account.provider, label: account.label, secret: "", modelsText: serializeModelText(account.models), kind: account.kind })} onPrefer={() => void run(async () => { await api.preferManagedAccount(account.id); return `${account.label} 已设为默认账号`; })} onCheck={() => void run(() => checkAccounts([account.id]))} onReset={() => void run(async () => { const result = await api.resetManagedAccount(account.id); for (const item of result.results) applyCheck(item); return "已使用重置卡并重新检查额度"; })} onToggle={() => void run(async () => { await api.updateManagedAccount(account.id, { enabled: !account.enabled }); return account.enabled ? "账号已停用" : "账号已启用"; })} onDelete={() => void run(async () => { await api.deleteManagedAccount(account.id); return "账号已删除"; })} />)}</div>}
+      {loading ? <div className="center-empty">正在加载账号…</div> : !visible.length ? <div className="center-empty center-empty-stack"><KeyRound className="h-6 w-6" /><strong>{accounts.length ? "没有匹配的账号" : `尚未添加 ${accountProviders[provider].label} 账号`}</strong><span className="field-hint">{accounts.length ? "调整名称或状态筛选" : accountProviders[provider].credentialHint}</span></div> : <div>{visible.slice(0, limit).map((account) => <ManagedAccountRow key={account.id} account={account} selected={selected.includes(account.id)} busy={busy} checking={checking.includes(account.id)} onSelect={() => setSelected((current) => current.includes(account.id) ? current.filter((id) => id !== account.id) : [...current, account.id])} onEdit={() => setDraft({ id: account.id, provider: account.provider, label: account.label, secret: "", modelsText: serializeModelText(account.models), kind: account.kind })} onCheck={() => void run(() => checkAccounts([account.id]))} onReset={() => void run(async () => { const result = await api.resetManagedAccount(account.id); for (const item of result.results) applyCheck(item); return "已使用重置卡并重新检查额度"; })} onToggle={() => void run(async () => { await api.updateManagedAccount(account.id, { enabled: !account.enabled }); return account.enabled ? "账号已停用" : "账号已启用"; })} onDelete={() => void run(async () => { await api.deleteManagedAccount(account.id); return "账号已删除"; })} />)}</div>}
       {visible.length > limit && <ActionButton tone="ghost" className="mt-3" onClick={() => setLimit((value) => value + 50)}>加载更多 · 已显示 {limit}/{visible.length}</ActionButton>}
     </section>
     {draft && <div className="modal-backdrop"><form className="modal-panel" role="dialog" aria-modal="true" aria-label={draft.id ? "编辑账号" : "添加账号"} onSubmit={saveAccount}><div className="form-head"><h2>{draft.id ? "编辑" : "添加"} {accountProviders[draft.provider].label} 账号</h2><ActionButton type="button" tone="ghost" disabled={busy} aria-label="关闭" onClick={() => setDraft(undefined)}><X className="h-4 w-4" /></ActionButton></div><div className="grid gap-4"><label>账号名称<TextInput required maxLength={200} value={draft.label} onChange={(event) => setDraft({ ...draft, label: event.target.value })} placeholder="便于区分的名称" /></label>{draft.kind === "api-key" && <label>API Key<SecretTextInput required={!draft.id} value={draft.secret} placeholder={draft.id ? "留空保留现有凭据" : accountProviders[draft.provider].credentialHint} onChange={(event) => setDraft({ ...draft, secret: event.target.value })} /></label>}<label>模型列表<textarea className="field" rows={4} value={draft.modelsText} onChange={(event) => setDraft({ ...draft, modelsText: event.target.value })} placeholder="每行一个模型，首次添加可留空后自动获取" /><span className="field-hint">检查 API Key 时会同步供应商返回的可用模型。登录账号留空使用账号默认范围。</span></label></div><div className="flex justify-end gap-2 mt-4"><ActionButton type="button" tone="ghost" disabled={busy} onClick={() => setDraft(undefined)}>取消</ActionButton><ActionButton type="submit" disabled={busy}>{busy ? "保存中…" : "保存账号"}</ActionButton></div></form></div>}

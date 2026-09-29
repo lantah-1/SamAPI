@@ -1,6 +1,7 @@
 import http from "node:http";
 import { URL } from "node:url";
 import { valueToHeaderText } from "../http.js";
+import { DOWNSTREAM_PROJECT_HEADERS, downstreamProjects, PROJECT_NAME_HEADER, PROJECT_PATH_HEADER } from "../../shared/model-rules.js";
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -38,6 +39,41 @@ export function maskRequestHeaders(headers: http.IncomingHttpHeaders) {
   return masked;
 }
 
+function incomingHeaderValue(headers: http.IncomingHttpHeaders, name: string) {
+  const value = Object.entries(headers).find(([key]) => key.toLowerCase() === name)?.[1];
+  return valueToHeaderText(value).trim();
+}
+
+function setIncomingHeader(headers: http.IncomingHttpHeaders, name: string, value: string) {
+  for (const key of Object.keys(headers)) if (key.toLowerCase() === name) delete headers[key];
+  headers[name] = value;
+}
+
+function decodedHeaderValue(value: string) {
+  try { return decodeURIComponent(value); } catch { return value; }
+}
+
+function projectNameFromPath(projectPath: string) {
+  const normalized = decodedHeaderValue(projectPath).trim().replace(/[\\/]+$/, "");
+  const name = normalized.split(/[\\/]/).at(-1)?.trim();
+  return name ? encodeURIComponent(name) : "";
+}
+
+/**
+ * Materialize the two canonical project headers before logging or route matching.
+ * Codex's workspace metadata and the legacy project header remain accepted as a
+ * source. Requests without project context continue normally and simply do not
+ * match project-scoped routing rules.
+ */
+export function materializeDownstreamProjectHeaders(headers: http.IncomingHttpHeaders) {
+  const projectPath = incomingHeaderValue(headers, PROJECT_PATH_HEADER) || downstreamProjects(headers)[0] || "";
+  if (projectPath) setIncomingHeader(headers, PROJECT_PATH_HEADER, projectPath);
+
+  const projectName = incomingHeaderValue(headers, PROJECT_NAME_HEADER) || projectNameFromPath(projectPath);
+  if (projectName) setIncomingHeader(headers, PROJECT_NAME_HEADER, projectName);
+
+}
+
 const HOP_BY_HOP_REQUEST_HEADERS = new Set([
   "connection",
   "content-length",
@@ -67,6 +103,12 @@ export function forwardableRequestHeaders(headers: http.IncomingHttpHeaders) {
     if (text) forwarded[key] = text;
   }
   return forwarded;
+}
+
+export function stripDownstreamProjectHeaders(headers: Record<string, string>) {
+  for (const key of Object.keys(headers)) {
+    if (DOWNSTREAM_PROJECT_HEADERS.includes(key.toLowerCase())) delete headers[key];
+  }
 }
 
 export function maskedStringHeaders(headers: Record<string, string>) {

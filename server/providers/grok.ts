@@ -573,7 +573,9 @@ export function stripGrokEncryptedReasoning(body: unknown): Record<string, unkno
 }
 
 function numberHeader(headers: Headers, name: string) {
-  const value = Number(headers.get(name));
+  const raw = headers.get(name);
+  if (raw === null || !raw.trim()) return undefined;
+  const value = Number(raw);
   return Number.isFinite(value) ? value : undefined;
 }
 

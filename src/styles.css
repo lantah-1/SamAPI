@@ -2909,8 +2909,672 @@ textarea.field:focus {
   gap: 0.8rem;
 }
 
-.settings-panel .form-grid {
+.settings-panel,
+.settings-detail-dialog {
+  /* Preserve the app's 8px controls; mobile sheets follow its 14px top corners. */
+  --settings-radius: 8px;
+  --settings-copy-size: 0.8125rem;
+  --settings-control-size: 0.875rem;
+  --settings-control-border: color-mix(in srgb, var(--muted) 85%, var(--surface-solid));
+}
+
+.settings-panel > .form-head {
+  align-items: center;
   gap: 1rem;
+}
+
+.settings-panel > .form-head > div {
+  min-width: 0;
+}
+
+.settings-panel .action,
+.settings-detail-dialog .action {
+  min-width: 44px;
+  min-height: 44px;
+  gap: 0.5rem;
+  border-radius: var(--settings-radius);
+  padding: 0.625rem 0.875rem;
+  font-size: var(--settings-control-size);
+  line-height: 1.4;
+}
+
+.settings-panel > .form-head > .action {
+  flex: 0 0 auto;
+}
+
+.settings-detail-dialog .action-primary {
+  background: var(--accent);
+  box-shadow: none;
+}
+
+.settings-panel button:focus-visible,
+.settings-detail-dialog :is(button, input, textarea):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.settings-overview-description {
+  margin-top: 0.375rem;
+  color: var(--muted-strong);
+  font-size: var(--settings-copy-size);
+  line-height: 1.6;
+}
+
+.settings-entry-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.settings-entry {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.875rem;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--settings-radius);
+  background: var(--surface-soft);
+  padding: 1rem;
+  color: var(--ink);
+  text-align: left;
+  transition: border-color 150ms ease, background 150ms ease, transform 150ms ease;
+}
+
+.settings-entry:focus-visible {
+  border-color: var(--accent);
+  background: var(--accent-softer);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .settings-entry:hover:not(:disabled) {
+    border-color: var(--accent);
+    background: var(--accent-softer);
+  }
+}
+
+.settings-entry:active:not(:disabled) {
+  transform: scale(0.99);
+}
+
+.settings-entry:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.settings-entry-icon {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  border-radius: var(--settings-radius);
+  background: var(--accent-softer);
+  color: var(--accent);
+}
+
+.settings-entry-content {
+  display: grid;
+  min-width: 0;
+  gap: 0.375rem;
+  overflow-wrap: anywhere;
+}
+
+.settings-entry-content strong {
+  font-size: 0.9375rem;
+  font-weight: 800;
+  line-height: 1.45;
+}
+
+.settings-entry-details {
+  display: grid;
+  gap: 0.25rem;
+  color: var(--muted-strong);
+  font-size: var(--settings-copy-size);
+  line-height: 1.5;
+}
+
+.settings-entry-content .settings-entry-value {
+  color: var(--accent-strong);
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-entry-arrow {
+  color: var(--muted);
+}
+
+.settings-detail-dialog {
+  position: fixed;
+  inset: var(--settings-viewport-top, 0px) 0 var(--settings-viewport-bottom, 0px);
+  width: min(660px, calc(100vw - 2rem));
+  min-width: 0;
+  max-width: none;
+  max-height: calc(var(--settings-viewport-height, 100dvh) - 2rem);
+  margin: auto;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--settings-radius);
+  background: var(--surface-solid);
+  color: var(--ink);
+  box-shadow: var(--shadow-modal);
+  line-height: 1.5;
+}
+
+.settings-detail-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-detail-dialog-wide {
+  width: min(1100px, calc(100vw - 2rem));
+}
+
+.settings-detail-dialog::backdrop {
+  background: var(--modal-overlay);
+  backdrop-filter: blur(8px);
+}
+
+.settings-dialog-head {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-dialog-parent {
+  margin-bottom: 0.25rem;
+  color: var(--accent-strong);
+  font-size: 0.75rem;
+  font-weight: 750;
+}
+
+.settings-dialog-head h2 {
+  outline: none;
+  font-size: 1.125rem;
+  font-weight: 800;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.settings-dialog-description {
+  margin-top: 0.375rem;
+  color: var(--muted-strong);
+  font-size: var(--settings-copy-size);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.settings-dialog-head > .settings-dialog-close {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+}
+
+.settings-dialog-form {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.settings-dialog-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 1rem;
+  scroll-padding-block: 1rem;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--accent) 28%, transparent) transparent;
+}
+
+.settings-dialog-body > fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.settings-dialog-footer {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem 1rem;
+  padding: 0.875rem 1rem;
+  border-top: 1px solid var(--line);
+  background: var(--surface-soft);
+}
+
+.settings-dialog-error {
+  width: 100%;
+  max-height: min(8rem, calc(var(--settings-viewport-height, 100dvh) / 5));
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+
+.settings-dialog-note,
+.settings-field-hint {
+  color: var(--muted-strong);
+  font-size: var(--settings-copy-size);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.settings-dialog-note {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+.settings-dialog-actions {
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+.settings-field-label {
+  display: grid;
+  min-width: 0;
+  gap: 0.5rem;
+  color: var(--muted-strong);
+  font-size: var(--settings-copy-size);
+  font-weight: 700;
+}
+
+.settings-field-hint {
+  margin-top: 0.5rem;
+}
+
+.settings-dialog-fields,
+.settings-backup-confirmation {
+  display: grid;
+  gap: 1rem;
+}
+
+.settings-dialog-callout {
+  display: grid;
+  gap: 0.625rem;
+  margin-top: 1rem;
+  padding: 0.875rem;
+  border: 1px solid var(--line);
+  border-radius: var(--settings-radius);
+  background: var(--surface-soft);
+  color: var(--muted-strong);
+  font-size: var(--settings-copy-size);
+  line-height: 1.65;
+}
+
+.settings-detail-dialog .settings-dialog-body label:not(.toggle-row) {
+  gap: 0.5rem;
+  color: var(--muted-strong);
+  font-size: var(--settings-copy-size);
+  line-height: 1.5;
+}
+
+.settings-detail-dialog .field,
+.settings-detail-dialog .select-shell {
+  min-width: 0;
+  margin-top: 0;
+}
+
+.settings-detail-dialog .field,
+.settings-detail-dialog .select-search-input {
+  min-height: 44px;
+  border-color: var(--settings-control-border);
+  border-radius: var(--settings-radius);
+  padding: 0.625rem 0.75rem;
+  font-size: var(--settings-control-size);
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.settings-detail-dialog .select-trigger {
+  padding-right: 2.5rem;
+}
+
+.settings-detail-dialog input::placeholder,
+.settings-detail-dialog .select-trigger-placeholder {
+  color: var(--muted-strong);
+  opacity: 1;
+}
+
+.settings-detail-dialog .field:focus,
+.settings-detail-dialog .select-trigger[data-state="open"],
+.settings-detail-dialog .select-search-input:focus {
+  border-color: var(--accent);
+}
+
+.settings-detail-dialog .field:disabled {
+  cursor: not-allowed;
+  background: var(--surface-muted);
+}
+
+.settings-detail-dialog .select-menu {
+  display: flex;
+  flex-direction: column;
+  max-width: calc(100vw - 2rem);
+  max-height: min(330px, var(--radix-popover-content-available-height));
+}
+
+.settings-detail-dialog .select-search-row {
+  flex: 0 0 auto;
+}
+
+.settings-detail-dialog .select-viewport {
+  min-height: 0;
+  max-height: min(280px, calc(var(--settings-viewport-height, 100dvh) - 8rem));
+}
+
+.settings-detail-dialog .select-option {
+  flex-shrink: 0;
+  min-height: 44px;
+  font-size: var(--settings-control-size);
+  font-weight: 600;
+}
+
+.settings-detail-dialog .toggle-row {
+  min-height: 44px;
+  font-size: var(--settings-copy-size);
+}
+
+.settings-detail-dialog .toggle-row input {
+  width: 18px;
+  height: 18px;
+}
+
+.settings-detail-dialog .settings-backup-box {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 0.875rem;
+  padding: 1rem;
+  background: var(--surface-soft);
+}
+
+.settings-detail-dialog .settings-backup-actions {
+  grid-column: 1 / -1;
+  gap: 0.5rem;
+}
+
+.settings-detail-dialog :is(.settings-backup-copy > span, .settings-import-description, .settings-import-meta, .theme-card-desc, .model-rules-help, .model-rules-empty p, .model-rule-caption, .settings-retry-empty, .settings-section-head p) {
+  color: var(--muted-strong);
+  font-size: var(--settings-copy-size);
+  font-weight: 500;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.settings-detail-dialog .settings-backup-warning {
+  align-items: flex-start;
+  color: var(--danger-strong);
+  font-size: var(--settings-copy-size);
+  font-weight: 500;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.settings-detail-dialog .settings-backup-warning svg {
+  margin-top: 0.15rem;
+}
+
+.settings-detail-dialog .settings-backup-confirmation h3,
+.settings-detail-dialog .settings-retry-timing h3,
+.settings-detail-dialog .settings-backup-copy strong,
+.settings-detail-dialog .model-rules-empty strong,
+.settings-detail-dialog .theme-card-name {
+  color: var(--ink);
+  font-size: 0.9375rem;
+  font-weight: 800;
+  line-height: 1.45;
+}
+
+.settings-detail-dialog .settings-retry-add-row {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 0.75rem;
+}
+
+.settings-detail-dialog .settings-retry-row {
+  grid-template-columns: minmax(0, 1fr) minmax(4.5rem, 0.75fr) auto;
+  gap: 0.75rem;
+  padding: 0.75rem;
+  background: var(--surface-soft);
+}
+
+.settings-detail-dialog .settings-retry-code {
+  font-size: 0.875rem;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-detail-dialog .settings-retry-delay-fields > :only-child {
+  grid-column: 1 / -1;
+}
+
+.settings-detail-dialog .model-rule {
+  padding: 1rem;
+  border-color: var(--line);
+  background: var(--surface-soft);
+}
+
+.settings-detail-dialog .model-rule-head {
+  align-items: end;
+}
+
+.settings-detail-dialog .model-rule-order {
+  margin-bottom: 0.75rem;
+}
+
+.settings-detail-dialog .model-rule-actions {
+  gap: 0.5rem;
+}
+
+.settings-detail-dialog .model-rule-actions .action,
+.settings-detail-dialog .model-rule-conditions > .action {
+  min-height: 44px;
+  padding: 0.625rem 0.75rem;
+  font-size: 0.875rem;
+}
+
+.settings-detail-dialog .model-rule-target,
+.settings-detail-dialog .model-rule-conditions {
+  margin-top: 1rem;
+}
+
+.settings-detail-dialog .model-rule-warning {
+  color: var(--danger-strong);
+  font-size: var(--settings-copy-size);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.settings-detail-dialog .model-rules-empty {
+  align-items: flex-start;
+}
+
+.settings-detail-dialog .model-rules-empty > svg {
+  flex-shrink: 0;
+  margin-top: 0.125rem;
+}
+
+.settings-detail-dialog .theme-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.settings-detail-dialog .theme-card {
+  gap: 1rem;
+  padding: 1rem;
+}
+
+.settings-detail-dialog .theme-card:focus-visible {
+  border-color: var(--accent);
+}
+
+@media (max-width: 1000px) {
+  .settings-detail-dialog .theme-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settings-detail-dialog .model-rule-target {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settings-detail-dialog .model-rule-target > label:first-child {
+    grid-column: 1 / -1;
+  }
+
+  .settings-detail-dialog .model-rule-arrow {
+    display: none;
+  }
+}
+
+/* Match the application shell's mobile breakpoint, including small tablets. */
+@media (max-width: 760px) {
+  .settings-entry-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-panel,
+  .settings-detail-dialog {
+    --settings-control-size: 1rem;
+  }
+
+  .settings-panel .action,
+  .settings-detail-dialog .action {
+    font-size: 0.875rem;
+  }
+
+  .settings-entry {
+    padding: 0.875rem;
+    gap: 0.75rem;
+  }
+
+  .settings-detail-dialog {
+    width: 100%;
+    max-height: calc(var(--settings-viewport-height, 100dvh) - max(0.5rem, env(safe-area-inset-top)));
+    margin: auto 0 0;
+    border-radius: 14px 14px 0 0;
+  }
+
+  .settings-dialog-head,
+  .settings-dialog-body {
+    padding: 1rem max(1rem, env(safe-area-inset-right)) 1rem max(1rem, env(safe-area-inset-left));
+  }
+
+  .settings-dialog-footer {
+    gap: 0.625rem;
+    padding: 0.75rem max(1rem, env(safe-area-inset-right)) calc(0.75rem + env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
+  }
+
+  .settings-dialog-note {
+    flex-basis: 100%;
+  }
+
+  .settings-dialog-actions {
+    width: 100%;
+  }
+
+  .settings-dialog-actions > .action {
+    flex: 1 1 0;
+    min-width: max-content;
+  }
+
+  .settings-detail-dialog .settings-retry-add-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .settings-detail-dialog .settings-retry-add-row > .action {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .settings-detail-dialog .model-rule-head {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .settings-detail-dialog .model-rule-head > .model-rule-actions {
+    grid-column: 1 / -1;
+  }
+
+  .settings-detail-dialog .model-rule-head .toggle-row {
+    margin-right: auto;
+  }
+
+  .settings-detail-dialog .model-rule-target,
+  .settings-detail-dialog .model-rule-condition,
+  .settings-detail-dialog .model-rule-condition-custom,
+  .settings-detail-dialog .theme-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-detail-dialog .model-rule-condition > .action,
+  .settings-detail-dialog .model-rule-condition > label {
+    grid-column: 1;
+  }
+
+  .settings-detail-dialog .settings-backup-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+}
+
+@media (max-width: 480px) {
+  .settings-panel > .form-head > .action {
+    width: 44px;
+    padding: 0;
+  }
+
+  .settings-refresh-label,
+  .settings-retry-remove-text {
+    display: none;
+  }
+
+  .settings-detail-dialog .settings-retry-row {
+    gap: 0.5rem;
+    padding: 0.625rem;
+  }
+
+  .settings-detail-dialog .settings-retry-remove {
+    width: 44px;
+    padding: 0;
+  }
+
+  .settings-detail-dialog .settings-retry-delay-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-detail-dialog .model-rule {
+    padding: 0.75rem;
+  }
+
+  .settings-detail-dialog .settings-backup-box {
+    padding: 0.875rem;
+  }
+}
+
+/* Also applies on touch tablets whose width exceeds the phone breakpoint. */
+@media (hover: none) and (pointer: coarse) {
+  .settings-detail-dialog {
+    --settings-control-size: 1rem;
+  }
+}
+
+.settings-detail-dialog[data-compact-viewport] .settings-dialog-parent {
+  display: none;
+}
+
+.settings-detail-dialog[data-compact-viewport] .settings-dialog-head {
+  padding-block: 0.625rem;
 }
 
 .settings-section {
@@ -3004,6 +3668,199 @@ textarea.field:focus {
   color: var(--muted);
   font-size: 0.76rem;
   font-weight: 680;
+}
+
+.settings-retry-timing {
+  display: grid;
+  gap: 0.85rem;
+  margin-top: 1.2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.settings-retry-timing h3 {
+  font-size: 0.9rem;
+  font-weight: 800;
+}
+
+.settings-retry-timing .settings-field-hint {
+  margin-top: 0.25rem;
+}
+
+.settings-retry-delay-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.model-rules-head {
+  flex-wrap: wrap;
+}
+
+.model-rule-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.model-rule-actions .action,
+.model-rule-conditions > .action {
+  min-height: 32px;
+  padding: 0.35rem 0.6rem;
+  font-size: 0.75rem;
+}
+
+.model-rules-empty {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 1rem;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  color: var(--accent);
+}
+
+.model-rules-empty strong {
+  color: var(--ink);
+  font-size: 0.83rem;
+}
+
+.model-rules-empty p,
+.model-rules-help {
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.model-rules-help {
+  margin-top: 0.6rem;
+}
+
+.model-rules-list {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.model-rule {
+  min-width: 0;
+  padding: 0.85rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-solid);
+}
+
+.model-rule-disabled {
+  border-style: dashed;
+  background: var(--surface-soft);
+}
+
+.model-rule-head {
+  display: grid;
+  grid-template-columns: auto minmax(8rem, 1fr) auto;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.model-rule-order {
+  font-size: 0.78rem;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+
+.model-rule-target {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 0.85fr) minmax(0, 1.25fr);
+  align-items: end;
+  gap: 0.75rem;
+  margin-top: 0.8rem;
+}
+
+.model-rule-arrow {
+  margin-bottom: 0.85rem;
+  color: var(--accent);
+}
+
+.model-rule-conditions {
+  display: grid;
+  justify-items: start;
+  gap: 0.65rem;
+  margin-top: 0.9rem;
+  padding-top: 0.8rem;
+  border-top: 1px solid var(--line);
+}
+
+.model-rule-caption {
+  color: var(--muted-strong);
+  font-size: 0.73rem;
+  font-weight: 750;
+}
+
+.model-rule-condition {
+  display: grid;
+  grid-template-columns: minmax(9rem, 1fr) minmax(7rem, 0.65fr) minmax(10rem, 1.65fr) auto;
+  align-items: end;
+  gap: 0.6rem;
+  width: 100%;
+}
+
+.model-rule-condition-custom {
+  grid-template-columns: minmax(8rem, 1fr) minmax(7rem, 0.9fr) minmax(6rem, 0.7fr) minmax(8rem, 1.4fr) auto;
+}
+
+.model-rule label:not(.toggle-row) {
+  display: grid;
+  min-width: 0;
+  gap: 0.3rem;
+  color: var(--muted-strong);
+  font-size: 0.74rem;
+  font-weight: 700;
+}
+
+.model-rule .select-shell,
+.model-rule .select-trigger {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.model-rule-warning {
+  color: var(--danger);
+  font-size: 0.75rem;
+  margin-top: 0.4rem;
+}
+
+@media (max-width: 1000px) {
+  .model-rule-condition,
+  .model-rule-condition-custom {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .model-rule-condition > .action {
+    justify-self: end;
+  }
+}
+
+@media (max-width: 600px) {
+  .model-rule-head {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .model-rule-head > .model-rule-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+  }
+  .model-rule-target {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .model-rule-arrow {
+    display: none;
+  }
+  .model-rule-condition > label:last-of-type {
+    grid-column: 1 / -1;
+  }
+  .model-rule-condition > .action {
+    grid-column: 2;
+  }
 }
 
 .settings-backup-box {
@@ -3429,7 +4286,7 @@ textarea.field:focus {
 .consumption-details > summary small { margin-left: 0.5rem; color: var(--muted); font-weight: 500; }
 .consumption-price-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.8rem; align-items: end; margin: 1rem 0; }
 .consumption-price-form .action { justify-self: start; }
-.managed-provider-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.6rem; }
+.managed-provider-tabs { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0.6rem; }
 .managed-provider-tabs button { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; border: 1px solid var(--line); background: var(--subtle-fill); color: var(--muted); border-radius: 8px; padding: 0.9rem; text-align: left; }
 .managed-provider-tabs strong { font-size: 0.9rem; }
 .managed-provider-tabs small { font-size: 0.7rem; white-space: nowrap; }
@@ -3939,10 +4796,6 @@ textarea.field:focus {
 
 .log-final-result {
   border-color: color-mix(in srgb, var(--accent) 38%, var(--line));
-}
-
-.log-final-upstream {
-  margin-block: 0.5rem;
 }
 
 .detail-block.log-final-result pre {

@@ -1,6 +1,9 @@
 import type { JsonStore } from "./store.js";
 import { shouldMarkTemporaryAccountUnavailable } from "./account-check.js";
 import type {
+  AppDatabase,
+  DownstreamModelRule,
+  EndpointKind,
   GroupRoute,
   HeaderTemplate,
   ProviderApiKeyEntry,
@@ -22,6 +25,50 @@ export interface ProxyExecutionCandidate {
   index: number;
 }
 
+/** Direct mappings reuse route execution without creating or modifying a saved route. */
+export function modelRuleTargetRoute(db: AppDatabase, rule: DownstreamModelRule, endpoint: EndpointKind = "chat/completions"): RouteRecord | undefined {
+  if (rule.targetRouteId) return db.routes.find((route) => route.id === rule.targetRouteId);
+  if (!rule.targetSiteId || !rule.targetModel) return undefined;
+  const site = db.sites.find((site) => site.id === rule.targetSiteId);
+  return {
+    id: `model-rule:${rule.id}`, name: rule.name, type: "switch", enabled: rule.enabled,
+    siteId: rule.targetSiteId, model: rule.targetModel, endpoint, headerTemplateId: rule.headerTemplateId, temporaryAccountId: rule.temporaryAccountId,
+    createdAt: site?.createdAt || new Date(0).toISOString(),
+    updatedAt: site?.updatedAt || new Date(0).toISOString()
+  };
+}
+
+/** Compare live forwarding settings without advancing random or sequential account selection. */
+export function proxyRouteConfigurationKey(store: JsonStore, routeOrId: string | RouteRecord) {
+  const db = store.getDb();
+  const route = typeof routeOrId === "string" ? db.routes.find((route) => route.id === routeOrId) : routeOrId;
+  if (!route) return "";
+  const { name, createdAt, updatedAt, ...routeConfig } = route;
+  const siteIds = new Set(route.type === "switch" ? [route.siteId] : (route.members || []).map((member) => member.siteId));
+  return JSON.stringify({
+    route: routeConfig,
+    sites: db.sites.filter((site) => siteIds.has(site.id)).map((site) => ({
+      id: site.id, name: site.name, siteType: site.siteType, enabled: site.enabled,
+      addresses: site.addresses.map(({ id, baseUrl, enabled, proxy }) => ({ id, baseUrl, enabled, proxy }))
+    })),
+    keys: db.providerApiKeyGroups.filter((group) => siteIds.has(group.siteId)).map((group) => ({
+      siteId: group.siteId,
+      keys: group.apiKeys.map(({ id, secret, enabled, kind, models }) => ({ id, secret, enabled, kind, models }))
+    })),
+    accounts: db.temporaryAccountGroups.filter((group) => siteIds.has(group.siteId)).map((group) => ({
+      id: group.id, enabled: group.enabled, strategy: group.strategy, preferredAccountId: group.preferredAccountId,
+      // Quota checks and automatic OAuth refreshes must not reset an in-flight retry budget.
+      accounts: group.accounts.map((account) => ({
+        id: account.id, enabled: account.enabled, models: account.models, accountType: account.accountType,
+        providerType: account.providerType, upstreamBaseUrl: account.upstreamBaseUrl, grokOAuthFormat: account.grokOAuthFormat,
+        secret: account.accountType === "api-key" || account.accountType === "openai-api-key" ? account.secret : undefined
+      }))
+    })),
+    headerTemplate: db.headerTemplates.find((template) => template.id === route.headerTemplateId)?.headersText,
+    accountStrategy: db.settings.temporaryAccountStrategy
+  });
+}
+
 
 
 
@@ -30,7 +77,7 @@ export interface ProxyExecutionCandidate {
 export function createRouting(store: JsonStore) {
   const routeRuntimeState = new Map<string, { stableCandidateKey?: string }>();
 
-  function markTemporaryAccountAttempt(candidate: ProxyExecutionCandidate, statusCode: number, errorMessage?: string) {
+  function markTemporaryAccountAttempt(candidate: ProxyExecutionCandidate, statusCode: number, errorMessage?: string, errorBody?: string) {
     const account = candidate.temporaryAccount || candidate.temporaryApiKeyAccount;
     if (!account) return;
     if (statusCode === 499 || /客户端已(?:中止|断开)|\b(?:this|the) operation was aborted\b/i.test(errorMessage || "")) return;
@@ -44,7 +91,7 @@ export function createRouting(store: JsonStore) {
       });
       return;
     }
-    if (!shouldMarkTemporaryAccountUnavailable(statusCode, errorMessage)) return;
+    if (!shouldMarkTemporaryAccountUnavailable(statusCode, errorMessage, errorBody)) return;
     store.updateTemporaryAccountCheckResult(account.id, {
       availability: "unavailable",
       lastQuotaCheckedAt: checkedAt,
@@ -143,9 +190,11 @@ export function createRouting(store: JsonStore) {
     return account.providerType === "gpt" && (account.accountType === "codex" || Boolean(account.accountId));
   }
 
-  function resolveProxyExecution(routeNameOrId: string) {
+  function resolveProxyExecution(routeNameOrId: string | RouteRecord) {
     const db = store.getDb();
-    const route = db.routes.find((item) => item.id === routeNameOrId || item.name === routeNameOrId);
+    const route = typeof routeNameOrId === "string"
+      ? db.routes.find((item) => item.id === routeNameOrId || item.name === routeNameOrId)
+      : routeNameOrId;
     if (!route || !route.enabled) throw new Error("路由不存在或已停用");
 
     if (route.type === "switch") {
@@ -163,8 +212,11 @@ export function createRouting(store: JsonStore) {
         : managedProvider
           ? store.resolveTemporaryProviderAccounts(managedProvider, route.model)
         : resolveTemporaryProviderAccountsForRoute(site, route.model);
-      if (temporaryAccounts.length > 0) {
-        const candidates: ProxyExecutionCandidate[] = temporaryAccounts.map((temporaryAccount, index) => {
+      const selectedTemporaryAccounts = route.temporaryAccountId
+        ? temporaryAccounts.filter((account) => account.id === route.temporaryAccountId)
+        : temporaryAccounts;
+      if (selectedTemporaryAccounts.length > 0) {
+        const candidates: ProxyExecutionCandidate[] = selectedTemporaryAccounts.map((temporaryAccount, index) => {
           const temporaryAccountIsCodex = isCodexTemporaryAccount(temporaryAccount);
           const temporaryAccountIsGrok = temporaryAccount.providerType === "grok";
           return {

@@ -19,7 +19,8 @@ export function managedAccountView(account: TemporaryAccount, group: TemporaryAc
   const provider = accountProvider(group.providerType || "gpt");
   return {
     id: account.id, provider, label: account.label, email: account.email, accountId: account.accountId,
-    kind: account.agentRuntimeId ? "agent-identity" : provider === "gpt" && (account.accountType === "codex" || Boolean(account.accountId)) ? "oauth" : "api-key",
+    kind: account.agentRuntimeId ? "agent-identity" : provider === "grok" || provider === "gpt" && (account.accountType === "codex" || Boolean(account.accountId)) ? "oauth" : "api-key",
+    grokOAuthFormat: account.grokOAuthFormat,
     credentialPreview: account.secret.length > 12 ? `${account.secret.slice(0, 6)}…${account.secret.slice(-4)}` : account.secret ? "••••••••" : "授权凭据已保存",
     enabled: account.enabled !== false && group.enabled !== false,
     availability: account.availability || "unknown", preferred: group.preferredAccountId === account.id,

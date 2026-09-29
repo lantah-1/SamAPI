@@ -1,6 +1,6 @@
 import * as Popover from "@radix-ui/react-popover";
 import { Check, ChevronDown, Eye, EyeOff } from "lucide-react";
-import { Children, isValidElement, useEffect, useId, useMemo, useState } from "react";
+import { Children, isValidElement, useEffect, useId, useMemo, useRef, useState } from "react";
 import { smartModelMatches } from "../app/utils";
 
 export function TextInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
@@ -52,6 +52,8 @@ let activeSelectInputId: string | null = null;
 export function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
   const { className, children, disabled, value, defaultValue, onChange, name } = props;
   const selectId = useId();
+  const selectRef = useRef<HTMLSpanElement>(null);
+  const [portalContainer, setPortalContainer] = useState<HTMLElement>();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const currentValue = String(value ?? defaultValue ?? "");
@@ -78,6 +80,17 @@ export function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>
     : options;
 
   useEffect(() => {
+    // Native modal dialogs make body-level portals inert and place them behind the top layer.
+    setPortalContainer(selectRef.current?.closest("dialog") || undefined);
+  }, []);
+
+  const close = () => {
+    if (activeSelectInputId === selectId) activeSelectInputId = null;
+    setOpen(false);
+    setQuery("");
+  };
+
+  useEffect(() => {
     const closeFromOtherSelect = (event: Event) => {
       if ((event as CustomEvent<string>).detail !== selectId) setOpen(false);
     };
@@ -86,8 +99,7 @@ export function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>
   }, [selectId]);
 
   const commitValue = (nextValue: string) => {
-    setOpen(false);
-    setQuery("");
+    close();
     onChange?.({
       target: { value: nextValue, name },
       currentTarget: { value: nextValue, name }
@@ -106,11 +118,10 @@ export function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>
         setOpen(true);
         return;
       }
-      if (activeSelectInputId === selectId) activeSelectInputId = null;
-      setOpen(false);
-      setQuery("");
+      close();
     }}>
       <span
+        ref={selectRef}
         className={`select-shell ${disabled ? "select-shell-disabled" : ""}`}
         onPointerDown={() => {
           if (activeSelectInputId && activeSelectInputId !== selectId) {
@@ -125,10 +136,17 @@ export function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>
             type="button"
             className={`field select-trigger ${className || ""}`}
             disabled={disabled}
+            aria-label={props["aria-label"]}
+            aria-labelledby={props["aria-labelledby"]}
+            aria-describedby={props["aria-describedby"]}
+            title={props.title ?? selectedOption?.label}
             aria-haspopup="listbox"
             aria-expanded={open}
             onClick={(event) => event.stopPropagation()}
-            onKeyDown={(event) => event.stopPropagation()}
+            onKeyDown={(event) => {
+              event.stopPropagation();
+              if (event.key === "Escape" && open) { event.preventDefault(); close(); }
+            }}
           >
             <span className={`select-trigger-value ${selectedOption ? "" : "select-trigger-placeholder"}`}>
               {selectedOption?.label || "请选择"}
@@ -137,7 +155,7 @@ export function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>
           </button>
         </Popover.Trigger>
       </span>
-      <Popover.Portal>
+      <Popover.Portal container={portalContainer}>
         <Popover.Content
           className="select-menu"
           align="start"
@@ -145,7 +163,9 @@ export function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>
           sideOffset={6}
           avoidCollisions
           collisionPadding={12}
+          collisionBoundary={portalContainer}
           onOpenAutoFocus={(event) => event.preventDefault()}
+          onEscapeKeyDown={(event) => { event.preventDefault(); close(); }}
           onClick={(event) => event.stopPropagation()}
           onKeyDown={(event) => event.stopPropagation()}
         >
@@ -155,10 +175,11 @@ export function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>
                 className="select-search-input"
                 value={query}
                 placeholder="搜索选项..."
+                aria-label="搜索选项"
                 onChange={(event) => setQuery(event.target.value)}
                 onKeyDown={(event) => {
                   event.stopPropagation();
-                  if (event.key === "Escape") setOpen(false);
+                  if (event.key === "Escape") { event.preventDefault(); close(); }
                 }}
               />
             </div>

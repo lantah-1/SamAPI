@@ -4,7 +4,7 @@ import type { RequestLog, RequestLogAttempt, RequestLogCall, RequestLogPhase, Re
 import { legacyLogScope, logRequestContext, type LogRequestContext, type LogResponseTool } from "../log-context.js";
 import { limitLogText } from "../log-content.js";
 
-type Content = Pick<RequestLog, "upstream" | "result"> & { requestHeaders?: RequestLog["requestHeaders"] };
+type Content = Pick<RequestLog, "kind" | "upstream" | "result"> & { requestHeaders?: RequestLog["requestHeaders"] };
 type Entry = { id: string; created_at: string; updated_at: string; turn_id: string; request_id: string; is_root_request: number; data_json: string };
 type Turn = { id: string; created_at: string; updated_at: string; revision: number; scope: string | null; root_message: number; request_headers_json: string | null };
 type ToolRow = { id: string; request_id: string; result_request_id: string | null; call_id: string | null; name: string; created_at: string; updated_at: string; status: RequestLogTool["status"]; result: string };
@@ -92,6 +92,9 @@ export class RequestLogTurns {
     return this.sqlite.transaction(() => {
       let turn = this.resolve(id);
       if (!turn) return;
+      // Clients can reuse turn/session headers when polling models. These operations
+      // must not replace a conversation's input or final response.
+      if (this.sqlite.prepare("SELECT 1 FROM request_logs WHERE id = ? AND json_extract(data_json, '$.kind') = 'models'").get(id)) return turn.id;
       if (context.isRootTurn) this.sqlite.prepare("UPDATE request_logs SET is_root_request = 1 WHERE id = ?").run(id);
       let target: Turn | undefined;
       if (context.correlationKey) {
@@ -215,6 +218,7 @@ export class RequestLogTurns {
       for (const entry of pending) {
         const content = JSON.parse(entry.data_json) as Content;
         content.result = { ...content.result, status: "cancelled", statusCode: 499, body: limitLogText(`${content.result.body}${content.result.body ? "\n\n" : ""}[服务已重启，该接口调用未记录完成结果]`) };
+        delete content.result.stage;
         const timestamp = new Date().toISOString();
         this.sqlite.prepare("UPDATE request_logs SET data_json = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(content), timestamp, entry.id);
         this.interruptTools(entry.id);
@@ -236,7 +240,8 @@ export class RequestLogTurns {
         return { id: entry.id, createdAt: entry.created_at, updatedAt: entry.updated_at, upstream: value.upstream, result: value.result };
       });
       const previous = attempts.at(-1);
-      if (content.upstream && !(content.result.status === "failed" && previous && previous.upstream?.url === content.upstream.url && previous.result.statusCode === content.result.statusCode)) {
+      const betweenAttempts = content.result.status === "pending" && ["receiving-request", "preparing-upstream", "waiting-retry"].includes(content.result.stage || "");
+      if (content.upstream && !betweenAttempts && !(content.result.status === "failed" && previous && previous.upstream?.url === content.upstream.url && previous.result.statusCode === content.result.statusCode)) {
         attempts.push({ id: request.id, createdAt: request.created_at, updatedAt: request.updated_at, upstream: content.upstream, result: content.result });
       }
       return { id: request.id, createdAt: request.created_at, updatedAt: request.updated_at, result: { ...content.result, body: attempts.length ? "" : content.result.body }, attempts };
@@ -249,23 +254,36 @@ export class RequestLogTurns {
     // but use the latest known main request as the standalone result when identifiable.
     const resultRequest = requests.filter((request) => request.is_root_request).at(-1) || requests.at(-1)!;
     const latest = JSON.parse(resultRequest.data_json) as Content;
+    const currentIndex = requests.indexOf(resultRequest);
+    const previousCall = calls.slice(0, currentIndex)
+      .filter((call, index) => call.result.status !== "pending" && (!resultRequest.is_root_request || requests[index].is_root_request)).at(-1);
+    const previousResult = latest.result.status === "pending"
+      ? calls[currentIndex].attempts.filter((attempt) => attempt.result.status !== "pending").at(-1)
+        || (previousCall && (previousCall.attempts.at(-1) || previousCall))
+      : undefined;
     const pending = calls.some((call) => call.result.status === "pending");
     const result = { ...latest.result, ...(pending ? { status: "pending" as const } : {}) };
     const message = this.message(turn.id);
     return { id: turn.id, createdAt: turn.created_at, updatedAt: turn.updated_at, revision: turn.revision,
+      ...(latest.kind ? { kind: latest.kind } : {}),
       requestHeaders: JSON.parse(turn.request_headers_json || "{}") as Record<string, string>, msg: message ? [message] : [], upstream: latest.upstream, result,
+      ...(previousResult ? { previousResultId: previousResult.id } : {}),
       phase: phase(result.status, tools.filter((tool) => tool.status === "pending").length), calls, tools };
   }
 
   list(limit: number, offset = 0, since?: string): RequestLogSummary[] {
     const rows = this.sqlite.prepare(`SELECT t.id, t.created_at, t.updated_at, t.revision,
+      json_extract(l.data_json, '$.kind') AS kind,
       (SELECT substr(m.content, 1, 200) FROM request_log_message_refs r JOIN request_log_messages m ON m.id = r.message_id WHERE r.log_id = t.id ORDER BY r.position DESC LIMIT 1) AS msg,
       json_extract(l.data_json, '$.upstream') AS upstream_json,
       json_extract(l.data_json, '$.result.status') AS status,
+      json_extract(l.data_json, '$.result.stage') AS stage,
       json_extract(l.data_json, '$.result.statusCode') AS status_code,
       substr(json_extract(l.data_json, '$.result.body'), 1, 240) AS body,
       (SELECT count(*) FROM request_logs r WHERE r.turn_id = t.id AND r.request_id = r.id) AS requests,
       (SELECT count(*) FROM request_logs r WHERE r.turn_id = t.id AND json_extract(r.data_json, '$.upstream.url') IS NOT NULL
+        AND (r.id != r.request_id OR json_extract(r.data_json, '$.result.status') != 'pending'
+          OR COALESCE(json_extract(r.data_json, '$.result.stage'), '') NOT IN ('receiving-request', 'preparing-upstream', 'waiting-retry'))
         AND (r.id != r.request_id OR json_extract(r.data_json, '$.result.status') != 'failed'
           OR NOT EXISTS (SELECT 1 FROM request_logs a WHERE a.request_id = r.id AND a.id != r.id))) AS attempts,
       (SELECT count(*) FROM request_logs r WHERE r.turn_id = t.id AND r.request_id = r.id AND json_extract(r.data_json, '$.result.status') = 'pending') AS pending,
@@ -274,12 +292,13 @@ export class RequestLogTurns {
       FROM request_log_turns t JOIN request_logs l ON l.id =
         (SELECT id FROM request_logs WHERE turn_id = t.id AND id = request_id ORDER BY is_root_request DESC, created_at DESC, rowid DESC LIMIT 1)
       ${since ? "WHERE t.updated_at >= ?" : ""} ORDER BY t.updated_at DESC, t.rowid DESC LIMIT ? OFFSET ?`)
-      .all(...(since ? [since, limit, offset] : [limit, offset])) as Array<{ id: string; created_at: string; updated_at: string; revision: number; msg: string | null; upstream_json: string | null; status: RequestLogResult["status"]; status_code: number; body: string; requests: number; attempts: number; pending: number; tools: number; pending_tools: number }>;
+      .all(...(since ? [since, limit, offset] : [limit, offset])) as Array<{ id: string; created_at: string; updated_at: string; revision: number; kind: RequestLog["kind"] | null; msg: string | null; upstream_json: string | null; status: RequestLogResult["status"]; stage: RequestLogResult["stage"] | null; status_code: number; body: string; requests: number; attempts: number; pending: number; tools: number; pending_tools: number }>;
     return rows.map((row) => {
       const status = row.pending ? "pending" : row.status;
       return { id: row.id, createdAt: row.created_at, updatedAt: row.updated_at, revision: row.revision, msg: row.msg || "", messageCount: row.msg ? 1 : 0,
+        ...(row.kind ? { kind: row.kind } : {}),
         upstream: row.upstream_json ? JSON.parse(row.upstream_json) as RequestLog["upstream"] : undefined,
-        result: { status, statusCode: row.status_code, body: row.body || "" }, phase: phase(status, row.pending_tools),
+        result: { status, ...(row.stage ? { stage: row.stage } : {}), statusCode: row.status_code, body: row.body || "" }, phase: phase(status, row.pending_tools),
         requestCount: row.requests, attemptCount: row.attempts, toolCount: row.tools };
     });
   }

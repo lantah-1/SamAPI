@@ -83,6 +83,32 @@ test("one turn owns concurrent requests, retries and tool callbacks without dupl
   assert.equal(store.requestLogCount(), 2);
 });
 
+test("pending main requests retain the previous main result or latest retry result by reference", (t) => {
+  const { store, begin, finish } = fixture(t);
+  const headers = turnHeaders("retain-result");
+  const previous = begin({ input: "analyse" }, headers);
+  finish(previous, "previous answer");
+  const child = begin({ input: "child task" }, turnHeaders("retain-result", "child", "child-session"));
+  finish(child, "child answer");
+  const current = begin({ input: "analyse" }, headers);
+  let log = store.getRequestLog(current)!;
+  assert.equal(log.previousResultId, previous, "a concurrent child result must not replace the previous main answer");
+  assert.equal(log.result.body, "", "the old answer is referenced instead of replacing the actual current result");
+  const failed = store.recordRequestLog(input({ parentRequestId: current, status: "failed", statusCode: 599, responsePreview: "last upstream error" }));
+  store.updateRequestLog(current, { stage: "waiting-retry", responsePreview: "" });
+  log = store.getRequestLog(current)!;
+  assert.equal(log.previousResultId, failed.id);
+  assert.equal(log.calls.at(-1)?.attempts.at(-1)?.result.body, "last upstream error");
+  store.updateRequestLog(current, { stage: "receiving-upstream", responsePreview: "new partial answer" });
+  log = store.getRequestLog(current)!;
+  assert.equal(log.previousResultId, failed.id);
+  assert.equal(log.result.body, "new partial answer");
+  finish(current, "new final answer");
+  log = store.getRequestLog(current)!;
+  assert.equal(log.previousResultId, undefined);
+  assert.equal(log.result.body, "new final answer");
+});
+
 test("tool and previous-response links continue a turn but repeated prompts, other clients and new user inputs stay separate", (t) => {
   const { store, begin, finish } = fixture(t);
   const a = begin({ input: "same words" });
@@ -236,7 +262,7 @@ test("upgrading compact logs collapses identifiable old requests, keeps only the
   const headers = { ...turnHeaders("legacy-root"), "x-client-request-id": "legacy-request" };
   const a = store.recordRequestLog(input({ requestHeaders: headers, requestBody: { messages: [{ role: "user", content: "old turn" }, { role: "user", content: "current turn" }] }, status: "success", statusCode: 200, responsePreview: "recovered response" }));
   store.recordRequestLog(input({ requestHeaders: headers, requestBody: { input: "current turn" }, status: "failed", statusCode: 503, responsePreview: "first attempt failed" }));
-  const active = store.recordRequestLog(input({ requestBody: { input: "interrupted" }, responsePreview: "partial response" }));
+  const active = store.recordRequestLog(input({ requestBody: { input: "interrupted" }, stage: "receiving-upstream", responsePreview: "partial response" }));
   // Recreate format 2, where every physical request still carried its own headers.
   sql.prepare(`UPDATE request_logs SET data_json = json_set(data_json, '$.requestHeaders', json(
     (SELECT request_headers_json FROM request_log_turns WHERE id = request_logs.turn_id)))`).run();
@@ -253,6 +279,8 @@ test("upgrading compact logs collapses identifiable old requests, keeps only the
     assert.equal(log.result.body, "recovered response");
     assert.equal(reopened.requestLogCount(), 2);
     assert.equal(reopened.getRequestLog(active.id)?.phase, "cancelled");
+    assert.equal(reopened.getRequestLog(active.id)?.result.stage, undefined);
+    assert.equal(reopened.listRequestLogs().find((log) => log.id === active.id)?.result.stage, undefined);
     assert.match(reopened.getRequestLog(active.id)?.result.body || "", /partial response.*\n.*服务已重启/s);
     assert.equal((sql.prepare("SELECT count(*) AS n FROM request_log_message_refs").get() as { n: number }).n, 2);
   } finally { reopened.close(); }
@@ -284,7 +312,7 @@ test("format 3 migration removes duplicate headers without losing requests, tool
     const reopened = new JsonStore(dir);
     try {
       assert.deepEqual(reopened.getRequestLog(a), expected);
-      assert.equal((sql.prepare("SELECT value FROM meta WHERE key = 'request_log_format'").get() as { value: string }).value, "4");
+      assert.equal((sql.prepare("SELECT value FROM meta WHERE key = 'request_log_format'").get() as { value: string }).value, "5");
       assert.equal((sql.prepare("SELECT count(*) AS n FROM request_logs WHERE json_type(data_json, '$.requestHeaders') IS NOT NULL").get() as { n: number }).n, 0);
       const after = (sql.prepare("SELECT (SELECT sum(length(data_json)) FROM request_logs) + (SELECT sum(length(request_headers_json)) FROM request_log_turns) AS n").get() as { n: number }).n;
       assert.ok(after < before, "one shared header copy must take less space than the previous repeated headers");

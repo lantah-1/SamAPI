@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { captureUsageResponse, createUsageCapture, usageFields } from "../server/usage-capture.js";
+import { captureUsageResponse, createUsageCapture, requestServiceTier, usageFields } from "../server/usage-capture.js";
 import { JsonStore } from "../server/store/index.js";
 import { usageCostNano, validatePrice } from "../server/store/usage.js";
 import type { UsageRecordInput } from "../shared/usage.js";
@@ -71,6 +71,52 @@ test("usage response tap preserves bytes, headers, status and records EOF or can
   assert.equal(cancelled, true);
   assert.equal(cancelledRecords.length, 2);
   assert.equal(cancelledRecords[1].usage, undefined);
+});
+
+test("service tier capture reads envelope metadata, ignores generated fields and uses the last upstream tier", () => {
+  const wire = [
+    { type: "response.created", response: { service_tier: "fast" } },
+    { choices: [{ message: { service_tier: "ultrafast", content: '{"service_tier":"scale"}' } }] },
+    { type: "response.completed", response: { usage: { input_tokens: 100, output_tokens: 5 }, service_tier: "default" } }
+  ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+  for (const width of [1, 7, wire.length]) {
+    const capture = createUsageCapture();
+    for (let i = 0; i < wire.length; i += width) capture.push(wire.slice(i, i + width));
+    assert.equal(capture.serviceTier(), "default");
+    assert.equal(capture.result()?.totalTokens, 105);
+  }
+  const fake = createUsageCapture();
+  fake.push(JSON.stringify({ output: [{ service_tier: "priority" }], choices: [{ message: { service_tier: "priority" } }] }));
+  assert.equal(fake.serviceTier(), undefined);
+  const anthropic = createUsageCapture();
+  anthropic.push(JSON.stringify({ usage: { input_tokens: 100, output_tokens: 5, service_tier: "standard" } }));
+  assert.equal(anthropic.serviceTier(), "default");
+  assert.equal(requestServiceTier('{"service_tier":"fast"}'), "fast");
+  assert.equal(requestServiceTier({ messages: [{ content: '{"service_tier":"fast"}' }] }), undefined);
+});
+
+test("response service tier overrides the requested tier before pricing and cannot be downgraded by a late estimate", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "samapi-service-tier-"));
+  const store = new JsonStore(dir);
+  t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
+  const source = { id: "fixture", name: "Fixture", url: "https://example.com/pricing" };
+  const prices = { providerId: "", model: "model", inputUsdPerMillion: 2, cachedInputUsdPerMillion: 0.5, cacheWriteUsdPerMillion: 2.5, outputUsdPerMillion: 8,
+    source, serviceTiers: { priority: { inputUsdPerMillion: 4, cachedInputUsdPerMillion: 1, cacheWriteUsdPerMillion: 5, outputUsdPerMillion: 16 } } };
+  store.saveOfficialModelPrices([prices], { ...source, status: "success", modelCount: 1, lastSuccessAt: "2026-09-11T00:00:00Z" });
+  const context = { requestId: "req", apiKeyId: "client", apiKeyName: "Client", providerId: "provider", providerName: "Provider", model: "model", serviceTier: "priority" };
+  const payload = { input_tokens: 100, output_tokens: 10, input_tokens_details: { cached_tokens: 30, cache_write_tokens: 20 } };
+  const records: UsageRecordInput[] = [];
+  await captureUsageResponse(Response.json({ usage: payload, service_tier: "default" }), context, (record) => { records.push(record); store.recordUsage(record); }).text();
+  assert.equal(records.at(-1)?.serviceTier, "default");
+  assert.equal(store.usageReport().totals.estimatedCostUsd, 0.000245);
+  const final = records.at(-1)!;
+  store.recordUsage({ ...final, serviceTier: "priority", estimation: { method: "content" } });
+  assert.equal(store.usageReport().totals.estimatedCostUsd, 0.000245);
+  await captureUsageResponse(Response.json({ usage: payload }), context, (record) => store.recordUsage(record)).text();
+  assert.equal(store.usageReport().totals.estimatedCostUsd, 0.000735);
+  await captureUsageResponse(Response.json({ usage: payload, service_tier: "ultrafast" }), context, (record) => store.recordUsage(record)).text();
+  assert.equal(store.usageReport().totals.unpricedRequests, 1);
+  assert.equal(store.priceUnpricedUsage(), 0, "unknown service tiers remain unpriced after a price refresh");
 });
 
 test("ledger filters by client and date, snapshots prices, keeps retries distinct, and survives log cleanup, key deletion and restart", (t) => {

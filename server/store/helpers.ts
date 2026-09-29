@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { normalizeDownstreamModelRules } from "../../shared/model-rules.js";
+import { normalizeUpstreamRetryDelay } from "../../shared/upstream-retry.js";
 import { validateOpenAiAgentIdentityPrivateKey } from "../providers/openai-agent-identity.js";
 import type {
   AppDatabase,
@@ -37,7 +39,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   themeId: "fresh",
   adminSessionTtlMinutes: 30,
   temporaryAccountStrategy: "sequential",
-  upstreamRetryCodeCounts: []
+  upstreamRetryCodeCounts: [],
+  upstreamRetryDelay: normalizeUpstreamRetryDelay(),
+  downstreamModelRules: []
 };
 
 export function now() {
@@ -113,7 +117,9 @@ export function normalizeSettings(input?: Partial<AppSettings>): AppSettings {
       ? Math.min(60 * 24 * 30, Math.max(1, Math.floor(adminSessionTtlMinutes)))
       : DEFAULT_SETTINGS.adminSessionTtlMinutes,
     temporaryAccountStrategy,
-    upstreamRetryCodeCounts: normalizeUpstreamRetryCodeCounts(input?.upstreamRetryCodeCounts)
+    upstreamRetryCodeCounts: normalizeUpstreamRetryCodeCounts(input?.upstreamRetryCodeCounts),
+    upstreamRetryDelay: normalizeUpstreamRetryDelay(input?.upstreamRetryDelay),
+    downstreamModelRules: normalizeDownstreamModelRules(input?.downstreamModelRules)
   };
 }
 
@@ -413,6 +419,7 @@ export function numericQuotaValue(value: unknown) {
 }
 
 export function accountHasUsableQuota(account: TemporaryAccount) {
+  if (account.quotaStages.some((stage) => stage.unlimited === true)) return true;
   const numericRemaining = account.quotaStages
     .map((stage) => numericQuotaValue(stage.remaining))
     .filter((value): value is number => value != null);

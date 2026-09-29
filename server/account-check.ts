@@ -31,19 +31,35 @@ import type {
   TemporaryAccountProviderType
 } from "../shared/types.js";
 
-export function shouldMarkTemporaryAccountUnavailable(statusCode: number, errorMessage = "") {
-  if ([401, 403, 429].includes(statusCode)) return true;
-  const normalized = errorMessage.toLowerCase();
-  return (
-    normalized.includes("html") ||
-    normalized.includes("chatgpt") ||
-    normalized.includes("unauthorized") ||
-    normalized.includes("insufficient_quota") ||
-    normalized.includes("usage_limit") ||
-    normalized.includes("rate_limit") ||
-    normalized.includes("quota") ||
-    normalized.includes("额度")
-  );
+const quotaExhaustionCodes = new Set([
+  "insufficient_quota", "quota_exceeded", "quota_exhausted", "usage_limit_reached", "usage_limit_exceeded",
+  "insufficient_balance", "insufficient_credits", "credit_balance_too_low", "billing_hard_limit_reached"
+]);
+const quotaExhaustionMessages = [
+  /\b(?:insufficient|exhausted|depleted)\s+(?:quota|credits?|(?:credit\s+)?balance)\b/,
+  /\b(?:quota|credits?|(?:credit\s+)?balance)\s+(?:(?:is|are|has been|have been)\s+)?(?:exhausted|depleted|insufficient|used up)\b/,
+  /\b(?:exceeded|exhausted|used up)\s+(?:(?:your|the|current|available|account)\s+){0,3}(?:quota|credits?)\b/,
+  /\b(?:hit|reached|exceeded)\s+(?:(?:your|the|current)\s+){0,3}usage limit\b/,
+  /\b(?:quota|usage limit)\s+(?:(?:is|has been)\s+)?(?:reached|exceeded)\b/,
+  /\bcredit balance\s+(?:is\s+)?too low\b/,
+  /\b(?:not enough|no remaining)\s+credits?\b/,
+  /(?:额度|配额|余额|点数|积分)(?:已(?:经)?)?(?:耗尽|用尽|用完|不足)/
+];
+
+/** Request failures only retire an account when the upstream explicitly reports exhausted quota. */
+export function shouldMarkTemporaryAccountUnavailable(statusCode: number, errorMessage = "", errorBody?: string) {
+  if (statusCode < 400) return false;
+  // HTTP 401/403 and transient 429s do not establish quota exhaustion. Keep structured
+  // error codes available even when the display message only says to try again later.
+  try {
+    const payload: unknown = JSON.parse(errorBody ?? errorMessage);
+    const error = isRecord(payload) ? (isRecord(payload.error) ? payload.error : payload) : undefined;
+    if (error && [error.code, error.type].some((code) => typeof code === "string" && quotaExhaustionCodes.has(code.toLowerCase()))) return true;
+  } catch {
+    // Plain-text failures can still explicitly report an exhausted quota or balance.
+  }
+  const normalized = errorMessage.trim().toLowerCase();
+  return quotaExhaustionCodes.has(normalized) || quotaExhaustionMessages.some((pattern) => pattern.test(normalized));
 }
 
 function isTemporaryAccountAuthFailure(errorMessage = "") {

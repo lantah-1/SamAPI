@@ -5,10 +5,23 @@ import { limitLogText, responseLogText } from "../log-content.js";
 import { currentUserMessages, logRequestContext, type LogResponseTool } from "../log-context.js";
 import { RequestLogTurns } from "./log-turns.js";
 
-type LogContent = Pick<RequestLog, "upstream" | "result"> & { requestHeaders?: RequestLog["requestHeaders"] };
+type LogContent = Pick<RequestLog, "kind" | "upstream" | "result"> & { requestHeaders?: RequestLog["requestHeaders"] };
 type LogPatch = Partial<Omit<RequestLogInput, "id" | "createdAt">>;
 type LegacyLog = RequestLogInput & { upstreamAttempts?: RequestLogUpstreamRequest[] };
 type LogRow = { id: string; created_at: string; data_json: string };
+const modelRequestPaths = new Set(["/proxy/models", "/proxy/v1/models", "/api/provider-key-groups/discover-models"]);
+
+function legacyModelList(content: LogContent) {
+  if (content.upstream) return /^模型发现(?:：\d+ 个模型)?$/.test(content.upstream.model);
+  if (content.result.status !== "success" || content.result.statusCode !== 200) return false;
+  try {
+    const body: unknown = JSON.parse(content.result.body);
+    if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+    const value = body as { modelCount?: unknown; models?: unknown };
+    return Object.keys(body).length === 2 && typeof value.modelCount === "number" && Number.isSafeInteger(value.modelCount)
+      && Array.isArray(value.models) && value.modelCount >= value.models.length && value.models.every((model) => typeof model === "string");
+  } catch { return false; }
+}
 
 function downstreamHeaders(headers: Record<string, string> = {}, legacy = false) {
   return Object.fromEntries(Object.entries(headers)
@@ -18,19 +31,33 @@ function downstreamHeaders(headers: Record<string, string> = {}, legacy = false)
 }
 
 function logContent(input: LogPatch, previous?: LogContent): LogContent {
+  const kind = previous?.kind || (input.method !== "HEAD" && modelRequestPaths.has((input.path || "").split("?")[0].replace(/\/+$/, "")) ? "models" : undefined);
   const attempt = input.upstreamRequest;
   const url = input.upstreamUrl || attempt?.upstreamUrl || previous?.upstream?.url;
+  const account = input.upstreamAccount === undefined ? previous?.upstream?.account : input.upstreamAccount;
+  const userAgent = input.upstreamUserAgent ?? previous?.upstream?.userAgent;
   const body = input.responsePreview ?? attempt?.responsePreview;
-  const streamStartedWith = input.streamStartedWith ?? previous?.result.streamStartedWith;
+  const status = input.status || previous?.result.status || "pending";
+  const stage = status === "pending" ? input.stage ?? previous?.result.stage : undefined;
+  const streamStartedWith = input.stage === "waiting-upstream" ? input.streamStartedWith : input.streamStartedWith ?? previous?.result.streamStartedWith;
   return {
+    ...(kind ? { kind } : {}),
     requestHeaders: previous?.requestHeaders || downstreamHeaders(input.requestHeaders),
     upstream: url ? {
       provider: input.providerName || previous?.upstream?.provider || "",
       model: attempt?.model || input.model || previous?.upstream?.model || "",
-      url
+      url,
+      // Copy only display metadata, even if a caller passes a full credential record.
+      ...(account ? { account: { id: account.id, label: account.label } } : {}),
+      ...(userAgent ? { userAgent: {
+        value: userAgent.value,
+        source: userAgent.source,
+        ...(userAgent.template ? { template: { id: userAgent.template.id, name: userAgent.template.name } } : {})
+      } } : {})
     } : previous?.upstream,
     result: {
-      status: input.status || previous?.result.status || "pending",
+      status,
+      ...(stage ? { stage } : {}),
       statusCode: input.statusCode ?? previous?.result.statusCode ?? 0,
       body: body !== undefined ? limitLogText(body)
         : input.errorMessage ? limitLogText(input.errorMessage)
@@ -63,7 +90,7 @@ export class RequestLogStore {
   migrate(limit: number) {
     this.retentionLimit = limit;
     const version = this.sqlite.prepare("SELECT value FROM meta WHERE key = 'request_log_format'").get() as { value: string } | undefined;
-    if (version?.value === "4") {
+    if (version?.value === "5") {
       this.turns.migrate(false);
       this.trim(limit);
       return;
@@ -71,7 +98,7 @@ export class RequestLogStore {
     let converted = false;
     this.sqlite.transaction(() => {
       let after = 0;
-      while (version?.value !== "2" && version?.value !== "3") {
+      while (version?.value !== "2" && version?.value !== "3" && version?.value !== "4") {
         // Migrate bounded batches; do not load all old request bodies into memory at startup.
         const rows = this.sqlite.prepare("SELECT rowid AS seq, id, created_at, data_json FROM request_logs WHERE rowid > ? ORDER BY rowid LIMIT 50").all(after) as Array<LogRow & { seq: number }>;
         if (!rows.length) break;
@@ -93,13 +120,35 @@ export class RequestLogStore {
           after = row.seq;
         }
       }
-      this.turns.migrate(version?.value !== "3");
+      this.classifyLegacyModelRequests();
+      this.turns.migrate(version?.value !== "3" && version?.value !== "4");
       // Group legacy requests before removing the per-request headers used to correlate them.
       converted = this.compactHeaders() || converted;
       this.trimRows(limit);
-      this.sqlite.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('request_log_format', '4')").run();
+      this.sqlite.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('request_log_format', '5')").run();
     })();
     if (converted || version?.value === "2") this.reclaimSpace();
+  }
+
+  private classifyLegacyModelRequests() {
+    // Compact logs no longer retain paths. Only recognize known model-list shapes on
+    // standalone, message-free requests; never relabel a conversation or a mixed turn.
+    const select = this.sqlite.prepare(`SELECT l.rowid AS seq, l.id, l.data_json FROM request_logs l
+      WHERE l.rowid > ? AND json_type(l.data_json, '$.kind') IS NULL
+        AND NOT EXISTS (SELECT 1 FROM request_log_message_refs r WHERE r.log_id = COALESCE(l.turn_id, l.id))
+        AND NOT EXISTS (SELECT 1 FROM request_logs r WHERE r.turn_id = l.turn_id AND r.id != l.id)
+      ORDER BY l.rowid LIMIT 50`);
+    const mark = this.sqlite.prepare("UPDATE request_logs SET data_json = json_set(data_json, '$.kind', 'models') WHERE id = ?");
+    const unlink = this.sqlite.prepare("UPDATE request_log_turns SET correlation_key = NULL, scope = NULL WHERE id = (SELECT turn_id FROM request_logs WHERE id = ?)");
+    let after = 0;
+    while (true) {
+      const rows = select.all(after) as Array<{ seq: number; id: string; data_json: string }>;
+      if (!rows.length) break;
+      for (const row of rows) {
+        if (legacyModelList(JSON.parse(row.data_json) as LogContent)) { mark.run(row.id); unlink.run(row.id); }
+        after = row.seq;
+      }
+    }
   }
 
   private compactHeaders() {
@@ -141,15 +190,17 @@ export class RequestLogStore {
       upstreamRequest: attempt,
       responsePreview: responseLogText(log.responsePreview || attempt?.responsePreview || log.errorMessage)
     };
-    this.write(log.id, log.createdAt, logContent(input), currentUserMessages(input.requestBody), { keepLegacyHeaders: true });
+    const content = logContent(input);
+    this.write(log.id, log.createdAt, content, content.kind === "models" ? [] : currentUserMessages(input.requestBody), { keepLegacyHeaders: true });
   }
 
   record(input: Omit<RequestLogInput, "id" | "createdAt">, limit: number) {
     this.retentionLimit = limit;
     const id = `log-${randomUUID()}`;
     const createdAt = new Date().toISOString();
+    const content = logContent(input);
     this.sqlite.transaction(() => {
-      this.write(id, createdAt, logContent(input), currentUserMessages(input.requestBody), { parentRequestId: input.parentRequestId });
+      this.write(id, createdAt, content, content.kind === "models" ? [] : currentUserMessages(input.requestBody), { parentRequestId: input.parentRequestId });
       if (input.parentRequestId && (input.status === "failed" || input.status === "cancelled")) this.turns.interruptTools(input.parentRequestId);
       if (input.status !== "pending" || input.parentRequestId) this.trimRows(limit);
     })();
@@ -161,7 +212,7 @@ export class RequestLogStore {
     if (!row) return undefined;
     const content = logContent(patch, JSON.parse(row.data_json) as LogContent);
     this.sqlite.transaction(() => {
-      this.write(id, row.created_at, content, patch.requestBody === undefined ? undefined : currentUserMessages(patch.requestBody));
+      this.write(id, row.created_at, content, content.kind === "models" ? [] : patch.requestBody === undefined ? undefined : currentUserMessages(patch.requestBody));
       if (patch.status === "failed" || patch.status === "cancelled") this.turns.interruptTools(id);
       if (patch.status && patch.status !== "pending") this.trimRows(this.retentionLimit);
       this.collectUnusedMessages();

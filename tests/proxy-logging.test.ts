@@ -12,7 +12,8 @@ import Database from "better-sqlite3";
 import { JsonStore } from "../server/store/index.js";
 import { createRouting } from "../server/routing.js";
 import { createProxyHandler } from "../server/handlers/proxy.js";
-import { CODEX_USER_AGENT } from "../server/providers/constants.js";
+import { CODEX_BACKEND_RESPONSES_URL, CODEX_USER_AGENT } from "../server/providers/constants.js";
+import type { DownstreamModelRule, RequestLogStage } from "../shared/types.js";
 
 class ResponseRecorder extends EventEmitter {
   statusCode = 0;
@@ -45,9 +46,12 @@ function setup(t: TestContext, multipleAddresses = false) {
   const key = store.createApiKey("fixture-client");
   const routing = createRouting(store);
   const handler = createProxyHandler({ store, ...routing });
-  const request = async (body: unknown, onResponse?: (response: ResponseRecorder) => void, extraHeaders: Record<string, string> = {}, pathname = "/proxy/v1/chat/completions") => {
+  const request = async (body: unknown, onResponse?: (response: ResponseRecorder) => void, extraHeaders: Record<string, string> = {}, pathname = "/proxy/v1/chat/completions", includeProjectHeaders = true) => {
     const req = Object.assign(Readable.from([JSON.stringify(body)]), {
-      headers: { authorization: `Bearer ${key.plainTextKey}`, "content-type": "application/json", "user-agent": "fixture-client", "upstream-custom": "keep-me", ...extraHeaders },
+      headers: {
+        authorization: `Bearer ${key.plainTextKey}`, "content-type": "application/json", "user-agent": "fixture-client", "upstream-custom": "keep-me",
+        ...(includeProjectHeaders ? { "x-samapi-project-path": "/work/fixture", "x-samapi-project-name": "fixture" } : {}), ...extraHeaders
+      },
       method: "POST", url: pathname, socket: { remoteAddress: "127.0.0.1" }
     }) as unknown as http.IncomingMessage;
     const res = new ResponseRecorder();
@@ -55,7 +59,7 @@ function setup(t: TestContext, multipleAddresses = false) {
     await handler.handleProxy(req, res as unknown as http.ServerResponse, new URL(`http://localhost${pathname}`));
     return res;
   };
-  return { store, sql, request };
+  return { store, sql, request, handler, key, site };
 }
 
 function mockRetryTimers(t: TestContext) {
@@ -74,6 +78,715 @@ async function finishWithRetryTimers<T>(t: TestContext, pending: Promise<T>, max
   assert.equal(settled, true, "request must finish within its configured retry budget");
   return pending;
 }
+
+async function waitForRetryDelay(store: JsonStore, attempts: number) {
+  const waiting = () => {
+    const log = store.listRequestLogs()[0];
+    return log?.result.stage === "waiting-retry" && log.attemptCount === attempts;
+  };
+  for (let turn = 0; turn < 40 && !waiting(); turn++) await nextTick();
+  assert.equal(waiting(), true, "a retry must wait after the failed attempt, without delaying the first request");
+}
+
+function setupModelMapping(t: TestContext) {
+  const fixture = setup(t);
+  const { store, site } = fixture;
+  const group = store.getDb().providerApiKeyGroups.find((group) => group.siteId === site.id)!;
+  store.upsertProviderApiKeyGroup({ ...group, apiKeys: group.apiKeys.map((key) => ({ ...key, models: ["fixture-model", "upstream-cli", "upstream-app"] })) });
+  const fallback = store.upsertRoute({ ...store.getDb().routes.find((route) => route.name === "alias")!, endpoint: "responses" });
+  const cli = store.upsertRoute({ type: "switch", name: "cli-target", siteId: site.id, model: "upstream-cli", endpoint: "responses", enabled: true });
+  const app = store.upsertRoute({ type: "switch", name: "app-target", siteId: site.id, model: "upstream-app", endpoint: "responses", enabled: true });
+  const sent: Array<{ model: string; headers: Headers }> = [];
+  globalThis.fetch = async (_target, init) => {
+    const body = JSON.parse(String(init?.body));
+    sent.push({ model: body.model, headers: new Headers(init?.headers) });
+    return new Response(JSON.stringify({
+      id: `resp-mapped-${sent.length}`, object: "response", model: body.model, status: "completed",
+      output: [{ id: "message", type: "message", role: "assistant", content: [{ type: "output_text", text: "mapped response" }] }],
+      usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 }
+    }), { headers: { "content-type": "application/json" } });
+  };
+  const mapping = (id: string, targetRouteId: string, conditions: DownstreamModelRule["conditions"], model = "alias"): DownstreamModelRule => ({
+    id, name: id, enabled: true, model, targetRouteId, conditions
+  });
+  return { ...fixture, fallback, cli, app, sent, mapping };
+}
+
+test("the same key and requested Responses model route CLI and App to different models using original headers", async (t) => {
+  const { store, request, sql, key, cli, app, sent, mapping } = setupModelMapping(t);
+  const template = store.upsertHeaderTemplate({ name: "upstream headers", headersText: "Originator: upstream-template\nUser-Agent: upstream-client" });
+  store.upsertRoute({ ...app, headerTemplateId: template.id });
+  store.updateApiKey(key.id, { models: ["gpt-5.6-sol"] });
+  store.updateSettings({ downstreamModelRules: [
+    mapping("cli", cli.id, [{ source: "header", header: "originator", match: "exact", value: "codex_cli_rs" }], "gpt-5.6-sol"),
+    mapping("app", app.id, [{ source: "header", header: "originator", match: "exact", value: "Codex Desktop" }], "gpt-5.6-sol"),
+    mapping("no recursive mapping", cli.id, [{ source: "header", header: "originator", match: "exact", value: "Codex Desktop" }], app.name)
+  ] });
+  for (const originator of ["codex_cli_rs", "Codex Desktop"]) {
+    const response = await request({ model: "gpt-5.6-sol", input: "map this request" }, undefined, { originator }, "/proxy/v1/responses");
+    assert.equal(response.statusCode, 200, response.text());
+  }
+  assert.deepEqual(sent.map((request) => request.model), ["upstream-cli", "upstream-app"]);
+  assert.equal(sent[1].headers.get("originator"), "upstream-template");
+  assert.deepEqual(new Set(store.listRequestLogs().map((log) => log.upstream?.model)), new Set(["upstream-cli", "upstream-app"]));
+  assert.deepEqual(sql.prepare("SELECT DISTINCT model FROM usage_records ORDER BY model").all(), [{ model: "upstream-app" }, { model: "upstream-cli" }]);
+});
+
+test("direct model mappings apply their own request-header template", async (t) => {
+  const { store, request, app, sent } = setupModelMapping(t);
+  const template = store.upsertHeaderTemplate({ name: "direct App headers", headersText: "Originator: direct-template\nUser-Agent: direct-client" });
+  store.updateSettings({ downstreamModelRules: [{
+    id: "direct", name: "direct", enabled: true, model: "alias",
+    targetSiteId: app.siteId, targetModel: "upstream-app", headerTemplateId: template.id, conditions: []
+  }] });
+  const response = await request({ model: "alias", input: "use direct template" }, undefined, { originator: "downstream-client" }, "/proxy/v1/responses");
+  assert.equal(response.statusCode, 200, response.text());
+  assert.equal(sent[0].model, "upstream-app");
+  assert.equal(sent[0].headers.get("originator"), "direct-template");
+  assert.equal(sent[0].headers.get("user-agent"), "direct-client");
+});
+
+test("project rules distinguish two projects in one App and fall back by client without carrying project state across requests", async (t) => {
+  const { store, request, fallback, cli, app, sent, mapping } = setupModelMapping(t);
+  const desktop = { source: "header", header: "originator", match: "exact", value: "Codex Desktop" } as const;
+  store.updateSettings({ downstreamModelRules: [
+    mapping("project A", app.id, [desktop, { source: "project", match: "prefix", value: "/work/project-a" }]),
+    mapping("project B", cli.id, [desktop, { source: "project", match: "exact", value: "project-b" }]),
+    mapping("App default", fallback.id, [desktop])
+  ] });
+  for (const [index, headers] of ([
+    { "x-codex-turn-metadata": JSON.stringify({ workspaces: { "/work/project-a/subdir": {} } }) },
+    { "x-samapi-project": "project-b", "x-codex-turn-metadata": JSON.stringify({ workspaces: { "/work/project-a": {} } }) },
+    { "x-codex-turn-metadata": JSON.stringify({ workspaces: { "/work/project-a-other": {} } }) },
+    { "x-codex-turn-metadata": "malformed" },
+    {}
+  ] as Record<string, string>[]).entries()) {
+    const response = await request({ model: "alias", input: "same App and model" }, undefined, { originator: "Codex Desktop", ...headers }, "/proxy/v1/responses", index >= 3);
+    assert.equal(response.statusCode, 200, response.text());
+  }
+  assert.deepEqual(sent.map((request) => request.model), ["upstream-app", "upstream-cli", "fixture-model", "fixture-model", "fixture-model"]);
+});
+
+test("unconditional model mappings retain original model permissions", async (t) => {
+  const { store, request, key, app, sent, mapping } = setupModelMapping(t);
+  store.updateSettings({ downstreamModelRules: [mapping("default", app.id, [], "gpt-5.6-sol")] });
+  store.updateApiKey(key.id, { models: ["gpt-5.6-sol"] });
+  const response = await request({ model: "gpt-5.6-sol", input: "no optional metadata" }, undefined, {}, "/proxy/v1/responses");
+  assert.equal(response.statusCode, 200, response.text());
+  assert.deepEqual(sent.map((request) => request.model), ["upstream-app"]);
+  store.updateApiKey(key.id, { models: [app.name] });
+  const denied = await request({ model: "gpt-5.6-sol", input: "not allowed" }, undefined, {}, "/proxy/v1/responses");
+  assert.match(denied.text(), /不允许使用模型 gpt-5.6-sol/);
+  assert.equal(sent.length, 1);
+});
+
+test("path and name headers select projects, stay in downstream logs and never reach the upstream", async (t) => {
+  const { store, request, fallback, cli, app, sent, mapping } = setupModelMapping(t);
+  const template = store.upsertHeaderTemplate({ name: "same client", headersText: `User-Agent: ${CODEX_USER_AGENT}` });
+  for (const route of [fallback, cli, app]) store.upsertRoute({ ...route, headerTemplateId: template.id });
+  store.updateSettings({ downstreamModelRules: [
+    mapping("project A", app.id, [
+      { source: "project", match: "prefix", value: "/work/project-a" },
+      { source: "header", header: "x-samapi-project-name", match: "exact", value: "App" }
+    ]),
+    mapping("project B", cli.id, [{ source: "header", header: "x-samapi-project-name", match: "exact", value: "project-b" }])
+  ] });
+  const requests = [
+    { "x-samapi-project-path": "/work/project-a/src", "x-samapi-project-name": "App", "x-samapi-project": "legacy-other" },
+    { "x-samapi-project-path": "/work/project-b", "x-samapi-project-name": "project-b" },
+    { "x-samapi-project-path": "/work/project-a-other", "x-samapi-project-name": "App" },
+    {}
+  ] as Record<string, string>[];
+  for (const [index, headers] of requests.entries()) {
+    const response = await request({ model: "alias", input: `project request ${index}` }, undefined, { "user-agent": CODEX_USER_AGENT, ...headers }, "/proxy/v1/responses");
+    assert.equal(response.statusCode, 200, response.text());
+    const log = store.getRequestLog(store.listRequestLogs()[0].id)!;
+    for (const name of ["x-samapi-project-path", "x-samapi-project-name", "x-samapi-project"]) {
+      assert.equal(sent[index].headers.get(name), null);
+      assert.equal(log.requestHeaders?.[name], headers[name] ?? (name === "x-samapi-project-path" ? "/work/fixture" : name === "x-samapi-project-name" ? "fixture" : undefined));
+    }
+    assert.equal(sent[index].headers.get("upstream-custom"), "keep-me", "same-client passthrough must actually be exercised");
+    assert.equal(sent[index].headers.get("authorization"), "Bearer fixture-upstream-key");
+  }
+  assert.deepEqual(sent.map((request) => request.model), ["upstream-app", "upstream-cli", "fixture-model", "fixture-model"]);
+});
+
+test("Codex workspace metadata materializes both project headers in logs while requests without a project use ordinary routing", async (t) => {
+  const { store, request, app, sent, mapping } = setupModelMapping(t);
+  store.updateSettings({ downstreamModelRules: [mapping("Codex project", app.id, [
+    { source: "project", match: "exact", value: "/work/project-a" },
+    { source: "header", header: "x-samapi-project-name", match: "exact", value: "project-a" }
+  ])] });
+
+  const metadata = JSON.stringify({ workspaces: { "/work/project-a": {} } });
+  const derived = await request({ model: "alias", input: "derive project headers" }, undefined, {
+    "x-codex-turn-metadata": metadata
+  }, "/proxy/v1/responses", false);
+  assert.equal(derived.statusCode, 200, derived.text());
+  assert.equal(sent[0].model, "upstream-app");
+  const derivedLog = store.getRequestLog(store.listRequestLogs()[0].id)!;
+  assert.equal(derivedLog.requestHeaders["x-samapi-project-path"], "/work/project-a");
+  assert.equal(derivedLog.requestHeaders["x-samapi-project-name"], "project-a");
+  assert.equal(sent[0].headers.get("x-samapi-project-path"), null);
+  assert.equal(sent[0].headers.get("x-samapi-project-name"), null);
+
+  const missing = await request({ model: "alias", input: "missing project headers" }, undefined, {}, "/proxy/v1/responses", false);
+  assert.equal(missing.statusCode, 200, missing.text());
+  assert.equal(sent.length, 2);
+  const missingLog = store.getRequestLog(store.listRequestLogs()[0].id)!;
+  assert.equal(missingLog.requestHeaders["x-samapi-project-path"], undefined);
+  assert.equal(missingLog.requestHeaders["x-samapi-project-name"], undefined);
+});
+
+test("project headers are removed on every upstream retry for both templates and passthrough, including Codex", async (t) => {
+  for (const codex of [false, true]) for (const passthrough of [false, true]) {
+    await t.test(`${codex ? "Codex" : "site"} ${passthrough ? "passthrough" : "template"}`, async (t) => {
+      const { store, request } = setup(t);
+      mockRetryTimers(t);
+      if (codex) store.saveCodexOAuthAccount({ accessToken: "fixture-project-access", refreshToken: "fixture-project-refresh", accountId: "fixture-project-account" });
+      const route = codex
+        ? store.createManagedAccountRoute("gpt", { name: "project-retry", model: "gpt-fixture" })
+        : store.getDb().routes.find((route) => route.name === "alias")!;
+      const template = store.upsertHeaderTemplate({ name: "project retry headers", headersText: [
+        `User-Agent: ${passthrough ? CODEX_USER_AGENT : "upstream-only"}`,
+        "X-Samapi-Project-Path: /template/private", "x-samapi-project-path: /template/duplicate",
+        "X-Samapi-Project-Name: template-private", "X-SAMAPI-PROJECT-NAME: duplicate",
+        "X-Samapi-Project: legacy-private", "X-Upstream-Custom: template-kept"
+      ].join("\n") });
+      store.upsertRoute({ ...route, headerTemplateId: template.id });
+      store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 503, count: 1 }] });
+      let calls = 0;
+      globalThis.fetch = async (_target, init) => {
+        calls++;
+        const headers = new Headers(init?.headers);
+        for (const name of ["x-samapi-project-path", "x-samapi-project-name", "x-samapi-project"]) assert.equal(headers.get(name), null);
+        assert.equal(headers.get(passthrough ? "upstream-custom" : "x-upstream-custom"), passthrough ? "keep-me" : "template-kept");
+        if (calls === 1) return Response.json({ error: { message: "retry fixture" } }, { status: 503 });
+        if (!codex) return Response.json({ choices: [{ message: { role: "assistant", content: "recovered" } }] });
+        const response = { id: "resp-project", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "recovered" }] }] };
+        return new Response(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+      };
+      const result = await finishWithRetryTimers(t, request({ model: route.name, messages: [{ role: "user", content: "project retry" }] }, undefined, {
+        "user-agent": CODEX_USER_AGENT, "x-samapi-project-path": "/client/private", "x-samapi-project-name": "client-private", "x-samapi-project": "legacy"
+      }));
+      assert.equal(result.statusCode, 200, result.text());
+      assert.equal(calls, 2);
+    });
+  }
+});
+
+test("mapping keeps original model permissions and authentication, and disabled rules preserve ordinary routing", async (t) => {
+  const { store, request, key, app, sent, mapping } = setupModelMapping(t);
+  const rule = mapping("App", app.id, [{ source: "header", header: "originator", match: "exact", value: "Codex Desktop" }]);
+  store.updateSettings({ downstreamModelRules: [rule] });
+  store.updateApiKey(key.id, { models: [app.name] });
+  const denied = await request({ model: "alias", input: "denied" }, undefined, { originator: "Codex Desktop" }, "/proxy/v1/responses");
+  assert.match(denied.text(), /不允许使用模型 alias/);
+  const unauthenticated = await request({ model: "alias", input: "invalid key" }, undefined, { authorization: "Bearer invalid", originator: "Codex Desktop" }, "/proxy/v1/responses");
+  assert.equal(unauthenticated.statusCode, 401);
+  assert.equal(sent.length, 0);
+  store.updateApiKey(key.id, { models: ["alias"] });
+  store.updateSettings({ downstreamModelRules: [{ ...rule, enabled: false }] });
+  assert.equal((await request({ model: "alias", input: "disabled rule" }, undefined, { originator: "Codex Desktop" }, "/proxy/v1/responses")).statusCode, 200);
+  store.updateSettings({ downstreamModelRules: [rule] });
+  assert.equal((await request({ model: "alias", input: "unmatched client" }, undefined, { originator: "another-client" }, "/proxy/v1/responses")).statusCode, 200);
+  assert.deepEqual(sent.map((request) => request.model), ["fixture-model", "fixture-model"]);
+});
+
+test("a matched mapping with a disabled or removed target fails instead of silently using a different model", async (t) => {
+  const { store, request, app, sent, mapping } = setupModelMapping(t);
+  store.updateSettings({ downstreamModelRules: [mapping("App", app.id, [{ source: "header", header: "originator", match: "exact", value: "Codex Desktop" }])] });
+  store.upsertRoute({ ...app, enabled: false });
+  for (const deleted of [false, true]) {
+    if (deleted) store.deleteRoute(app.id);
+    const response = await request({ model: "alias", input: "unavailable target" }, undefined, { originator: "Codex Desktop" }, "/proxy/v1/responses");
+    assert.equal(response.statusCode, 502);
+    assert.match(response.text(), /模型映射「App」的目标路由不存在或已停用/);
+  }
+  assert.equal(sent.length, 0);
+});
+
+test("direct provider mappings forward without a saved route and preserve original model permissions and logs", async (t) => {
+  const { store, request, key, sql } = setup(t);
+  const site = store.upsertSite({ name: "selected provider", addresses: [{ id: "selected", label: "selected", baseUrl: "https://selected.invalid/v1", enabled: true, models: [] }] });
+  store.upsertProviderApiKeyGroup({ siteId: site.id, apiKeys: [{ label: "selected key", secret: "selected-fixture-secret", enabled: true, models: ["selected-model"] }] });
+  const rules: DownstreamModelRule[] = [{ id: "direct", name: "provider mapping", model: "mapped-only", enabled: true, targetSiteId: site.id, targetModel: "selected-model", conditions: [] }];
+  const routesBefore = structuredClone(store.getDb().routes);
+  store.updateSettings({ downstreamModelRules: rules });
+  store.updateApiKey(key.id, { models: ["mapped-only"] });
+  const sent: Array<{ url: string; model: string; authorization: string | null }> = [];
+  globalThis.fetch = async (url, init) => {
+    const body = JSON.parse(String(init?.body));
+    sent.push({ url: String(url), model: body.model, authorization: new Headers(init?.headers).get("authorization") });
+    return new Response(JSON.stringify({ id: "resp-direct", object: "response", model: body.model, status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "direct reply" }] }], usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } }), { headers: { "content-type": "application/json" } });
+  };
+  const response = await request({ model: "mapped-only", input: "direct fixture" }, undefined, {}, "/proxy/v1/responses");
+  assert.equal(response.statusCode, 200, response.text());
+  assert.deepEqual(sent, [{ url: "https://selected.invalid/v1/responses", model: "selected-model", authorization: "Bearer selected-fixture-secret" }]);
+  assert.deepEqual(store.getDb().routes, routesBefore, "mapping must not create hidden saved routes");
+  const log = store.getRequestLog(store.listRequestLogs()[0].id)!;
+  assert.equal(log.upstream?.provider, "selected provider");
+  assert.equal(log.upstream?.model, "selected-model");
+  assert.equal(log.upstream?.url, "https://selected.invalid/v1/responses");
+  assert.equal((sql.prepare("SELECT model FROM usage_records ORDER BY id DESC LIMIT 1").get() as { model: string }).model, "selected-model");
+  store.updateApiKey(key.id, { models: ["selected-model"] });
+  const denied = await request({ model: "mapped-only", input: "not permitted" }, undefined, {}, "/proxy/v1/responses");
+  assert.equal(denied.statusCode, 502);
+  assert.match(denied.text(), /不允许使用模型 mapped-only/);
+  assert.equal(sent.length, 1);
+});
+
+test("unavailable direct targets fail closed instead of using an alias route or a later mapping", async (t) => {
+  const { store, request, site, app, sent, mapping } = setupModelMapping(t);
+  const group = structuredClone(store.getDb().providerApiKeyGroups.find((group) => group.siteId === site.id)!);
+  const originalSite = structuredClone(site);
+  store.updateSettings({ downstreamModelRules: [
+    { id: "direct", name: "direct", enabled: true, model: "alias", targetSiteId: site.id, targetModel: "upstream-app", conditions: [] },
+    mapping("later rule", app.id, [])
+  ] });
+  const assertUnavailable = async () => {
+    const response = await request({ model: "alias", input: "unavailable direct target" }, undefined, {}, "/proxy/v1/responses");
+    assert.equal(response.statusCode, 502);
+    assert.match(response.text(), /模型映射「direct」的目标供应商或模型不可用/);
+    assert.equal(sent.length, 0);
+  };
+  store.upsertProviderApiKeyGroup({ ...group, apiKeys: group.apiKeys.map((key) => ({ ...key, enabled: false })) });
+  await assertUnavailable();
+  store.upsertProviderApiKeyGroup({ ...group, apiKeys: group.apiKeys.map((key) => ({ ...key, models: ["fixture-model"] })) });
+  await assertUnavailable();
+  store.upsertProviderApiKeyGroup(group);
+  store.upsertSite({ ...originalSite, enabled: false });
+  await assertUnavailable();
+  store.upsertSite({ ...originalSite, addresses: originalSite.addresses.map((address) => ({ ...address, enabled: false })) });
+  await assertUnavailable();
+  store.deleteSite(site.id);
+  await assertUnavailable();
+});
+
+test("model discovery exposes route and direct aliases with correct conditions, key filtering and list boundaries", async (t) => {
+  const { store, handler, key, site, app, mapping } = setupModelMapping(t);
+  store.updateApiKey(key.id, { models: ["gpt-5.6-sol"] });
+  for (const direct of [true, false]) for (const scoped of [true, false]) for (const format of ["openai", "anthropic"]) for (const project of ["project-a", "project-b"]) for (const projectHeader of ["x-samapi-project", "x-samapi-project-path", "x-samapi-project-name"]) {
+    const rule = mapping("model mapping", app.id, scoped ? [projectHeader === "x-samapi-project-name"
+      ? { source: "header", header: projectHeader, match: "exact", value: "project-a" }
+      : { source: "project", match: "exact", value: "project-a" }] : [], "gpt-5.6-sol");
+    store.updateSettings({ downstreamModelRules: [direct ? { ...rule, targetRouteId: undefined, targetSiteId: site.id, targetModel: "upstream-app" } : rule] });
+    const req = Object.assign(Readable.from([]), {
+      headers: {
+        authorization: `Bearer ${key.plainTextKey}`,
+        "x-samapi-project-path": projectHeader === "x-samapi-project-name" ? "/work/project-a" : project,
+        "x-samapi-project-name": projectHeader === "x-samapi-project-name" ? project : "project-a",
+        [projectHeader]: project
+      },
+      method: "GET", url: "/proxy/v1/models", socket: { remoteAddress: "127.0.0.1" }
+    });
+    const res = new ResponseRecorder();
+    await handler.handleProxy(req as unknown as http.IncomingMessage, res as unknown as http.ServerResponse, new URL(`http://localhost/proxy/v1/models?format=${format}`));
+    assert.equal(res.statusCode, 200);
+    const result = JSON.parse(res.text());
+    assert.deepEqual(result.data.map((item: { id: string }) => item.id), !scoped || project === "project-a" ? ["gpt-5.6-sol"] : []);
+    assert.equal(result.first_id, !scoped || project === "project-a" ? "gpt-5.6-sol" : null);
+    assert.equal(result.last_id, result.first_id);
+    const log = store.listRequestLogs()[0];
+    assert.equal(log.kind, "models");
+    assert.equal(log.messageCount, 0);
+    assert.equal(log.attemptCount, 0);
+  }
+});
+
+test("model endpoint logs remain separate for successful, invalid and unauthorized requests but exclude health checks", async (t) => {
+  const { store, handler, key } = setup(t);
+  globalThis.fetch = async () => { throw new Error("model listing must not request an upstream"); };
+  const cases = [
+    { method: "GET", pathname: "/proxy/models", status: 200 },
+    { method: "GET", pathname: "/proxy/v1/models", status: 200 },
+    { method: "GET", pathname: "/proxy/v1/models/", status: 200 },
+    { method: "GET", pathname: "/proxy/v1/models", status: 401, invalidKey: true },
+    { method: "POST", pathname: "/proxy/v1/models", status: 405 },
+    { method: "POST", pathname: "/proxy/v1/models", status: 400, body: "{" },
+    { method: "HEAD", pathname: "/proxy/v1/models", status: 200 }
+  ];
+  for (const [index, item] of cases.entries()) {
+    const req = Object.assign(Readable.from(item.body ? [item.body] : []), {
+      headers: {
+        authorization: `Bearer ${item.invalidKey ? "invalid" : key.plainTextKey}`, "x-samapi-turn-id": "shared-turn", "x-samapi-session-id": "shared-session",
+        "x-samapi-project-path": "/work/fixture", "x-samapi-project-name": "fixture"
+      },
+      method: item.method, url: item.pathname, socket: { remoteAddress: "127.0.0.1" }
+    });
+    const res = new ResponseRecorder();
+    await handler.handleProxy(req as unknown as http.IncomingMessage, res as unknown as http.ServerResponse, new URL(`http://localhost${item.pathname}`));
+    assert.equal(res.statusCode, item.status, res.text());
+    assert.equal(store.requestLogCount(), index + 1);
+    const summary = store.listRequestLogs()[0];
+    assert.equal(summary.kind, item.method === "HEAD" ? undefined : "models");
+    assert.deepEqual(store.getRequestLog(summary.id)?.msg, []);
+    assert.equal(summary.attemptCount, 0);
+  }
+});
+
+test("request stages follow body reception, upstream headers and immediate response forwarding for group and Codex routes", async (t) => {
+  for (const codex of [false, true]) for (const retryEnabled of [false, true]) {
+    await t.test(`${codex ? "Codex" : "group"}, ${retryEnabled ? "retry enabled" : "streaming"}`, { timeout: 3000 }, async (t) => {
+      const { store, handler, key, site } = setup(t);
+      store.updateSettings({ upstreamRetryCodeCounts: retryEnabled ? [{ statusCode: 599, count: 1 }] : [] });
+      const model = codex ? "codex-stages" : "group-stages";
+      if (codex) {
+        store.saveCodexOAuthAccount({ accessToken: "fixture-access", refreshToken: "fixture-refresh", accountId: "fixture-account", email: "fixture@example.invalid" });
+        store.createManagedAccountRoute("gpt", { name: model, model: "gpt-fixture" });
+      } else {
+        const group = store.getDb().providerApiKeyGroups.find((group) => group.siteId === site.id)!;
+        store.upsertRoute({ type: "group", name: model, endpoint: "responses", strategy: "stable-first", matchRule: "fixture-model",
+          members: [{ siteId: site.id, apiKeyId: group.apiKeys[0].id, model: "fixture-model" }], enabled: true });
+      }
+      const assertStage = (stage: RequestLogStage, attemptCount: number) => {
+        const summary = store.listRequestLogs()[0];
+        const log = store.getRequestLog(summary.id)!;
+        assert.equal(summary.result.stage, stage);
+        assert.equal(log.result.stage, stage);
+        assert.equal(log.calls[0].result.stage, stage);
+        assert.equal(summary.attemptCount, attemptCount);
+        assert.equal(log.calls[0].attempts.length, attemptCount);
+        if (attemptCount) assert.equal(log.calls[0].attempts.at(-1)?.result.stage, stage);
+        return log;
+      };
+      const verifyApiKey = store.verifyApiKey.bind(store);
+      t.mock.method(store, "verifyApiKey", (...args: Parameters<typeof store.verifyApiKey>) => {
+        assertStage("preparing-upstream", 0);
+        return verifyApiKey(...args);
+      });
+      let releaseHeaders!: (response: Response) => void;
+      const headers = new Promise<Response>((resolve) => { releaseHeaders = resolve; });
+      let markFetchStarted!: () => void;
+      const fetchStarted = new Promise<void>((resolve) => { markFetchStarted = resolve; });
+      let fetchCalls = 0;
+      globalThis.fetch = async (target) => {
+        fetchCalls++;
+        const log = assertStage("waiting-upstream", 1);
+        assert.equal(log.upstream?.url, String(target));
+        assert.equal(log.upstream?.account?.label, codex ? "fixture@example.invalid" : "fixture");
+        assert.ok(log.upstream?.account?.id);
+        assert.deepEqual(log.upstream?.userAgent, codex ? { value: CODEX_USER_AGENT, source: "codex" } : { source: "default" });
+        assert.equal(String(target), codex ? CODEX_BACKEND_RESPONSES_URL : "https://first.invalid/v1/responses");
+        markFetchStarted();
+        return headers;
+      };
+      const req = Object.assign(new Readable({ read() {} }), {
+        headers: {
+          authorization: `Bearer ${key.plainTextKey}`, "content-type": "application/json",
+          "x-samapi-project-path": "/work/fixture", "x-samapi-project-name": "fixture"
+        },
+        method: "POST", url: "/proxy/v1/responses", socket: { remoteAddress: "127.0.0.1" }
+      });
+      const res = new ResponseRecorder();
+      let markFirstWrite!: () => void;
+      const firstWrite = new Promise<void>((resolve) => { markFirstWrite = resolve; });
+      const write = res.write.bind(res);
+      res.write = (chunk) => { assertStage("forwarding-response", 1); markFirstWrite(); return write(chunk); };
+      const pending = handler.handleProxy(req as unknown as http.IncomingMessage, res as unknown as http.ServerResponse, new URL("http://localhost/proxy/v1/responses"));
+      req.push(`{"model":"${model}","stream":true,`);
+      await nextTick();
+      assertStage("receiving-request", 0);
+      assert.equal(fetchCalls, 0, "an incomplete downstream body must not start an upstream request");
+      req.push('"input":"analyse"}');
+      req.push(null);
+      await fetchStarted;
+      assertStage("waiting-upstream", 1);
+      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      releaseHeaders(new Response(new ReadableStream<Uint8Array>({ start(value) { controller = value; } }), { headers: { "content-type": "text/event-stream" } }));
+      await nextTick();
+      assertStage("receiving-upstream", 1);
+      assert.equal(res.headersSent, false);
+      const frame = (value: unknown) => controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(value)}\n\n`));
+      frame({ type: "response.created", response: { id: "resp-stages", status: "in_progress", output: [] } });
+      await nextTick();
+      assertStage("receiving-upstream", 1);
+      frame({ type: "response.output_text.delta", delta: "actual reply" });
+      await firstWrite;
+      assertStage("forwarding-response", 1);
+      assert.equal(res.headersSent, true, "useful output must be forwarded even when 599 retry is enabled");
+      frame({ type: "response.completed", response: { id: "resp-stages", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "actual reply" }] }] } });
+      await pending;
+      const summary = store.listRequestLogs()[0];
+      const log = store.getRequestLog(summary.id)!;
+      assert.equal(log.result.status, "success");
+      assert.equal(log.result.stage, undefined);
+      assert.equal(summary.result.stage, undefined);
+      assert.equal(log.calls[0].attempts[0].result.stage, undefined);
+      assert.equal(log.result.body, "actual reply");
+      assert.deepEqual(summary.upstream?.account, log.upstream?.account);
+      assert.equal(log.calls[0].attempts[0].upstream?.account?.label, codex ? "fixture@example.invalid" : "fixture");
+      assert.equal(fetchCalls, 1);
+      assert.equal(res.writableEnded, true);
+    });
+  }
+});
+
+test("retry backoff is a request stage and does not create an upstream attempt before the next fetch", { timeout: 3000 }, async (t) => {
+  const { store, request } = setup(t);
+  mockRetryTimers(t);
+  store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 503, count: 1 }] });
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    const summary = store.listRequestLogs()[0];
+    const log = store.getRequestLog(summary.id)!;
+    assert.equal(log.result.stage, "waiting-upstream");
+    assert.equal(log.result.statusCode, 0);
+    assert.equal(log.result.body, "");
+    assert.equal(log.calls[0].attempts.length, calls);
+    assert.equal(summary.attemptCount, calls);
+    return calls === 1 ? Response.json({ error: "unavailable" }, { status: 503 }) : Response.json({ choices: [{ message: { content: "recovered" } }] });
+  };
+  const pending = request({ model: "alias", messages: [{ role: "user", content: "retry" }] });
+  await nextTick();
+  const summary = store.listRequestLogs()[0];
+  const log = store.getRequestLog(summary.id)!;
+  assert.equal(log.result.stage, "waiting-retry");
+  assert.equal(summary.result.stage, "waiting-retry");
+  assert.equal(log.result.body, "");
+  assert.equal(log.calls[0].attempts.length, 1);
+  assert.equal(summary.attemptCount, 1);
+  assert.equal(log.calls[0].attempts[0].result.status, "failed");
+  assert.equal(calls, 1);
+  await finishWithRetryTimers(t, pending);
+  const completed = store.getRequestLog(summary.id)!;
+  assert.equal(completed.result.stage, undefined);
+  assert.deepEqual(completed.calls[0].attempts.map((attempt) => attempt.result.statusCode), [503, 200]);
+  assert.deepEqual(completed.calls[0].attempts.map((attempt) => attempt.upstream?.account?.label), ["fixture", "fixture"]);
+});
+
+test("saving an upstream switch during 599 backoff rebuilds the next request under the original log", { timeout: 3000 }, async (t) => {
+  const { store, request } = setup(t);
+  mockRetryTimers(t);
+  store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: 2 }] });
+  const route = store.getDb().routes.find((route) => route.name === "alias")!;
+  const nextSite = store.upsertSite({ name: "replacement", addresses: [{ id: "new", label: "new", baseUrl: "https://replacement.invalid/v1", enabled: true, models: [] }] });
+  store.upsertProviderApiKeyGroup({ siteId: nextSite.id, apiKeys: [{ label: "new", secret: "replacement-key", enabled: true, models: ["replacement-model"] }] });
+  const template = store.upsertHeaderTemplate({ name: "replacement", headersText: "User-Agent: replacement-client\nX-Upstream-Choice: replacement" });
+  const sent: Array<{ target: string; body: Record<string, unknown>; headers: Headers }> = [];
+  globalThis.fetch = async (target, init) => {
+    sent.push({ target: String(target), body: JSON.parse(String(init?.body)), headers: new Headers(init?.headers) });
+    return String(target).includes("first.invalid")
+      ? Response.json({ error: { message: "old upstream overloaded" } }, { status: 599 })
+      : Response.json({ id: "resp-new", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "new upstream reply" }] }] });
+  };
+  const pending = request({ model: "alias", messages: [{ role: "user", content: "keep this request" }] });
+  await nextTick();
+  const original = store.listRequestLogs()[0];
+  assert.equal(original.result.stage, "waiting-retry");
+  store.upsertRoute({ ...route, type: "switch", siteId: nextSite.id, model: "replacement-model", endpoint: "responses", headerTemplateId: template.id });
+  const response = await finishWithRetryTimers(t, pending);
+  assert.deepEqual(sent.map((attempt) => attempt.target), ["https://first.invalid/v1/chat/completions", "https://replacement.invalid/v1/responses"]);
+  assert.equal(sent[1].body.model, "replacement-model");
+  assert.ok(Array.isArray(sent[1].body.input), "the replacement endpoint must receive a newly converted request");
+  assert.equal(sent[1].headers.get("authorization"), "Bearer replacement-key");
+  assert.equal(sent[1].headers.get("x-upstream-choice"), "replacement");
+  assert.equal(response.statusCode, 200);
+  assert.match(response.text(), /new upstream reply/);
+  const log = store.getRequestLog(original.id)!;
+  assert.equal(store.requestLogCount(), 1);
+  assert.equal(log.calls.length, 1);
+  assert.deepEqual(log.calls[0].attempts.map((attempt) => [attempt.upstream?.url, attempt.result.statusCode]), [
+    [sent[0].target, 599], [sent[1].target, 200]
+  ]);
+  assert.equal(log.upstream?.provider, "replacement");
+  assert.equal(log.result.stage, undefined);
+  assert.deepEqual(log.calls[0].attempts.map((attempt) => attempt.upstream?.userAgent), [
+    { source: "default" },
+    { value: sent[1].headers.get("user-agent"), source: "template", template: { id: template.id, name: template.name } }
+  ]);
+  assert.deepEqual(log.upstream?.userAgent, log.calls[0].attempts[1].upstream?.userAgent);
+});
+
+test("logged User-Agent provenance matches forwarded headers and retains template names after edits", async (t) => {
+  for (const source of ["template", "downstream", "grok"] as const) await t.test(source, async (t) => {
+    const { store, sql, request } = setup(t);
+    const template = store.upsertHeaderTemplate({ name: "Original UA template", headersText: "User-Agent: claude-cli/1.0\nX-Template-Secret: fixture-template-secret" });
+    let route = store.getDb().routes.find((route) => route.name === "alias")!;
+    if (source === "grok") {
+      store.importTemporaryAccounts({ providerType: "grok", models: ["grok-fixture"], content: JSON.stringify({
+        type: "xai", name: "Grok fixture", access_token: "fixture-grok-access", refresh_token: "fixture-grok-refresh",
+        expired: "2099-01-01T00:00:00Z", base_url: "https://grok.invalid/v1"
+      }) });
+      route = store.createManagedAccountRoute("grok", { name: "grok-route", model: "grok-fixture" });
+    }
+    store.upsertRoute({ ...route, headerTemplateId: template.id });
+    const clientUa = source === "downstream" ? "claude-cli/2.0" : "fixture-client";
+    const expected = source === "grok" ? { value: "samapi-grok-oauth/1.0", source } : {
+      value: source === "template" ? "claude-cli/1.0" : clientUa, source, template: { id: template.id, name: template.name }
+    };
+    globalThis.fetch = async (_target, init) => {
+      assert.equal(new Headers(init?.headers).get("user-agent"), expected.value);
+      const pending = store.getRequestLog(store.listRequestLogs()[0].id)!;
+      assert.deepEqual(pending.upstream?.userAgent, expected, "the source must be saved before awaiting upstream headers");
+      return source === "grok"
+        ? Response.json({ id: "resp-grok", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }] })
+        : Response.json({ choices: [{ message: { content: "ok" } }] });
+    };
+    const result = await request({ model: route.name, messages: [{ role: "user", content: "User-Agent provenance" }] }, undefined, { "user-agent": clientUa });
+    assert.equal(result.statusCode, 200);
+    store.upsertHeaderTemplate({ ...template, name: "Renamed template", headersText: "User-Agent: replacement/1.0" });
+    const log = store.getRequestLog(store.listRequestLogs()[0].id)!;
+    assert.deepEqual(log.upstream?.userAgent, expected);
+    assert.deepEqual(log.calls[0].attempts[0].upstream?.userAgent, expected);
+    assert.equal(log.requestHeaders["user-agent"], clientUa);
+    assert.equal(JSON.stringify(sql.prepare("SELECT data_json FROM request_logs").all()).includes("fixture-template-secret"), false);
+  });
+});
+
+test("a switch during the final in-flight attempt uses the new upstream even after the old budget is exhausted", { timeout: 3000 }, async (t) => {
+  const { store, request } = setup(t);
+  mockRetryTimers(t);
+  store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: 1 }] });
+  const route = store.getDb().routes.find((route) => route.name === "alias")!;
+  const replacement = store.upsertSite({ name: "replacement", addresses: [{ id: "new", label: "new", baseUrl: "https://replacement.invalid/v1", enabled: true, models: [] }] });
+  store.upsertProviderApiKeyGroup({ siteId: replacement.id, apiKeys: [{ label: "new", secret: "replacement-key", enabled: true, models: ["replacement-model"] }] });
+  let releaseResponse!: (response: Response) => void;
+  const heldResponse = new Promise<Response>((resolve) => { releaseResponse = resolve; });
+  let markLastAttempt!: () => void;
+  const lastAttempt = new Promise<void>((resolve) => { markLastAttempt = resolve; });
+  const sent: string[] = [];
+  globalThis.fetch = async (target) => {
+    sent.push(String(target));
+    if (sent.length === 1) return Response.json({ error: "overloaded" }, { status: 599 });
+    if (sent.length === 2) { markLastAttempt(); return heldResponse; }
+    return Response.json({ choices: [{ message: { content: "replacement reply" } }] });
+  };
+  const pending = request({ model: "alias", messages: [{ role: "user", content: "switch while waiting" }] });
+  await nextTick();
+  t.mock.timers.tick(3000);
+  await lastAttempt;
+  store.upsertRoute({ ...route, type: "switch", siteId: replacement.id, model: "replacement-model" });
+  releaseResponse(Response.json({ error: "last old attempt failed" }, { status: 599 }));
+  const response = await finishWithRetryTimers(t, pending);
+  assert.deepEqual(sent, ["https://first.invalid/v1/chat/completions", "https://first.invalid/v1/chat/completions", "https://replacement.invalid/v1/chat/completions"]);
+  assert.equal(response.statusCode, 200);
+  const log = store.getRequestLog(store.listRequestLogs()[0].id)!;
+  assert.deepEqual(log.calls[0].attempts.map((attempt) => [attempt.upstream?.model, attempt.result.statusCode]), [["fixture-model", 599], ["fixture-model", 599], ["replacement-model", 200]]);
+});
+
+test("retry routing follows group selection, address edits and switches into or out of Codex accounts", async (t) => {
+  for (const kind of ["group", "address", "codex-account", "codex-provider", "provider-codex"] as const) {
+    await t.test(kind, { timeout: 3000 }, async (t) => {
+      const { store, request, site } = setup(t);
+      mockRetryTimers(t);
+      store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: 2 }] });
+      let route = store.getDb().routes.find((route) => route.name === "alias")!;
+      const nextSite = store.upsertSite({ name: "replacement", addresses: [{ id: "new", label: "new", baseUrl: "https://replacement.invalid/v1", enabled: true, models: [] }] });
+      const nextGroup = store.upsertProviderApiKeyGroup({ siteId: nextSite.id, apiKeys: [{ label: "new", secret: "replacement-key", enabled: true, models: ["replacement-model"] }] });
+      let expectedTarget = "https://replacement.invalid/v1/chat/completions";
+      let expectedKey = "Bearer replacement-key";
+      let expectedModel = "replacement-model";
+      let changeRoute!: () => void;
+      if (kind === "group") {
+        const oldGroup = store.getDb().providerApiKeyGroups.find((group) => group.siteId === site.id)!;
+        const before = { siteId: site.id, apiKeyId: oldGroup.apiKeys[0].id, model: "fixture-model" };
+        const after = { siteId: nextSite.id, apiKeyId: nextGroup.apiKeys[0].id, model: expectedModel };
+        route = store.upsertRoute({ type: "group", name: "group-switch", endpoint: "chat/completions", strategy: "specified", members: [before, after], specifiedMember: before });
+        changeRoute = () => { store.upsertRoute({ ...route, type: "group", specifiedMember: after }); };
+      } else if (kind === "address") {
+        expectedTarget = "https://changed.invalid/v1/chat/completions";
+        expectedKey = "Bearer fixture-upstream-key";
+        expectedModel = "fixture-model";
+        changeRoute = () => { store.upsertSite({ ...site, addresses: [{ ...site.addresses[0], baseUrl: "https://changed.invalid/v1", proxy: { mode: "custom", url: "http://127.0.0.1:12345" } }] }); };
+      } else {
+        const first = store.saveCodexOAuthAccount({ accessToken: "oauth-first", refreshToken: "refresh-first", accountId: "account-first" }).account;
+        const second = store.saveCodexOAuthAccount({ accessToken: "oauth-second", refreshToken: "refresh-second", accountId: "account-second" }).account;
+        store.setManagedAccountPolicy("gpt", { preferredAccountId: first.id });
+        const codexRoute = store.createManagedAccountRoute("gpt", { name: "codex-switch", model: "gpt-fixture" });
+        if (kind === "provider-codex") {
+          expectedTarget = CODEX_BACKEND_RESPONSES_URL;
+          expectedKey = "Bearer oauth-first";
+          expectedModel = "gpt-fixture";
+          changeRoute = () => { store.upsertRoute({ ...codexRoute, id: route.id, name: route.name }); };
+        } else {
+          route = codexRoute;
+          if (kind === "codex-account") {
+            expectedTarget = CODEX_BACKEND_RESPONSES_URL;
+            expectedKey = "Bearer oauth-second";
+            expectedModel = "gpt-fixture";
+            changeRoute = () => { store.setManagedAccountPolicy("gpt", { preferredAccountId: second.id }); };
+          } else {
+            changeRoute = () => { store.upsertRoute({ ...route, type: "switch", siteId: nextSite.id, model: expectedModel, endpoint: "chat/completions" }); };
+          }
+        }
+      }
+      const sent: Array<{ target: string; authorization: string | null; model: string; proxied: boolean }> = [];
+      globalThis.fetch = async (target, init) => {
+        sent.push({ target: String(target), authorization: new Headers(init?.headers).get("authorization"), model: JSON.parse(String(init?.body)).model, proxied: Boolean((init as RequestInit & { dispatcher?: unknown })?.dispatcher) });
+        if (sent.length === 1) return Response.json({ error: { message: "overloaded" } }, { status: 599 });
+        if (String(target) === CODEX_BACKEND_RESPONSES_URL) {
+          return new Response(`data: ${JSON.stringify({ type: "response.completed", response: { id: "resp-switch", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "switched upstream" }] }] } })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+        }
+        return Response.json({ choices: [{ message: { content: "switched upstream" } }] });
+      };
+      const pending = request({ model: route.name, messages: [{ role: "user", content: "keep the active request" }] });
+      await nextTick();
+      const original = store.listRequestLogs()[0];
+      assert.equal(original.result.stage, "waiting-retry");
+      changeRoute();
+      const response = await finishWithRetryTimers(t, pending);
+      assert.equal(sent.length, 2);
+      assert.equal(sent[1].target, expectedTarget);
+      assert.equal(sent[1].authorization, expectedKey);
+      assert.equal(sent[1].model, expectedModel);
+      assert.equal(sent[1].proxied, kind === "address");
+      assert.equal(response.statusCode, 200);
+      assert.match(response.text(), /switched upstream/);
+      const log = store.getRequestLog(original.id)!;
+      assert.equal(log.calls.length, 1);
+      assert.equal(store.requestLogCount(), 1);
+      assert.deepEqual(log.calls[0].attempts.map((attempt) => attempt.result.statusCode), [599, 200]);
+      assert.equal(log.upstream?.url, expectedTarget);
+    });
+  }
+});
+
+test("disabling or deleting a route during retry backoff prevents another request to the old upstream", async (t) => {
+  for (const remove of [false, true]) await t.test(remove ? "delete" : "disable", { timeout: 2000 }, async (t) => {
+    const { store, request } = setup(t);
+    mockRetryTimers(t);
+    store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: 2 }] });
+    let calls = 0;
+    globalThis.fetch = async () => { calls++; return Response.json({ error: "overloaded" }, { status: 599 }); };
+    const pending = request({ model: "alias", messages: [{ role: "user", content: "stop the route" }] });
+    await nextTick();
+    const route = store.getDb().routes.find((route) => route.name === "alias")!;
+    if (remove) store.deleteRoute(route.id);
+    else store.upsertRoute({ ...route, enabled: false });
+    const response = await finishWithRetryTimers(t, pending);
+    assert.equal(calls, 1);
+    assert.equal(response.statusCode, 502);
+    assert.match(response.text(), /路由不存在或已停用/);
+    assert.equal(store.listRequestLogs()[0].result.status, "failed");
+    assert.equal(store.listRequestLogs()[0].result.stage, undefined);
+  });
+});
+
+test("unrelated settings and account quota updates preserve the current target and retry budget", { timeout: 3000 }, async (t) => {
+  const { store, request } = setup(t);
+  mockRetryTimers(t);
+  store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: 2 }] });
+  const first = store.saveCodexOAuthAccount({ accessToken: "oauth-fixed", refreshToken: "refresh-fixed", accountId: "account-fixed" }).account;
+  store.saveCodexOAuthAccount({ accessToken: "oauth-spare", refreshToken: "refresh-spare", accountId: "account-spare" });
+  store.setManagedAccountPolicy("gpt", { preferredAccountId: first.id });
+  const route = store.createManagedAccountRoute("gpt", { name: "fixed-retry", model: "gpt-fixture" });
+  const sent: Array<string | null> = [];
+  globalThis.fetch = async (_target, init) => {
+    sent.push(new Headers(init?.headers).get("authorization"));
+    return Response.json({ error: "overloaded" }, { status: 599 });
+  };
+  const pending = request({ model: route.name, messages: [{ role: "user", content: "keep retrying" }] });
+  await nextTick();
+  store.updateSettings({ maxRequestLogs: 50 });
+  store.updateTemporaryAccountCheckResult(first.id, { availability: "available", lastQuotaCheckedAt: new Date().toISOString(), quotaStages: [{ label: "quota", remaining: 50 }] });
+  store.upsertRoute({ ...route });
+  await finishWithRetryTimers(t, pending);
+  assert.deepEqual(sent.slice(0, 3), Array(3).fill("Bearer oauth-fixed"));
+  assert.equal(sent.length, 6, "each of the two accounts keeps its original initial attempt plus two retries");
+  assert.deepEqual(sent.slice(3), Array(3).fill("Bearer oauth-spare"));
+});
 
 test("proxy end-to-end records shared user turns and original upstream answer without changing forwarding", async (t) => {
   const { store, sql, request } = setup(t);
@@ -172,6 +885,8 @@ test("client disconnection during an idle stream releases upstream and records c
   assert.equal(upstreamCancelled, true);
   assert.equal(store.listRequestLogs()[0].result.status, "cancelled");
   assert.equal(store.listRequestLogs()[0].result.statusCode, 499);
+  assert.equal(store.listRequestLogs()[0].result.stage, undefined);
+  assert.equal(store.getRequestLog(store.listRequestLogs()[0].id)?.calls[0].result.stage, undefined);
 });
 
 test("configured HTTP retries bill each actual response once under the original downstream request", { timeout: 10000 }, async (t) => {
@@ -189,6 +904,94 @@ test("configured HTTP retries bill each actual response once under the original 
   assert.equal(store.getRequestLog(store.listRequestLogs()[0].id)?.calls[0].attempts.length, 2);
   const totals = store.usageReport().totals;
   assert.equal(totals.requests, 2); assert.equal(totals.downstreamRequests, 1); assert.equal(totals.totalTokens, 22); assert.equal(totals.missingUsageRequests, 0);
+});
+
+test("custom fixed retry intervals apply to HTTP, transport, streamed errors and Codex", async (t) => {
+  for (const kind of ["HTTP", "transport", "stream", "Codex HTTP", "Codex stream"]) await t.test(kind, { timeout: 2000 }, async (t) => {
+    const { store, request } = setup(t);
+    mockRetryTimers(t);
+    const codex = kind.startsWith("Codex");
+    const stream = kind.includes("stream");
+    if (codex) {
+      store.saveCodexOAuthAccount({ accessToken: "fixture-delay-access", refreshToken: "fixture-delay-refresh", accountId: "fixture-delay-account" });
+      store.createManagedAccountRoute("gpt", { name: "delay-codex", model: "gpt-fixture" });
+    }
+    store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 503, count: 1 }, { statusCode: 599, count: 1 }], upstreamRetryDelay: { mode: "fixed", seconds: 2.5 } });
+    let calls = 0;
+    globalThis.fetch = async () => {
+      const failed = ++calls === 1;
+      if (failed && kind === "transport") throw new TypeError("fetch failed");
+      if (failed && !stream) return Response.json({ error: "busy" }, { status: 503 });
+      if (codex) {
+        const payload = failed
+          ? { type: "response.failed", response: { status: "failed", error: { message: "overloaded" } } }
+          : { type: "response.completed", response: { id: "resp-delay", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "recovered" }] }] } };
+        const delta = failed ? "" : 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"msg-delay","output_index":0,"content_index":0,"delta":"recovered"}\n\n';
+        return new Response(`${delta}event: ${payload.type}\ndata: ${JSON.stringify(payload)}\n\n`, { headers: { "content-type": "text/event-stream" } });
+      }
+      if (stream) return new Response(failed ? 'event: error\ndata: {"error":{"message":"overloaded"}}\n\n'
+        : 'data: {"choices":[{"delta":{"content":"recovered"}}]}\n\ndata: [DONE]\n\n', { headers: { "content-type": "text/event-stream" } });
+      return Response.json({ choices: [{ message: { content: "recovered" } }] });
+    };
+    const pending = request({ model: codex ? "delay-codex" : "alias", stream, messages: [{ role: "user", content: "custom retry delay" }] });
+    await waitForRetryDelay(store, 1);
+    assert.equal(calls, 1);
+    t.mock.timers.tick(2499); await nextTick();
+    assert.equal(calls, 1, "must not retry before the configured interval");
+    t.mock.timers.tick(1); await nextTick();
+    assert.equal(calls, 2, "must retry at the configured interval");
+    const result = await pending;
+    assert.equal(result.statusCode, 200, result.text());
+    assert.match(result.text(), /recovered/);
+  });
+});
+
+test("custom random intervals draw a fresh wait within the range for each retry", { timeout: 2000 }, async (t) => {
+  const { store, request } = setup(t);
+  mockRetryTimers(t);
+  store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 503, count: 2 }], upstreamRetryDelay: { mode: "random", minSeconds: 0.01, maxSeconds: 0.03 } });
+  let draws = 0;
+  t.mock.method(Math, "random", () => draws++ === 0 ? 0 : 0.999999);
+  let calls = 0;
+  globalThis.fetch = async () => ++calls <= 2 ? Response.json({ error: "busy" }, { status: 503 }) : Response.json({ choices: [{ message: { content: "recovered" } }] });
+  const pending = request({ model: "alias", messages: [{ role: "user", content: "random retry delay" }] });
+  await waitForRetryDelay(store, 1);
+  t.mock.timers.tick(9); await nextTick(); assert.equal(calls, 1);
+  t.mock.timers.tick(1); await waitForRetryDelay(store, 2); assert.equal(calls, 2);
+  t.mock.timers.tick(29); await nextTick(); assert.equal(calls, 2);
+  t.mock.timers.tick(1); await nextTick(); assert.equal(calls, 3);
+  assert.equal((await pending).statusCode, 200);
+  assert.equal(draws, 2);
+});
+
+test("immediate and zero-duration rules retry without advancing the clock", async (t) => {
+  for (const delay of [{ mode: "immediate" }, { mode: "fixed", seconds: 0 }, { mode: "random", minSeconds: 0, maxSeconds: 0 }] as const) {
+    await t.test(delay.mode, { timeout: 1000 }, async (t) => {
+      const { store, request } = setup(t);
+      mockRetryTimers(t);
+      store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 503, count: 2 }], upstreamRetryDelay: delay });
+      let calls = 0;
+      globalThis.fetch = async () => ++calls <= 2 ? Response.json({ error: "busy" }, { status: 503 }) : Response.json({ choices: [{ message: { content: "recovered" } }] });
+      assert.equal((await request({ model: "alias", messages: [{ role: "user", content: "immediate retry" }] })).statusCode, 200);
+      assert.equal(calls, 3);
+    });
+  }
+});
+
+test("a long retry interval does not delay failover after the configured budget is exhausted", { timeout: 2000 }, async (t) => {
+  const { store, request } = setup(t, true);
+  mockRetryTimers(t);
+  store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 503, count: 1 }], upstreamRetryDelay: { mode: "fixed", seconds: 3600 } });
+  const hosts: string[] = [];
+  globalThis.fetch = async (target) => {
+    hosts.push(new URL(String(target)).hostname);
+    return hosts.at(-1) === "first.invalid" ? Response.json({ error: "busy" }, { status: 503 }) : Response.json({ choices: [{ message: { content: "fallback" } }] });
+  };
+  const pending = request({ model: "alias", messages: [{ role: "user", content: "retry then fail over" }] });
+  await waitForRetryDelay(store, 1);
+  t.mock.timers.tick(3600000);
+  assert.equal((await pending).statusCode, 200);
+  assert.deepEqual(hosts, ["first.invalid", "first.invalid", "second.invalid"]);
 });
 
 test("599 retries transport failures the configured number of times without inventing usage", { timeout: 10000 }, async (t) => {
@@ -390,13 +1193,14 @@ test("sharedchat-style metadata does not bypass configured 599 retries on Respon
     assert.equal(totals.requests, 3);
     assert.equal(totals.downstreamRequests, 1);
     assert.equal(totals.totalTokens, recovers ? 12 : 0);
-    assert.equal(totals.missingUsageRequests, recovers ? 2 : 3);
+    assert.equal(totals.missingUsageRequests, 0);
+    assert.equal(totals.estimatedRequests, recovers ? 2 : 3);
   });
 });
 
-test("599 never replays a stream after forwarding partial output", { timeout: 2000 }, async (t) => {
+test("disabling 599 retries keeps immediate streaming after partial output", { timeout: 2000 }, async (t) => {
   const { store, request } = setup(t);
-  store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: 10 }] });
+  store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: 0 }] });
   let calls = 0;
   let controller!: ReadableStreamDefaultController<Uint8Array>;
   globalThis.fetch = async () => {
@@ -413,6 +1217,159 @@ test("599 never replays a stream after forwarding partial output", { timeout: 20
   assert.equal(result.text().split("partial answer").length - 1, 1);
   assert.equal(store.listRequestLogs()[0].result.statusCode, 599);
   assert.equal(store.getRequestLog(store.listRequestLogs()[0].id)!.calls[0].attempts[0].result.streamStartedWith, "data");
+});
+
+test("logged Codex overload after reasoning keeps partial output live while retrying the later request", async (t) => {
+  for (const recovers of [true, false]) await t.test(recovers ? "recovers on retry 100" : "exhausts retry 100", { timeout: 10000 }, async (t) => {
+    const { store, request } = setup(t);
+    mockRetryTimers(t);
+    const retries = 100;
+    store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: retries }] });
+    store.saveCodexOAuthAccount({ accessToken: "fixture-codex-access", refreshToken: "fixture-codex-refresh", accountId: "fixture-chatgpt-account", email: "fixture@example.invalid" });
+    store.createManagedAccountRoute("gpt", { name: "gpt-late-overload", model: "gpt-fixture" });
+    let calls = 0;
+    let cancelled = 0;
+    let downstream!: ResponseRecorder;
+    const sse = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
+    globalThis.fetch = async (target) => {
+      assert.equal(String(target), "https://chatgpt.com/backend-api/codex/responses");
+      const attempt = ++calls;
+      assert.equal(downstream.headersSent, attempt > 2, "the second request starts streaming before its retry attempts");
+      if (attempt <= 2) assert.equal(downstream.text(), "");
+      const succeeds = attempt === 1 || (recovers && attempt === retries + 2);
+      const answer = attempt === 1 ? "earlier response" : "recovered response";
+      const frames = [sse({ type: "response.created", response: { id: `resp_${attempt}`, output: [] } }),
+        sse({ type: "response.reasoning_summary_text.delta", delta: succeeds ? "successful reasoning" : `discarded reasoning ${attempt}` })];
+      frames.push(...(succeeds ? [
+        sse({ type: "response.output_text.delta", delta: answer }),
+        sse({ type: "response.completed", response: { id: `resp_${attempt}`, status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: answer }] }], usage: { input_tokens: 10, output_tokens: 2 } } })
+      ] : [sse({ type: "error", error: { code: "server_is_overloaded", message: "Our servers are currently overloaded. Please try again later." } })]));
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const text of frames) controller.enqueue(new TextEncoder().encode(text));
+          if (!succeeds) controller.close();
+        },
+        cancel() { cancelled++; }
+      }));
+    };
+    const headers = { "session-id": "fixture-late-session", "x-samapi-turn-id": "fixture-late-turn", "user-agent": CODEX_USER_AGENT };
+    const body = { model: "gpt-late-overload", stream: true, input: "continue this turn" };
+    const first = await finishWithRetryTimers(t, request(body, (response) => { downstream = response; }, headers, "/proxy/v1/responses"));
+    assert.match(first.text(), /earlier response/);
+    const logId = store.listRequestLogs()[0].id;
+    const result = await finishWithRetryTimers(t, request(body, (response) => { downstream = response; }, headers, "/proxy/v1/responses"), retries * 8 + 40);
+    assert.equal(calls, retries + 2);
+    assert.ok(cancelled >= 1, "finished or failed attempts release their upstream streams");
+    assert.equal(result.statusCode, 200, "headers were committed by the first useful frame");
+    assert.match(result.text(), /discarded reasoning 2/);
+    assert.doesNotMatch(result.text(), /server_is_overloaded/);
+    if (recovers) {
+      assert.match(result.text(), /recovered response/);
+      assert.equal((result.text().match(/"type":"response.created"/g) || []).length, 1);
+    }
+    const log = store.getRequestLog(logId)!;
+    assert.equal(store.requestLogCount(), 1);
+    assert.equal(log.calls.length, 2);
+    assert.deepEqual(log.calls[1].attempts.map((attempt) => attempt.result.statusCode), [
+      ...Array<number>(retries).fill(599), ...(recovers ? [200] : [])
+    ]);
+    assert.equal(store.usageReport().totals.requests, calls);
+    assert.equal(store.usageReport().totals.missingUsageRequests, 0);
+    assert.equal(store.usageReport().totals.estimatedRequests, recovers ? retries : retries + 1);
+  });
+});
+
+test("configured 599 retries suppress late errors and continue raw or converted streams without delaying output", async (t) => {
+  const sse = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
+  const fixtures = [
+    {
+      endpoint: "chat/completions" as const,
+      prefix: sse({ choices: [{ delta: { content: "discarded answer", tool_calls: [{ index: 0, id: "discarded_tool", function: { name: "discarded_action", arguments: "{}" } }] } }] }),
+      success: sse({ choices: [{ delta: { content: "recovered answer" } }] }) + sse({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 2 } }) + "data: [DONE]\n\n"
+    },
+    {
+      endpoint: "responses" as const,
+      prefix: sse({ type: "response.reasoning_summary_text.delta", delta: "discarded reasoning" })
+        + sse({ type: "response.output_item.added", output_index: 0, item: { id: "discarded_item", type: "function_call", call_id: "discarded_tool", name: "discarded_action", arguments: "{}" } }),
+      success: sse({ type: "response.output_text.delta", item_id: "msg_recovered", output_index: 0, content_index: 0, delta: "recovered answer" })
+        + sse({ type: "response.completed", response: { id: "resp_recovered", object: "response", status: "completed", model: "fixture-model", output: [{ id: "msg_recovered", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "recovered answer", annotations: [] }] }], usage: { input_tokens: 10, output_tokens: 2 } } })
+    },
+    {
+      endpoint: "messages" as const,
+      prefix: sse({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "discarded thinking" } })
+        + sse({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "discarded_tool", name: "discarded_action", input: {} } }),
+      success: sse({ type: "message_start", message: { id: "msg_recovered", type: "message", role: "assistant", content: [], model: "fixture-model", usage: { input_tokens: 10, output_tokens: 0 } } })
+        + sse({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
+        + sse({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "recovered answer" } })
+        + sse({ type: "content_block_stop", index: 0 })
+        + sse({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } }) + sse({ type: "message_stop" })
+    }
+  ];
+  for (const fixture of fixtures) for (const fallback of [false, true]) {
+    await t.test(`${fixture.endpoint}, ${fallback ? "fallback after budget exhaustion" : "same target recovery"}`, { timeout: 3000 }, async (t) => {
+      const { store, request } = setup(t, fallback);
+      mockRetryTimers(t);
+      store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: fallback ? 2 : 3 }] });
+      store.upsertRoute({ ...store.getDb().routes[0], endpoint: fixture.endpoint });
+      let calls = 0;
+      let downstream!: ResponseRecorder;
+      globalThis.fetch = async (target) => {
+        const attempt = ++calls;
+        assert.equal(downstream.headersSent, attempt > 1, "the first useful frame commits the downstream response before a retry starts");
+        assert.match(String(target), /first\.invalid/);
+        if (attempt === 4) return new Response(fixture.success);
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(fixture.prefix));
+            if (attempt === 1) controller.enqueue(new TextEncoder().encode('event: error\ndata: {"message":"late overload"}\n\n'));
+            if (attempt === 3) controller.close();
+          },
+          pull(controller) { if (attempt === 2) controller.error(new TypeError("terminated after output")); }
+        }, { highWaterMark: 0 }));
+      };
+      // Responses/Claude continue through the same converter after a retry.
+      const result = await finishWithRetryTimers(t, request({ model: "alias", stream: true, max_tokens: 1024, messages: [{ role: "user", content: "recover without duplicated actions" }] }, (response) => { downstream = response; }));
+      assert.equal(calls, fallback ? 3 : 4);
+      assert.equal(result.statusCode, 200);
+      assert.match(result.text(), /discarded/, "partial output from failed attempts is delivered immediately");
+      if (fallback) assert.doesNotMatch(result.text(), /recovered answer/);
+      else assert.match(result.text(), /recovered answer/);
+      assert.doesNotMatch(result.text(), /late overload|terminated/);
+      const log = store.getRequestLog(store.listRequestLogs()[0].id)!;
+      assert.deepEqual(log.calls[0].attempts.map((attempt) => attempt.result.statusCode), fallback ? [599, 599] : [599, 599, 599, 200]);
+      const usage = store.usageReport().totals;
+      assert.equal(usage.requests, fallback ? 3 : 4);
+      assert.equal(usage.totalTokens - usage.estimatedTotalTokens, fallback ? 0 : 12);
+      assert.ok(usage.estimatedInputTokens > 0);
+      assert.ok(usage.estimatedOutputTokens > 0, "partial generation is included as an explicit estimate");
+      assert.equal(usage.missingUsageRequests, 0);
+      assert.equal(usage.estimatedRequests, 3);
+    });
+  }
+});
+
+test("client cancellation after streamed reasoning stops immediately without spending the 599 budget", { timeout: 1000 }, async (t) => {
+  const { store, request } = setup(t);
+  store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: 100 }, { statusCode: 499, count: 1 }] });
+  let calls = 0;
+  let cancelled = false;
+  let downstream!: ResponseRecorder;
+  let timer: ReturnType<typeof setTimeout>;
+  t.after(() => clearTimeout(timer));
+  globalThis.fetch = async () => {
+    calls++;
+    timer = setTimeout(() => downstream.destroy(), 20);
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"reasoning_content":"still thinking"}}]}\n\n')); },
+      cancel() { cancelled = true; }
+    }));
+  };
+  await request({ model: "alias", stream: true, messages: [{ role: "user", content: "cancel buffered reasoning" }] }, (response) => { downstream = response; });
+  assert.equal(calls, 1);
+  assert.equal(cancelled, true);
+  assert.equal(downstream.headersSent, true);
+  assert.match(downstream.text(), /still thinking/);
+  assert.equal(store.listRequestLogs()[0].result.statusCode, 499);
 });
 
 test("599 exhausts its configured budget on the same target before failing over", async (t) => {
@@ -509,9 +1466,9 @@ test("599 retries header timeouts and streams terminated before any output", asy
   });
 });
 
-test("599 backoff stops immediately when the client cancels, even with 499 retries configured", { timeout: 1000 }, async (t) => {
+test("a custom hour-long 599 backoff stops immediately when the client cancels, even with 499 retries configured", { timeout: 1000 }, async (t) => {
   const { store, request } = setup(t);
-  store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: 10 }, { statusCode: 499, count: 1 }] });
+  store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: 10 }, { statusCode: 499, count: 1 }], upstreamRetryDelay: { mode: "fixed", seconds: 3600 } });
   let calls = 0;
   let downstream!: ResponseRecorder;
   let timer: ReturnType<typeof setTimeout>;
@@ -532,7 +1489,7 @@ test("599 retries Codex response.failed for streaming and non-streaming clients"
     const { store, request } = setup(t);
     mockRetryTimers(t);
     store.updateSettings({ upstreamRetryCodeCounts: [{ statusCode: 599, count: 1 }] });
-    store.saveCodexOAuthAccount({ accessToken: "fixture-codex-access", refreshToken: "fixture-codex-refresh", accountId: "fixture-chatgpt-account", email: "fixture@example.invalid" });
+    const { account } = store.saveCodexOAuthAccount({ accessToken: "fixture-codex-access", refreshToken: "fixture-codex-refresh", accountId: "fixture-chatgpt-account", email: "fixture@example.invalid" });
     store.createManagedAccountRoute("gpt", { name: "gpt-oauth-route", model: "gpt-fixture" });
     let calls = 0;
     let cancelled = 0;
@@ -560,6 +1517,10 @@ test("599 retries Codex response.failed for streaming and non-streaming clients"
     assert.match(result.text(), /Codex recovered/);
     assert.doesNotMatch(result.text(), /Codex overloaded|response.failed/);
     assert.deepEqual(store.getRequestLog(store.listRequestLogs()[0].id)!.calls[0].attempts.map((attempt) => attempt.result.statusCode), [599, 200]);
+    const log = store.getRequestLog(store.listRequestLogs()[0].id)!;
+    assert.deepEqual(log.calls[0].attempts.map((attempt) => attempt.upstream?.account), [
+      { id: account.id, label: "fixture@example.invalid" }, { id: account.id, label: "fixture@example.invalid" }
+    ]);
     const totals = store.usageReport().totals;
     assert.equal(totals.requests, 2); assert.equal(totals.downstreamRequests, 1); assert.equal(totals.totalTokens, 13);
   });
@@ -823,8 +1784,8 @@ test("a running stream exposes partial progress before completion and updates th
   assert.equal(store.usageReport().totals.totalTokens, 5);
 });
 
-test("managed Claude accounts use native auth and protocol, fail over on invalid credentials, and attribute usage to the client", async (t) => {
-  const { store, request } = setup(t);
+test("managed Claude accounts use native auth and protocol, fail over without disabling credentials, and attribute usage to the client", async (t) => {
+  const { store, sql, request } = setup(t);
   const first = store.createManagedAccount({ provider: "claude", label: "first", secret: "fixture-claude-first", models: ["claude-fixture"] });
   const second = store.createManagedAccount({ provider: "claude", label: "second", secret: "fixture-claude-second", models: ["claude-fixture"] });
   store.createManagedAccountRoute("claude", { name: "claude-route", model: "claude-fixture" });
@@ -842,10 +1803,66 @@ test("managed Claude accounts use native auth and protocol, fail over on invalid
   assert.equal(result.statusCode, 200);
   assert.equal(JSON.parse(result.text()).choices[0].message.content, "Claude fixture reply");
   assert.deepEqual(keys, ["fixture-claude-first", "fixture-claude-second"]);
-  assert.equal(store.temporaryAccountCheckTarget(first.id)?.account.availability, "unavailable");
+  assert.equal(store.temporaryAccountCheckTarget(first.id)?.account.availability, "unknown");
   assert.equal(store.temporaryAccountCheckTarget(second.id)?.account.availability, "available");
   const usage = store.usageReport();
   assert.equal(usage.totals.requests, 2); assert.equal(usage.totals.downstreamRequests, 1); assert.equal(usage.totals.totalTokens, 133); assert.equal(usage.clients[0].apiKeyName, "fixture-client");
+  const summary = store.listRequestLogs()[0];
+  store.updateManagedAccount(second.id, { label: "renamed second" });
+  store.deleteTemporaryAccount(first.id);
+  const log = store.getRequestLog(summary.id)!;
+  assert.deepEqual(log.upstream?.account, { id: second.id, label: "second" });
+  assert.deepEqual(summary.upstream?.account, log.upstream?.account);
+  assert.deepEqual(log.calls[0].attempts.map((attempt) => attempt.upstream?.account), [
+    { id: first.id, label: "first" }, { id: second.id, label: "second" }
+  ]);
+  const stored = JSON.stringify(sql.prepare("SELECT data_json FROM request_logs").all());
+  assert.equal(stored.includes("fixture-claude-first"), false);
+  assert.equal(stored.includes("fixture-claude-second"), false);
+});
+
+test("account failover preserves ordinary failures and excludes explicit quota exhaustion from future requests", async (t) => {
+  const failures = [
+    { name: "authentication", status: 401, error: { message: "Unauthorized" }, exhausted: false },
+    { name: "rate limit", status: 429, error: { code: "rate_limit_exceeded", message: "Too many requests" }, exhausted: false },
+    { name: "quota code", status: 429, error: { code: "insufficient_quota", message: "Check your plan." }, exhausted: true },
+    { name: "usage limit type", status: 429, error: { type: "usage_limit_reached", message: "Please try again later." }, exhausted: true },
+    { name: "balance", status: 402, error: { message: "Insufficient Balance" }, exhausted: true }
+  ];
+  for (const codex of [false, true]) for (const failure of failures) await t.test(`${codex ? "Codex" : "API key"}: ${failure.name}`, async (t) => {
+    const { store, request } = setup(t);
+    store.updateSettings({ upstreamRetryCodeCounts: [] });
+    const addAccount = (name: string) => codex
+      ? store.saveCodexOAuthAccount({ accessToken: `fixture-status-${name}`, refreshToken: `fixture-refresh-${name}`, accountId: `fixture-account-${name}` }).account
+      : store.createManagedAccount({ provider: "gpt", label: name, secret: `fixture-status-${name}`, models: ["gpt-fixture"] });
+    const first = addAccount("first");
+    const second = addAccount("second");
+    store.updateTemporaryAccountCheckResult(first.id, { availability: "available", quotaStages: [{ label: "quota", remaining: 10 }] });
+    store.setManagedAccountPolicy("gpt", { preferredAccountId: first.id });
+    const route = store.createManagedAccountRoute("gpt", { name: "status-route", model: "gpt-fixture" });
+    const sent: string[] = [];
+    globalThis.fetch = async (_target, init) => {
+      const authorization = new Headers(init?.headers).get("authorization");
+      assert.ok(authorization === "Bearer fixture-status-first" || authorization === "Bearer fixture-status-second");
+      sent.push(authorization.endsWith("-first") ? "first" : "second");
+      if (sent.length === 1) return Response.json({ error: failure.error }, { status: failure.status });
+      if (codex) {
+        const response = { id: "resp-status", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "recovered" }] }] };
+        return new Response(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+      }
+      return Response.json({ choices: [{ message: { role: "assistant", content: "recovered" } }] });
+    };
+    const result = await request({ model: route.name, messages: [{ role: "user", content: "first request" }] });
+    assert.equal(result.statusCode, 200);
+    assert.deepEqual(sent, ["first", "second"]);
+    assert.equal(store.temporaryAccountCheckTarget(first.id)?.account.availability, failure.exhausted ? "unavailable" : "available");
+    const log = store.getRequestLog(store.listRequestLogs()[0].id)!;
+    assert.deepEqual(log.calls[0].attempts.map((attempt) => attempt.result.statusCode), [failure.status, 200]);
+    assert.deepEqual(log.calls[0].attempts.map((attempt) => attempt.upstream?.account?.id), [first.id, second.id]);
+    const next = await request({ model: route.name, messages: [{ role: "user", content: "next request" }] });
+    assert.equal(next.statusCode, 200);
+    assert.deepEqual(sent, ["first", "second", failure.exhausted ? "second" : "first"]);
+  });
 });
 
 test("managed DeepSeek requests follow the selected account and preserve OpenAI-compatible billing", async (t) => {
@@ -861,6 +1878,7 @@ test("managed DeepSeek requests follow the selected account and preserve OpenAI-
   };
   const result = await request({ model: "deepseek-route", messages: [{ role: "user", content: "test default account" }] });
   assert.equal(result.statusCode, 200); assert.equal(store.usageReport().totals.totalTokens, 105); assert.equal(store.usageReport().totals.cachedInputTokens, 80);
+  assert.deepEqual(store.listRequestLogs()[0].upstream?.account, { id: second.id, label: "second" });
 });
 
 test("managed Claude streaming converts to client Chat SSE and records final usage instead of initial output counts", async (t) => {
@@ -901,4 +1919,28 @@ test("existing GPT OAuth accounts retain Codex routing and contribute Responses 
   assert.equal(store.usageReport().totals.totalTokens, 13);
   assert.equal(store.usageReport().clients[0].apiKeyName, "fixture-client");
   assert.equal(cancelled, true);
+});
+
+test("proxy billing uses upstream cache-write usage and the actual response service tier", async (t) => {
+  const { store, sql, request } = setup(t);
+  const source = { id: "fixture", name: "Fixture", url: "https://example.com/pricing" };
+  store.saveOfficialModelPrices([{ providerId: "", model: "fixture-model", inputUsdPerMillion: 2, cachedInputUsdPerMillion: 0.5, cacheWriteUsdPerMillion: 2.5, outputUsdPerMillion: 8,
+    source, serviceTiers: { priority: { inputUsdPerMillion: 4, cachedInputUsdPerMillion: 1, cacheWriteUsdPerMillion: 5, outputUsdPerMillion: 16 } } }],
+    { ...source, status: "success", modelCount: 1, lastSuccessAt: "2026-09-11T00:00:00Z" });
+  let tier = "priority";
+  globalThis.fetch = async (_target, init) => {
+    assert.equal(JSON.parse(String(init?.body)).service_tier, "fast");
+    return Response.json({ choices: [{ message: { role: "assistant", content: "Done." } }], service_tier: tier,
+      usage: { prompt_tokens: 100, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 30, cache_write_tokens: 20 } } });
+  };
+  const body = { model: "alias", service_tier: "fast", messages: [{ role: "user", content: "test billing" }] };
+  assert.equal((await request(body)).statusCode, 200);
+  tier = "default";
+  assert.equal((await request(body)).statusCode, 200);
+  const records = sql.prepare("SELECT service_tier, cache_write_input_tokens, cost_nano FROM usage_records ORDER BY created_at").all();
+  assert.deepEqual(records, [
+    { service_tier: "priority", cache_write_input_tokens: 20, cost_nano: 490000 },
+    { service_tier: "default", cache_write_input_tokens: 20, cost_nano: 245000 }
+  ]);
+  assert.equal(store.usageReport().totals.totalTokens, 220);
 });

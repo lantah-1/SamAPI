@@ -23,6 +23,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, api, isUnauthorizedError } from "./api";
+import { modelRuleTargetAvailable } from "../shared/model-rules";
 import type {
   ApiKeyCreated,
   AppSettings,
@@ -46,14 +47,7 @@ import type {
   Site,
   SiteAddress,
   SiteType,
-  SwitchRoute,
-  TemporaryAccount,
-  TemporaryAccountAvailability,
-  TemporaryAccountCheckItemResult,
-  TemporaryAccountCheckResult,
-  TemporaryAccountGroup,
-  TemporaryAccountImportSource,
-  TemporaryAccountProviderType
+  SwitchRoute
 } from "../shared/types";
 
 import { AuthLanding } from "./components/AuthLanding";
@@ -70,8 +64,7 @@ import {
   ProviderKeysView,
   RoutesView,
   SettingsView,
-  SitesView,
-  TemporaryAccountsView
+  SitesView
 } from "./views";
 import { UsageView } from "./views/UsageView";
 import { AccountsView } from "./views/AccountsView";
@@ -85,9 +78,6 @@ import {
   groupStrategyLabels,
   routeTypeLabels,
   siteTypeLabels,
-  temporaryAccountAvailabilityLabels,
-  temporaryAccountProviderLabels,
-  temporaryAccountSourceLabels,
   sectionMeta,
   settingsNavItem,
   themeOptions
@@ -100,8 +90,7 @@ import type {
   ProviderKeyGroupDraft,
   ProviderModelOption,
   RouteDraft,
-  Section,
-  TemporaryAccountImportDraft
+  Section
 } from "./app/types";
 import {
   apiOrigin,
@@ -110,7 +99,6 @@ import {
   emptyProviderKeyGroup,
   emptyRoute,
   emptySite,
-  emptyTemporaryAccountImport,
   formatQuotaPercent,
   formatTime,
   groupMemberKey,
@@ -131,26 +119,15 @@ import {
   serializeModelText,
   siteModels,
   smartModelMatches,
-  temporaryAccountAvailabilityStats,
-  temporaryAccountCheckSummary,
-  temporaryAccountQuotaPercent,
-  temporaryAccountQuotaText,
-  temporaryAccountTypeLabel,
   toastDurationMs,
   uniqueMembers
 } from "./app/utils";
-
-// Keep UI progressive checks aligned with server default; high concurrency stresses local proxies.
-const TEMPORARY_ACCOUNT_PROGRESS_CONCURRENCY = 3;
 
 export default function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus>("checking");
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
-  const [temporaryAccountsLoaded, setTemporaryAccountsLoaded] = useState(false);
-  const [temporaryAccountsLoading, setTemporaryAccountsLoading] = useState(false);
-  const [temporaryAccountsError, setTemporaryAccountsError] = useState("");
   const [section, setSection] = useState<Section>("routes");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [routeDraft, setRouteDraft] = useState<RouteDraft>({});
@@ -161,8 +138,6 @@ export default function App() {
   const [providerKeyEditorOpen, setProviderKeyEditorOpen] = useState(false);
   const [providerModelDraft, setProviderModelDraft] = useState<ProviderKeyGroupDraft>(emptyProviderKeyGroup());
   const [providerModelEditorOpen, setProviderModelEditorOpen] = useState(false);
-  const [temporaryAccountDraft, setTemporaryAccountDraft] = useState<TemporaryAccountImportDraft>(emptyTemporaryAccountImport());
-  const [temporaryAccountEditorOpen, setTemporaryAccountEditorOpen] = useState(false);
   const [headerDraft, setHeaderDraft] = useState<HeaderTemplateDraft>(emptyHeader());
   const [headerEditorOpen, setHeaderEditorOpen] = useState(false);
   const [keyName, setKeyName] = useState("client-app");
@@ -188,21 +163,12 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [modelSyncing, setModelSyncing] = useState(false);
   const [modelSyncingGroupId, setModelSyncingGroupId] = useState<string | null>(null);
-  const [temporaryAccountChecking, setTemporaryAccountChecking] = useState<string | null>(null);
-  const [temporaryAccountCheckingIds, setTemporaryAccountCheckingIds] = useState<string[]>([]);
-  const [temporaryAccountQueuedIds, setTemporaryAccountQueuedIds] = useState<string[]>([]);
-  const [temporaryAccountResetting, setTemporaryAccountResetting] = useState<string | null>(null);
-  const [temporaryAccountCheckProviderType, setTemporaryAccountCheckProviderType] = useState<Extract<TemporaryAccountProviderType, "gpt" | "grok">>("grok");
-  const [temporaryAccountUpdating, setTemporaryAccountUpdating] = useState<string | null>(null);
-  const [temporaryAccountDeleting, setTemporaryAccountDeleting] = useState<string | null>(null);
-  const [selectedTemporaryAccountIds, setSelectedTemporaryAccountIds] = useState<string[]>([]);
   const appScrollRef = useRef<HTMLDivElement | null>(null);
   const appScrollContentRef = useRef<HTMLDivElement | null>(null);
   const toastTimerRef = useRef<number | undefined>(undefined);
   const toastStartedAtRef = useRef(0);
   const toastRemainingMsRef = useRef(0);
   const appScrollbarTimerRef = useRef<number | undefined>(undefined);
-  const temporaryAccountIndividualCheckIdsRef = useRef<Set<string>>(new Set());
   const appScrollbarDragRef = useRef<{
     maxScrollTop: number;
     maxThumbTop: number;
@@ -345,17 +311,14 @@ export default function App() {
   const handleUnauthorized = (error: unknown) => {
     if (!isUnauthorizedError(error)) return false;
     setSnapshot(null);
-    setTemporaryAccountsLoaded(false);
-    setTemporaryAccountsLoading(false);
-    setTemporaryAccountsError("");
     setAuthStatus("signed-out");
     setAuthError("会话已过期，请重新输入管理密码");
     return true;
   };
 
-  const load = async (options: { includeRequestLogs?: boolean; includeTemporaryAccounts?: boolean } = {}) => {
+  const load = async (options: { includeRequestLogs?: boolean } = {}) => {
     const currentSnapshot = snapshot;
-    const [bootstrap, settings, sites, apiKeys, providerApiKeyGroups, headerTemplates, routes, routeDisplayGroups, requestLogs, temporaryAccountGroups] =
+    const [bootstrap, settings, sites, apiKeys, providerApiKeyGroups, headerTemplates, routes, routeDisplayGroups, temporaryAccountGroups, requestLogs] =
       await Promise.all([
         api.bootstrap(),
         api.listSettings(),
@@ -365,13 +328,13 @@ export default function App() {
         api.listHeaders(),
         api.listRoutes(),
         api.listRouteDisplayGroups(),
+        api.temporaryAccountGroups(),
         options.includeRequestLogs
           ? api.listLogs(LOGS_PAGE_SIZE, 0).then((result) => {
               setLogsTotal(result.total);
               return result.items;
             })
-          : Promise.resolve(currentSnapshot?.requestLogs || []),
-        options.includeTemporaryAccounts ? api.listTemporaryAccountGroups() : Promise.resolve(currentSnapshot?.temporaryAccountGroups || [])
+          : Promise.resolve(currentSnapshot?.requestLogs || [])
       ]);
     const next: AppSnapshot = {
       ...bootstrap,
@@ -385,34 +348,10 @@ export default function App() {
       requestLogs,
       temporaryAccountGroups
     };
-    if (options.includeTemporaryAccounts) {
-      setTemporaryAccountsLoaded(true);
-      setTemporaryAccountsError("");
-    }
-    setTemporaryAccountsLoading(false);
     setSnapshot(next);
     setRouteDraft((current) => (current.name ? current : emptyRoute(next)));
     setAuthStatus("signed-in");
     setAuthError("");
-  };
-
-  const loadTemporaryAccountGroups = async () => {
-    if (temporaryAccountsLoading) return;
-    setTemporaryAccountsLoading(true);
-    setTemporaryAccountsError("");
-    try {
-      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
-      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
-      setTemporaryAccountsLoaded(true);
-    } catch (error) {
-      if (handleUnauthorized(error)) return;
-      const message = error instanceof Error ? error.message : "临时账号加载失败";
-      setTemporaryAccountsError(message);
-      setTemporaryAccountsLoaded(true);
-      setToast(message);
-    } finally {
-      setTemporaryAccountsLoading(false);
-    }
   };
 
   const bootstrap = async () => {
@@ -420,18 +359,12 @@ export default function App() {
       const session = await api.authSession();
       if (!session.authenticated) {
         setSnapshot(null);
-        setTemporaryAccountsLoaded(false);
-        setTemporaryAccountsLoading(false);
-        setTemporaryAccountsError("");
         setAuthStatus("signed-out");
         return;
       }
       await load();
     } catch (error) {
       setSnapshot(null);
-      setTemporaryAccountsLoaded(false);
-      setTemporaryAccountsLoading(false);
-      setTemporaryAccountsError("");
       setAuthStatus("signed-out");
       setAuthError(error instanceof Error ? error.message : "认证状态检查失败");
     }
@@ -621,11 +554,6 @@ export default function App() {
   }, [section, snapshot]);
 
   useEffect(() => {
-    if (authStatus !== "signed-in" || section !== "temporaryAccounts" || temporaryAccountsLoaded) return;
-    loadTemporaryAccountGroups();
-  }, [authStatus, section, temporaryAccountsLoaded]);
-
-  useEffect(() => {
     if (authStatus !== "signed-in" || section !== "logs") return;
     loadInitialLogs();
   }, [authStatus, section]);
@@ -667,8 +595,7 @@ export default function App() {
       // The mutation response confirms the write. Refresh the snapshot in the background so a
       // long-running proxy request cannot make an unrelated configuration save appear stuck.
       void load({
-        includeRequestLogs: section === "logs",
-        includeTemporaryAccounts: temporaryAccountsLoaded
+        includeRequestLogs: section === "logs"
       }).catch((error) => {
         if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "保存后刷新失败");
       });
@@ -679,14 +606,28 @@ export default function App() {
     }
   };
 
+  const saveSettings = async (settings: Partial<AppSettings>) => {
+    const previousTheme = snapshot?.settings.themeId;
+    if (settings.themeId) setSnapshot((current) => current ? { ...current, settings: { ...current.settings, themeId: settings.themeId! } } : current);
+    setBusy(true);
+    try {
+      const saved = await api.updateSettings(settings);
+      setSnapshot((current) => current ? { ...current, settings: saved } : current);
+      setToast(settings.themeId ? "主题已切换" : "设置已保存");
+    } catch (error) {
+      if (settings.themeId && previousTheme) setSnapshot((current) => current ? { ...current, settings: { ...current.settings, themeId: previousTheme } } : current);
+      handleUnauthorized(error);
+      throw error;
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const changeAdminPassword = async (currentPassword: string, nextPassword: string) => {
     setBusy(true);
     try {
       await api.updateAdminPassword(currentPassword, nextPassword);
       setSnapshot(null);
-      setTemporaryAccountsLoaded(false);
-      setTemporaryAccountsLoading(false);
-      setTemporaryAccountsError("");
       setAuthStatus("signed-out");
       setAuthError("");
       setToast("");
@@ -716,7 +657,7 @@ export default function App() {
     setBusy(true);
     try {
       const result = await api.importBackup(backup);
-      await load({ includeRequestLogs: section === "logs", includeTemporaryAccounts: true });
+      await load({ includeRequestLogs: section === "logs" });
       setToast(`备份导入完成：${result.counts.sites} 个站点，${result.counts.routes} 条路由`);
       return result;
     } catch (error) {
@@ -757,286 +698,6 @@ export default function App() {
     }, "上游密钥分组已保存");
   };
 
-  const importTemporaryAccounts = (event: FormEvent) => {
-    event.preventDefault();
-    setBusy(true);
-    (async () => {
-      const providerType = temporaryAccountDraft.providerType;
-      const result = await api.importTemporaryAccounts({
-        name: temporaryAccountDraft.name,
-        providerType,
-        source: temporaryAccountDraft.mode === "cpa" ? "cpa" : "subapi",
-        mode: temporaryAccountDraft.mode,
-        content: temporaryAccountDraft.content,
-        contents: temporaryAccountDraft.contents,
-        fileNames: temporaryAccountDraft.fileNames
-      });
-      setTemporaryAccountEditorOpen(false);
-      setTemporaryAccountDraft(emptyTemporaryAccountImport());
-      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
-      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
-      setTemporaryAccountsLoaded(true);
-      setTemporaryAccountsLoading(false);
-      setTemporaryAccountCheckProviderType(providerType === "grok" ? "grok" : "gpt");
-      const unrecognizedSummary = result.unrecognizedFiles?.length
-        ? `；${result.unrecognizedFiles.length} 个文件未识别：${result.unrecognizedFiles.slice(0, 3).join("、")}${result.unrecognizedFiles.length > 3 ? " 等" : ""}`
-        : "";
-      setToast(`已导入 ${result.imported} 个临时账号${result.skipped ? `，跳过 ${result.skipped} 个重复项` : ""}${unrecognizedSummary}`);
-      setBusy(false);
-
-      // Preview imported accounts first, then check availability progressively.
-      const accountIds = result.accountIds || [];
-      if (accountIds.length === 0 || !["gpt", "grok"].includes(providerType)) return;
-      setTemporaryAccountChecking("import");
-      try {
-        const { result: checkResult, requestFailures } = await checkTemporaryAccountIdsProgressively(accountIds);
-        const refreshedGroups = await api.listTemporaryAccountGroups();
-        setSnapshot((current) => (current ? { ...current, temporaryAccountGroups: refreshedGroups } : current));
-        const failureHint = requestFailures > 0 ? `，${requestFailures} 个请求失败已跳过` : "";
-        setToast(
-          `已导入 ${result.imported} 个临时账号${result.skipped ? `，跳过 ${result.skipped} 个重复项` : ""}${unrecognizedSummary}；检查结果：${temporaryAccountCheckSummary(checkResult)}${failureHint}`
-        );
-      } catch (error) {
-        if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "导入后账号检查失败");
-      } finally {
-        setTemporaryAccountChecking(null);
-        setTemporaryAccountCheckingIds([]);
-        setTemporaryAccountQueuedIds([]);
-      }
-    })()
-      .catch((error) => {
-        if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号导入失败");
-        setBusy(false);
-      });
-  };
-
-  const applyTemporaryAccountCheckItem = (item: TemporaryAccountCheckItemResult) => {
-    setSnapshot((current) => {
-      if (!current) return current;
-      return {
-        ...current,
-        temporaryAccountGroups: current.temporaryAccountGroups.map((group) => ({
-          ...group,
-          accounts: group.accounts.map((account) =>
-            account.id === item.accountId
-              ? {
-                  ...account,
-                  availability: item.availability,
-                  quotaStages: item.quotaStages,
-                  lastQuotaCheckedAt: item.checkedAt,
-                  lastCheckStatusCode: item.statusCode,
-                  lastCheckError: item.errorMessage
-                }
-              : account
-          )
-        }))
-      };
-    });
-  };
-
-  const checkTemporaryAccountIdsProgressively = async (accountIds: string[]) => {
-    const results = new Array<TemporaryAccountCheckItemResult | undefined>(accountIds.length);
-    const errors: unknown[] = [];
-    let nextIndex = 0;
-    setTemporaryAccountQueuedIds(accountIds);
-    const workers = Array.from(
-      { length: Math.min(TEMPORARY_ACCOUNT_PROGRESS_CONCURRENCY, accountIds.length) },
-      async () => {
-        while (nextIndex < accountIds.length) {
-          const index = nextIndex;
-          nextIndex += 1;
-          const accountId = accountIds[index];
-          setTemporaryAccountQueuedIds((current) => current.filter((id) => id !== accountId));
-          setTemporaryAccountCheckingIds((current) => [...current, accountId]);
-          try {
-            const result = await api.checkTemporaryAccount(accountId);
-            const item = result.results[0];
-            if (!item) throw new Error("账号检查没有返回结果");
-            results[index] = item;
-            applyTemporaryAccountCheckItem(item);
-          } catch (error) {
-            // Keep checking remaining accounts; one proxy blip should not abort the whole batch.
-            // Auth failures still surface via toast after the run finishes.
-            if (isUnauthorizedError(error)) {
-              errors.unshift(error);
-              nextIndex = accountIds.length;
-              setTemporaryAccountQueuedIds([]);
-              return;
-            }
-            errors.push(error);
-          } finally {
-            setTemporaryAccountCheckingIds((current) => current.filter((id) => id !== accountId));
-          }
-        }
-      }
-    );
-    await Promise.all(workers);
-    const completed = results.filter((item): item is TemporaryAccountCheckItemResult => Boolean(item));
-    if (completed.length === 0 && errors.length > 0) throw errors[0];
-    return {
-      result: {
-        total: completed.length,
-        available: completed.filter((item) => item.availability === "available").length,
-        unavailable: completed.filter((item) => item.availability === "unavailable").length,
-        unknown: completed.filter((item) => item.availability === "unknown").length,
-        results: completed
-      } satisfies TemporaryAccountCheckResult,
-      requestFailures: errors.length
-    };
-  };
-
-
-  const checkTemporaryAccounts = async () => {
-    const accountIds = (snapshot?.temporaryAccountGroups || [])
-      .filter((group) => (group.providerType || "gpt") === temporaryAccountCheckProviderType)
-      .flatMap((group) => group.accounts.map((account) => account.id));
-    if (accountIds.length === 0) return;
-    setTemporaryAccountChecking("all");
-    try {
-      const { result, requestFailures } = await checkTemporaryAccountIdsProgressively(accountIds);
-      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
-      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
-      setTemporaryAccountsLoaded(true);
-      setTemporaryAccountsLoading(false);
-      const failureHint = requestFailures > 0 ? `，${requestFailures} 个请求失败已跳过` : "";
-      setToast(`${temporaryAccountProviderLabels[temporaryAccountCheckProviderType]} 账号检查完成：${temporaryAccountCheckSummary(result)}${failureHint}`);
-    } catch (error) {
-      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号检查失败");
-    } finally {
-      setTemporaryAccountChecking(null);
-      setTemporaryAccountCheckingIds([]);
-      setTemporaryAccountQueuedIds([]);
-    }
-  };
-
-  const checkTemporaryAccount = async (id: string) => {
-    if (temporaryAccountIndividualCheckIdsRef.current.has(id)) return;
-    temporaryAccountIndividualCheckIdsRef.current.add(id);
-    setTemporaryAccountChecking("individual");
-    setTemporaryAccountCheckingIds((current) => (current.includes(id) ? current : [...current, id]));
-    try {
-      const result = await api.checkTemporaryAccount(id);
-      const item = result.results[0];
-      if (item) applyTemporaryAccountCheckItem(item);
-      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
-      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
-      setTemporaryAccountsLoaded(true);
-      setTemporaryAccountsLoading(false);
-      setToast(
-        `${temporaryAccountProviderLabels[temporaryAccountCheckProviderType]} 账号检查完成：${
-          item ? temporaryAccountAvailabilityLabels[item.availability] : "完成"
-        }`
-      );
-    } catch (error) {
-      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号刷新失败");
-    } finally {
-      temporaryAccountIndividualCheckIdsRef.current.delete(id);
-      setTemporaryAccountCheckingIds((current) => current.filter((accountId) => accountId !== id));
-      if (temporaryAccountIndividualCheckIdsRef.current.size === 0) setTemporaryAccountChecking(null);
-    }
-  };
-
-  const resetTemporaryAccount = async (id: string) => {
-    if (temporaryAccountResetting || temporaryAccountChecking) return;
-    setTemporaryAccountResetting(id);
-    try {
-      const result = await api.resetTemporaryAccount(id);
-      const item = result.results[0];
-      if (item) applyTemporaryAccountCheckItem(item);
-      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
-      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
-      setTemporaryAccountsLoaded(true);
-      setTemporaryAccountsLoading(false);
-      setToast(item ? `额度已重置：${temporaryAccountAvailabilityLabels[item.availability]}` : "额度已重置");
-    } catch (error) {
-      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号额度重置失败");
-    } finally {
-      setTemporaryAccountResetting(null);
-    }
-  };
-
-  const checkSelectedTemporaryAccounts = async () => {
-    if (temporaryAccountChecking) return;
-    const currentTypeAccountIds = new Set(
-      (snapshot?.temporaryAccountGroups || [])
-        .filter((group) => (group.providerType || "gpt") === temporaryAccountCheckProviderType)
-        .flatMap((group) => group.accounts.map((account) => account.id))
-    );
-    const accountIds = selectedTemporaryAccountIds.filter((id) => currentTypeAccountIds.has(id));
-    if (accountIds.length === 0) return;
-    setTemporaryAccountChecking("selected");
-    try {
-      const { result, requestFailures } = await checkTemporaryAccountIdsProgressively(accountIds);
-      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
-      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
-      setTemporaryAccountsLoaded(true);
-      setTemporaryAccountsLoading(false);
-      const failureHint = requestFailures > 0 ? `，${requestFailures} 个请求失败已跳过` : "";
-      setToast(`${temporaryAccountProviderLabels[temporaryAccountCheckProviderType]} 选中账号复检完成：${temporaryAccountCheckSummary(result)}${failureHint}`);
-    } catch (error) {
-      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号复检失败");
-    } finally {
-      setTemporaryAccountChecking(null);
-      setTemporaryAccountCheckingIds([]);
-      setTemporaryAccountQueuedIds([]);
-    }
-  };
-
-  const updateTemporaryAccount = async (id: string, patch: Partial<TemporaryAccount>) => {
-    if (temporaryAccountUpdating) return;
-    setTemporaryAccountUpdating(id);
-    try {
-      await api.updateTemporaryAccount(id, patch);
-      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
-      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
-      setTemporaryAccountsLoaded(true);
-      setTemporaryAccountsLoading(false);
-      setToast("临时账号已更新");
-    } catch (error) {
-      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号更新失败");
-    } finally {
-      setTemporaryAccountUpdating(null);
-    }
-  };
-
-  const deleteTemporaryAccount = async (id: string) => {
-    if (temporaryAccountDeleting) return;
-    setTemporaryAccountDeleting(id);
-    try {
-      await api.deleteTemporaryAccount(id);
-      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
-      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
-      setSelectedTemporaryAccountIds((current) => current.filter((item) => item !== id));
-      setToast("临时账号已删除");
-    } catch (error) {
-      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号删除失败");
-    } finally {
-      setTemporaryAccountDeleting(null);
-    }
-  };
-
-  const deleteSelectedTemporaryAccounts = async () => {
-    const currentTypeAccountIds = new Set(
-      (snapshot?.temporaryAccountGroups || [])
-        .filter((group) => (group.providerType || "gpt") === temporaryAccountCheckProviderType)
-        .flatMap((group) => group.accounts.map((account) => account.id))
-    );
-    const idsToDelete = selectedTemporaryAccountIds.filter((id) => currentTypeAccountIds.has(id));
-    if (temporaryAccountDeleting || idsToDelete.length === 0) return;
-    setTemporaryAccountDeleting("batch");
-    try {
-      await api.deleteTemporaryAccounts(idsToDelete);
-      const temporaryAccountGroups = await api.listTemporaryAccountGroups();
-      setSnapshot((current) => (current ? { ...current, temporaryAccountGroups } : current));
-      setSelectedTemporaryAccountIds([]);
-      setToast("已批量删除临时账号");
-    } catch (error) {
-      if (!handleUnauthorized(error)) setToast(error instanceof Error ? error.message : "临时账号批量删除失败");
-    } finally {
-      setTemporaryAccountDeleting(null);
-    }
-  };
-
   const saveHeader = (event: FormEvent) => {
     event.preventDefault();
     mutate(async () => {
@@ -1049,7 +710,10 @@ export default function App() {
     }, "请求头模板已保存");
   };
 
-  const apiKeyModelOptions = useMemo(() => (snapshot?.routes || []).filter((route) => route.enabled).map((route) => route.name).sort(), [snapshot?.routes]);
+  const apiKeyModelOptions = useMemo(() => [...new Set([
+    ...(snapshot?.routes || []).filter((route) => route.enabled).map((route) => route.name),
+    ...(snapshot?.settings.downstreamModelRules || []).filter((rule) => rule.enabled && snapshot && modelRuleTargetAvailable(rule, snapshot)).map((rule) => rule.model)
+  ])].sort(), [snapshot?.routes, snapshot?.sites, snapshot?.providerApiKeyGroups, snapshot?.temporaryAccountGroups, snapshot?.settings.downstreamModelRules]);
 
   const openNewRoute = () => {
     setRouteDraft(emptyRoute(snapshot || undefined));
@@ -1074,11 +738,6 @@ export default function App() {
   const openNewProviderKeyGroup = () => {
     setProviderKeyDraft(emptyProviderKeyGroup(snapshot || undefined));
     setProviderKeyEditorOpen(true);
-  };
-
-  const openNewTemporaryAccounts = () => {
-    setTemporaryAccountDraft({ ...emptyTemporaryAccountImport(), providerType: "grok", name: "Grok 临时账号" });
-    setTemporaryAccountEditorOpen(true);
   };
 
   const openEditProviderKeyGroup = (group: ProviderApiKeyGroupView) => {
@@ -1231,12 +890,11 @@ export default function App() {
     if (section === "routes") openNewRoute();
     if (section === "sites") openNewSite();
     if (section === "providerKeys") openNewProviderKeyGroup();
-    if (section === "temporaryAccounts") openNewTemporaryAccounts();
     if (section === "keys") openNewKey();
     if (section === "headers") openNewHeader();
   };
 
-  const canAddInSection = ["routes", "sites", "providerKeys", "temporaryAccounts", "keys", "headers"].includes(section);
+  const canAddInSection = ["routes", "sites", "providerKeys", "keys", "headers"].includes(section);
 
   const setRouteSite = (siteId: string) => {
     const site = snapshot?.sites.find((item) => item.id === siteId);
@@ -1474,42 +1132,7 @@ export default function App() {
                 onEditModels={openEditProviderModels}
               />
             )}
-            {section === "accounts" && <AccountsView onChanged={() => load({ includeTemporaryAccounts: temporaryAccountsLoaded })} onUnauthorized={handleUnauthorized} onNotify={setToast} />}
-            {section === "temporaryAccounts" && (
-              <TemporaryAccountsView
-                snapshot={snapshot}
-                draft={temporaryAccountDraft}
-                editorOpen={temporaryAccountEditorOpen}
-                busy={busy}
-                checking={temporaryAccountChecking}
-                checkingAccountIds={temporaryAccountCheckingIds}
-                queuedAccountIds={temporaryAccountQueuedIds}
-                checkProviderType={temporaryAccountCheckProviderType}
-                onCheckProviderTypeChange={(providerType) => {
-                  setTemporaryAccountCheckProviderType(providerType);
-                  setSelectedTemporaryAccountIds([]);
-                }}
-                updating={temporaryAccountUpdating}
-                resetting={temporaryAccountResetting}
-                deleting={temporaryAccountDeleting}
-                selectedAccountIds={selectedTemporaryAccountIds}
-                onSelectedAccountIds={setSelectedTemporaryAccountIds}
-                onDraft={setTemporaryAccountDraft}
-                onSubmit={importTemporaryAccounts}
-                onClose={() => setTemporaryAccountEditorOpen(false)}
-                onCheck={checkTemporaryAccounts}
-                loading={temporaryAccountsLoading || !temporaryAccountsLoaded}
-                error={temporaryAccountsError}
-                onRetry={loadTemporaryAccountGroups}
-                onStrategyChange={(strategy) => mutate(async () => api.updateSettings({ temporaryAccountStrategy: strategy }), "临时账号策略已更新")}
-                onCheckAccount={checkTemporaryAccount}
-                onResetAccount={resetTemporaryAccount}
-                onCheckSelected={checkSelectedTemporaryAccounts}
-                onUpdateAccount={updateTemporaryAccount}
-                onDeleteAccount={deleteTemporaryAccount}
-                onDeleteSelected={deleteSelectedTemporaryAccounts}
-              />
-            )}
+            {section === "accounts" && <AccountsView onChanged={() => load()} onUnauthorized={handleUnauthorized} onNotify={setToast} />}
             {section === "keys" && (
               <KeysView
                 snapshot={snapshot}
@@ -1576,12 +1199,8 @@ export default function App() {
                 snapshot={snapshot}
                 busy={busy}
                 onRefresh={load}
-                onSave={(settings) => mutate(async () => api.updateSettings(settings), "设置已保存")}
+                onSave={saveSettings}
                 onPasswordChange={changeAdminPassword}
-                onThemeChange={(themeId) => {
-                  setSnapshot((current) => (current ? { ...current, settings: { ...current.settings, themeId } } : current));
-                  mutate(async () => api.updateSettings({ themeId }), "主题已切换");
-                }}
                 onExportBackup={exportBackup}
                 onImportBackup={importBackup}
               />

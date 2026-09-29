@@ -144,7 +144,7 @@ export function ProviderKeysView(props: {
                       ) : selectedSiteIsOfficialGrok ? (
                         <label>
                           账号来源
-                          <span className="field-hint">固定使用已导入的 Grok OAuth 临时账号池；模型请到「模型管理」页维护。</span>
+                          <span className="field-hint">使用「账号管理」中的 Grok OAuth 账号池；模型请到「模型管理」页维护。</span>
                         </label>
                       ) : (
                         <label>

@@ -287,7 +287,7 @@ export function emptyProviderKeyGroup(snapshot?: AppSnapshot): ProviderKeyGroupD
 
 export function emptyTemporaryAccountImport(): TemporaryAccountImportDraft {
   return {
-    name: "GPT 临时账号",
+    name: "GPT 账号",
     providerType: "gpt",
     source: "subapi",
     mode: "auto",
@@ -319,7 +319,7 @@ export function temporaryAccountTypeLabel(account: TemporaryAccount) {
     return account.grokOAuthFormat === "grok2api-oauth" ? "Grok OAuth / grok2api" : "Grok OAuth / CPA";
   }
   if (account.accountType === "codex" || account.accountId) return "Codex";
-  return "临时账号";
+  return "账号";
 }
 
 export function formatQuotaValue(value: TemporaryAccount["quotaStages"][number]["remaining"], unit?: string) {

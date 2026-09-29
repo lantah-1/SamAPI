@@ -234,6 +234,20 @@ export function codexUsageCheckResult(payload: unknown, resetCreditDetails?: Cod
     if (isCodex) selectedAvailability = codexRateLimitIsAvailable(item.rate_limit);
   }
 
+  if (isRecord(payload.credits)) {
+    const credits = payload.credits;
+    const balance = typeof credits.balance === "string" ? credits.balance.trim() : credits.balance;
+    const validBalance = (typeof balance === "number" || typeof balance === "string") && balance !== "" && Number.isFinite(Number(balance));
+    const unlimited = credits.unlimited === true;
+    // Credits remain usable after the subscription's rate-limit windows are exhausted.
+    if (unlimited || validBalance && Number(balance) > 0) selectedAvailability = true;
+    stages.push({
+      label: "Credits 余额",
+      remaining: unlimited ? "不限量" : validBalance ? balance : "未知",
+      ...(unlimited ? { unlimited: true } : {})
+    });
+  }
+
   const resetCredits = isRecord(payload.rate_limit_reset_credits) ? payload.rate_limit_reset_credits : undefined;
   const availableCount = resetCreditDetails?.availableCount ?? resetCreditAvailableCount(resetCredits?.available_count);
   if (availableCount != null) {

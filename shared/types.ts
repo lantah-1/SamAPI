@@ -190,6 +190,7 @@ export interface TemporaryAccount {
 export interface TemporaryAccountQuotaStage {
   label: string;
   remaining?: number | string;
+  unlimited?: boolean;
   total?: number | string;
   used?: number | string;
   unit?: string;
@@ -276,6 +277,8 @@ export interface SwitchRoute {
   model: string;
   endpoint: EndpointKind;
   headerTemplateId?: string;
+  /** Optional managed account pin used by a direct model mapping. */
+  temporaryAccountId?: string;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -355,6 +358,20 @@ export interface RequestLogUpstreamRequest {
   errorMessage?: string;
 }
 
+export type RequestLogStage = "receiving-request" | "preparing-upstream" | "waiting-upstream" | "receiving-upstream" | "waiting-retry" | "forwarding-response";
+
+export interface RequestLogAccount {
+  id: string;
+  label: string;
+}
+
+export interface RequestLogUserAgent {
+  /** Absent when no User-Agent header was set and the HTTP runtime supplies its default. */
+  value?: string;
+  source: "template" | "downstream" | "codex" | "grok" | "default";
+  template?: Pick<HeaderTemplate, "id" | "name">;
+}
+
 /** Transient context accepted by the logger; only the compact RequestLog is persisted. */
 export interface RequestLogInput {
   id: string;
@@ -376,11 +393,15 @@ export interface RequestLogInput {
   apiKeyId?: string;
   apiKeyName?: string;
   status: RequestLogStatus;
+  stage?: RequestLogStage;
   statusCode: number;
   durationMs: number;
   requestHeaders: Record<string, string>;
   requestBody?: unknown;
   upstreamUrl?: string;
+  /** Snapshot of the selected upstream account; null clears an earlier attempt's account. */
+  upstreamAccount?: RequestLogAccount | null;
+  upstreamUserAgent?: RequestLogUserAgent;
   upstreamContentType?: string;
   /** First event that released the response prelude; helps explain failures after streaming began. */
   streamStartedWith?: string;
@@ -397,10 +418,14 @@ export interface RequestLogUpstream {
   provider: string;
   model: string;
   url: string;
+  account?: RequestLogAccount;
+  userAgent?: RequestLogUserAgent;
 }
 
 export interface RequestLogResult {
   status: RequestLogStatus;
+  /** Observed stage of a pending request; absent on completed and legacy logs. */
+  stage?: RequestLogStage;
   statusCode: number;
   body: string;
   streamStartedWith?: string;
@@ -441,12 +466,16 @@ export interface RequestLog {
   createdAt: string;
   updatedAt: string;
   revision: number;
+  /** Model-list requests are independent operations, not user conversation turns. */
+  kind?: "models";
   /** Masked headers from the first downstream request, stored once for the whole turn. */
   requestHeaders: Record<string, string>;
   /** Only this turn's user input, resolved from the shared message record. */
   msg: string[];
   upstream?: RequestLogUpstream;
   result: RequestLogResult;
+  /** A completed call/attempt in calls to retain above the pending result. */
+  previousResultId?: string;
   phase: RequestLogPhase;
   calls: RequestLogCall[];
   tools: RequestLogTool[];
@@ -457,6 +486,7 @@ export interface RequestLogSummary {
   createdAt: string;
   updatedAt: string;
   revision: number;
+  kind?: RequestLog["kind"];
   msg: string;
   messageCount: number;
   upstream?: RequestLogUpstream;
@@ -479,6 +509,41 @@ export interface UpstreamRetryCodeCount {
   count: number;
 }
 
+export type UpstreamRetryDelay =
+  | { mode: "immediate" }
+  | { mode: "fixed"; seconds: number }
+  | { mode: "random"; minSeconds: number; maxSeconds: number };
+
+export type ModelRuleMatch = "exact" | "contains" | "prefix";
+
+export type ModelRuleCondition = {
+  source: "header";
+  header: string;
+  match: ModelRuleMatch;
+  value: string;
+} | {
+  source: "project";
+  match: ModelRuleMatch;
+  value: string;
+};
+
+export interface DownstreamModelRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  model: string;
+  /** 兼容已有路由映射；新映射直接选择供应商和模型。 */
+  targetRouteId?: string;
+  targetSiteId?: string;
+  targetModel?: string;
+  /** Direct mappings can apply a different upstream request-header template. */
+  headerTemplateId?: string;
+  /** Direct mappings to the official OpenAI site may pin one GPT account. */
+  temporaryAccountId?: string;
+  /** 空列表表示仅按下游模型名匹配，不限制客户端或项目。 */
+  conditions: ModelRuleCondition[];
+}
+
 export interface AppSettings {
   maxRequestLogs: number;
   requestTimeoutSeconds: number;
@@ -487,6 +552,10 @@ export interface AppSettings {
   temporaryAccountStrategy: GroupRouteStrategy;
   /** 上游返回对应错误码时的重试次数配置；仅配置过的错误码会重试，0 表示禁用。 */
   upstreamRetryCodeCounts: UpstreamRetryCodeCount[];
+  /** 每次错误码重试前的等待规则；首次请求及耗尽重试后的目标切换不等待。 */
+  upstreamRetryDelay: UpstreamRetryDelay;
+  /** 按顺序匹配下游模型及全部条件，只应用第一条命中的规则。 */
+  downstreamModelRules: DownstreamModelRule[];
 }
 
 export interface AuthSession {
@@ -511,7 +580,7 @@ export interface AppBackupData extends Omit<AppDatabase, "adminPasswordHash"> {}
 export interface AppBackup {
   format: "samapi-backup";
   version: 1;
-  accountPolicyVersion?: 1;
+  accountPolicyVersion?: 1 | 2;
   exportedAt: string;
   data: AppBackupData;
 }

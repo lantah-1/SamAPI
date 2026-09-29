@@ -18,6 +18,7 @@ export const DEFAULT_CORS_HEADERS = [
   "Priority",
   "X-API-Key",
   "X-App",
+  "X-Samapi-Project",
   "X-Stainless-Arch",
   "X-Stainless-Lang",
   "X-Stainless-OS",

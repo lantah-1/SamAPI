@@ -175,6 +175,7 @@ export function createApiHandler(deps: ApiHandlerDeps) {
           if (method === "DELETE" && parts[3]) { store.deleteModelPrice(routeParam(parts, 3)); return sendJson(response, 200, { ok: true }); }
         }
         if (method === "POST" && parts[2] === "price-unpriced") return sendJson(response, 200, { updated: store.priceUnpricedUsage() });
+        if (method === "POST" && parts[2] === "estimate-missing" && !parts[3]) return sendJson(response, 200, store.estimateMissingUsage(filters));
         if (method === "GET" && !parts[2]) return sendJson(response, 200, store.usageReport(filters), { "Cache-Control": "no-store" });
         return notFound(response);
       }
@@ -280,7 +281,10 @@ export function createApiHandler(deps: ApiHandlerDeps) {
           }
         }
         if (method === "POST" && parts[2] === "import") {
-          const result = store.importTemporaryAccounts({ ...await readJson(request), providerType: "gpt" });
+          const body = await readJson(request);
+          const provider = accountProvider(body.providerType ?? "gpt");
+          if (provider !== "gpt" && provider !== "grok") throw new Error("该供应商请通过 API Key 添加账号");
+          const result = store.importTemporaryAccounts({ ...body, providerType: provider });
           return sendJson(response, 201, { ...result, group: temporaryAccountGroupView(result.group) });
         }
         if (method === "POST" && parts[2] === "check") {
@@ -295,14 +299,14 @@ export function createApiHandler(deps: ApiHandlerDeps) {
         if (method === "DELETE" && parts[2] === "batch") {
           const body = await readJson(request);
           const ids: string[] = Array.isArray(body.ids) ? body.ids.map(String) : [];
-          if (ids.some((id) => { const target = store.temporaryAccountCheckTarget(id); return !target || target.group.providerType === "grok"; })) throw new Error("账号不存在");
+          if (ids.some((id) => !store.temporaryAccountCheckTarget(id))) throw new Error("账号不存在");
           store.deleteTemporaryAccounts(ids);
           return sendJson(response, 200, { ok: true });
         }
         if (parts[2] && !["providers", "oauth"].includes(parts[2])) {
           const id = routeParam(parts, 2);
           const target = store.temporaryAccountCheckTarget(id);
-          if (!target || target.group.providerType === "grok") return sendJson(response, 404, { error: "账号不存在" });
+          if (!target) return sendJson(response, 404, { error: "账号不存在" });
           if (method === "PATCH" && !parts[3]) return sendJson(response, 200, store.updateManagedAccount(id, await readJson(request)));
           if (method === "DELETE" && !parts[3]) { store.deleteTemporaryAccount(id); return sendJson(response, 200, { ok: true }); }
           if (method === "POST" && parts[3] === "prefer") return sendJson(response, 200, store.setManagedAccountPolicy(target.group.providerType || "gpt", { preferredAccountId: id }));
